@@ -87,6 +87,11 @@ COPY ./src/json.lua /opt/src/json.lua
 COPY ./src/ao.lua /opt/src/ao.lua
 # COPY ./src/pack.lua /opt/pack.lua
 COPY ./src/main.c /opt/main.c
+# COPY ./src/linit.c /opt/linit.c
+COPY ./src/lsqlite3.c /opt/lsqlite3.c
+COPY ./src/lsqlite3.h /opt/lsqlite3.h
+COPY ./src/sqlite3.c /opt/sqlite3.c
+COPY ./src/sqlite3.h /opt/sqlite3.h
 COPY ./src/main.lua /opt/main.lua
 RUN chmod +x /usr/local/bin/emcc-lua
 

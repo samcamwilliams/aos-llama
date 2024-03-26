@@ -159,25 +159,40 @@ def main():
             c_program = c_program.replace('__LUA_FUNCTION_DECLARATIONS__', definition.make_function_delarations())
             c_program = c_program.replace('__INJECT_LUA_FILES__', '\n'.join(inject_lua_files))
 
-            with open('/tmp/compile.c', mode='w') as build:
+            with open('/opt/compile.c', mode='w') as build:
                 build.write(c_program)
 
     # Finally, compile to wasm
     debug_print('Start to compile as WASM')
-    cmd = ['emcc', '-Os', '-s', 'ALLOW_MEMORY_GROWTH=1', '-s', 'INITIAL_MEMORY=6291456', '-s', 'MAXIMUM_MEMORY=524288000', '-s', 'WASM=1', '-s', 'MODULARIZE', '-s', 'FILESYSTEM=0', '-s', 'DETERMINISTIC=1', '-s', 'NODERAWFS=0', '--pre-js', '/opt/pre.js']
+    cmd = ['emcc', '-O0']
+    cmd.extend([
+        '-s', 'ALLOW_MEMORY_GROWTH=1',
+        '-s', 'INITIAL_MEMORY=6291456',
+        '-s', 'MAXIMUM_MEMORY=524288000',
+        '-s', 'WASM=1',
+        '-s', 'MODULARIZE',
+        # '-s', 'FILESYSTEM=0',
+        '-s', 'DETERMINISTIC=1', 
+        '-s', 'NODERAWFS=0'
+    ])
+    cmd.extend(['-s', 'ASSERTIONS=1'])
+    cmd.extend(['--pre-js', '/opt/pre.js'])
     cmd.extend(definition.get_extra_args())
     cmd.extend(['-I', quote('/lua-{}/src'.format(os.environ.get('LUA_VERSION')))])
-    cmd.extend(['/tmp/compile.c', quote('/lua-{}/src/liblua.a'.format(os.environ.get('LUA_VERSION')))])
-    cmd.extend([quote(v.filepath) for v in link_libraries])
+    # cmd.extend(['-I', '/opt'])
+    # cmd.extend(['/opt/lsqlite3.c', '/opt/sqlite3.c'])
+    cmd.extend(['/opt/compile.c', quote('/lua-{}/src/liblua.a'.format(os.environ.get('LUA_VERSION')))])
+    cmd.extend(['/opt/lsqlite3.c', '/opt/sqlite3.c'])
+    # cmd.extend(['-I', '/opt'])
     cmd.extend([quote(v.filepath) for v in link_libraries])
     cmd.extend(['-lm', '-ldl', '-o', definition.get_output_file(), '-s', 'EXPORTED_RUNTIME_METHODS=["cwrap"]'])
 
-    debug_print('Compile command is {}'.format(' '.join(cmd)))
+    print('Compile command is {}'.format(' '.join(cmd)))
     shell_exec(*cmd)
 
     # add metering library
-    meter_cmd = ['node', '/opt/node/apply-metering.cjs']
-    shell_exec(*meter_cmd)
+    # meter_cmd = ['node', '/opt/node/apply-metering.cjs']
+    # shell_exec(*meter_cmd)
     # shell_exec(*['rm', '/src/process.js'])
 
 if __name__ == '__main__':
