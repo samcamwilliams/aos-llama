@@ -1,1608 +1,2459 @@
+/************************************************************************
+* lsqlite3                                                              *
+* Copyright (C) 2002-2016 Tiago Dionizio, Doug Currie                   *
+* All rights reserved.                                                  *
+* Author    : Tiago Dionizio <tiago.dionizio@ist.utl.pt>                *
+* Author    : Doug Currie <doug.currie@alum.mit.edu>                    *
+* Library   : lsqlite3 - an SQLite 3 database binding for Lua 5         *
+*                                                                       *
+* Permission is hereby granted, free of charge, to any person obtaining *
+* a copy of this software and associated documentation files (the       *
+* "Software"), to deal in the Software without restriction, including   *
+* without limitation the rights to use, copy, modify, merge, publish,   *
+* distribute, sublicense, and/or sell copies of the Software, and to    *
+* permit persons to whom the Software is furnished to do so, subject to *
+* the following conditions:                                             *
+*                                                                       *
+* The above copyright notice and this permission notice shall be        *
+* included in all copies or substantial portions of the Software.       *
+*                                                                       *
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,       *
+* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF    *
+* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.*
+* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY  *
+* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,  *
+* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE     *
+* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                *
+************************************************************************/
+
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+
+#define LUA_LIB
+#include "lua.h"
+#include "lauxlib.h"
+
+#if LUA_VERSION_NUM > 501
+/*
+** Lua 5.2
+*/
+#ifndef lua_strlen
+#define lua_strlen lua_rawlen
+#endif
+/* luaL_typerror always used with arg at ndx == NULL */
+#define luaL_typerror(L,ndx,str) luaL_error(L,"bad argument %d (%s expected, got nil)",ndx,str)
+/* luaL_register used once, so below expansion is OK for this case */
+#define luaL_register(L,name,reg) lua_newtable(L);luaL_setfuncs(L,reg,0)
+/* luaL_openlib always used with name == NULL */
+#define luaL_openlib(L,name,reg,nup) luaL_setfuncs(L,reg,nup)
+
+#if LUA_VERSION_NUM > 502
+/*
+** Lua 5.3
+*/
+#define luaL_checkint(L,n)  ((int)luaL_checkinteger(L, (n)))
+#endif
+#endif
+
+#include "sqlite3.h"
+
+/* compile time features */
+#if !defined(SQLITE_OMIT_PROGRESS_CALLBACK)
+    #define SQLITE_OMIT_PROGRESS_CALLBACK 0
+#endif
+#if !defined(LSQLITE_OMIT_UPDATE_HOOK)
+    #define LSQLITE_OMIT_UPDATE_HOOK 0
+#endif
+#if defined(LSQLITE_OMIT_OPEN_V2)
+    #define SQLITE3_OPEN(L,filename,flags) sqlite3_open(L,filename)
+#else
+    #define SQLITE3_OPEN(L,filename,flags) sqlite3_open_v2(L,filename,flags,NULL)
+#endif
+
+typedef struct sdb sdb;
+typedef struct sdb_vm sdb_vm;
+typedef struct sdb_bu sdb_bu;
+typedef struct sdb_func sdb_func;
+
+/* to use as C user data so i know what function sqlite is calling */
+struct sdb_func {
+    /* references to associated lua values */
+    int fn_step;
+    int fn_finalize;
+    int udata;
+
+    sdb *db;
+    char aggregate;
+
+    sdb_func *next;
+};
+
+/* information about database */
+struct sdb {
+    /* associated lua state */
+    lua_State *L;
+    /* sqlite database handle */
+    sqlite3 *db;
+
+    /* sql functions stack usage */
+    sdb_func *func;         /* top SQL function being called */
+
+    /* references */
+    int busy_cb;        /* busy callback */
+    int busy_udata;
+
+    int progress_cb;    /* progress handler */
+    int progress_udata;
+
+    int trace_cb;       /* trace callback */
+    int trace_udata;
+
+#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK
+
+    int update_hook_cb; /* update_hook callback */
+    int update_hook_udata;
+
+    int commit_hook_cb; /* commit_hook callback */
+    int commit_hook_udata;
+
+    int rollback_hook_cb; /* rollback_hook callback */
+    int rollback_hook_udata;
+
+#endif
+};
+
+static const char *sqlite_meta      = ":sqlite3";
+static const char *sqlite_vm_meta   = ":sqlite3:vm";
+static const char *sqlite_bu_meta   = ":sqlite3:bu";
+static const char *sqlite_ctx_meta  = ":sqlite3:ctx";
+static int sqlite_ctx_meta_ref;
+
+/* Lua 5.3 introduced an integer type, but depending on the implementation, it could be 32 
+** or 64 bits (or something else?). This helper macro tries to do "the right thing."
+*/
+
+#if LUA_VERSION_NUM > 502
+#define PUSH_INT64(L,i64in,fallback) \
+    do { \
+        sqlite_int64 i64 = i64in; \
+        lua_Integer i = (lua_Integer )i64; \
+        if (i == i64) lua_pushinteger(L, i);\
+        else { \
+            lua_Number n = (lua_Number)i64; \
+            if (n == i64) lua_pushnumber(L, n); \
+            else fallback; \
+        } \
+    } while (0)
+#else
+#define PUSH_INT64(L,i64in,fallback) \
+    do { \
+        sqlite_int64 i64 = i64in; \
+        lua_Number n = (lua_Number)i64; \
+        if (n == i64) lua_pushnumber(L, n); \
+        else fallback; \
+    } while (0)
+#endif
+
+/*
+** =======================================================
+** Database Virtual Machine Operations
+** =======================================================
+*/
+
+static void vm_push_column(lua_State *L, sqlite3_stmt *vm, int idx) {
+    switch (sqlite3_column_type(vm, idx)) {
+        case SQLITE_INTEGER:
+            PUSH_INT64(L, sqlite3_column_int64(vm, idx)
+                     , lua_pushlstring(L, (const char*)sqlite3_column_text(vm, idx)
+                                        , sqlite3_column_bytes(vm, idx)));
+            break;
+        case SQLITE_FLOAT:
+            lua_pushnumber(L, sqlite3_column_double(vm, idx));
+            break;
+        case SQLITE_TEXT:
+            lua_pushlstring(L, (const char*)sqlite3_column_text(vm, idx), sqlite3_column_bytes(vm, idx));
+            break;
+        case SQLITE_BLOB:
+            lua_pushlstring(L, sqlite3_column_blob(vm, idx), sqlite3_column_bytes(vm, idx));
+            break;
+        case SQLITE_NULL:
+            lua_pushnil(L);
+            break;
+        default:
+            lua_pushnil(L);
+            break;
+    }
+}
+
+/* virtual machine information */
+struct sdb_vm {
+    sdb *db;                /* associated database handle */
+    sqlite3_stmt *vm;       /* virtual machine */
+
+    /* sqlite3_step info */
+    int columns;            /* number of columns in result */
+    char has_values;        /* true when step succeeds */
+
+    char temp;              /* temporary vm used in db:rows */
+};
+
+/* called with db,sql text on the lua stack */
+static sdb_vm *newvm(lua_State *L, sdb *db) {
+    sdb_vm *svm = (sdb_vm*)lua_newuserdata(L, sizeof(sdb_vm)); /* db sql svm_ud -- */
+
+    luaL_getmetatable(L, sqlite_vm_meta);
+    lua_setmetatable(L, -2);        /* set metatable */
+
+    svm->db = db;
+    svm->columns = 0;
+    svm->has_values = 0;
+    svm->vm = NULL;
+    svm->temp = 0;
+
+    /* add an entry on the database table: svm -> db to keep db live while svm is live */
+    lua_pushlightuserdata(L, db);     /* db sql svm_ud db_lud -- */
+    lua_rawget(L, LUA_REGISTRYINDEX); /* db sql svm_ud reg[db_lud] -- */
+    lua_pushlightuserdata(L, svm);    /* db sql svm_ud reg[db_lud] svm_lud -- */
+    lua_pushvalue(L, -5);             /* db sql svm_ud reg[db_lud] svm_lud db -- */
+    lua_rawset(L, -3);                /* (reg[db_lud])[svm_lud] = db ; set the db for this vm */
+    lua_pop(L, 1);                    /* db sql svm_ud -- */
+
+    return svm;
+}
+
+static int cleanupvm(lua_State *L, sdb_vm *svm) {
+
+    /* remove entry in database table - no harm if not present in the table */
+    lua_pushlightuserdata(L, svm->db);
+    lua_rawget(L, LUA_REGISTRYINDEX);
+    lua_pushlightuserdata(L, svm);
+    lua_pushnil(L);
+    lua_rawset(L, -3);
+    lua_pop(L, 1);
+
+    svm->columns = 0;
+    svm->has_values = 0;
+
+    if (!svm->vm) return 0;
+
+    lua_pushinteger(L, sqlite3_finalize(svm->vm));
+    svm->vm = NULL;
+    return 1;
+}
+
+static int stepvm(lua_State *L, sdb_vm *svm) {
+	(void)L;
+    return sqlite3_step(svm->vm);
+}
+
+static sdb_vm *lsqlite_getvm(lua_State *L, int index) {
+    sdb_vm *svm = (sdb_vm*)luaL_checkudata(L, index, sqlite_vm_meta);
+    if (svm == NULL) luaL_argerror(L, index, "bad sqlite virtual machine");
+    return svm;
+}
+
+static sdb_vm *lsqlite_checkvm(lua_State *L, int index) {
+    sdb_vm *svm = lsqlite_getvm(L, index);
+    if (svm->vm == NULL) luaL_argerror(L, index, "attempt to use closed sqlite virtual machine");
+    return svm;
+}
+
+static int dbvm_isopen(lua_State *L) {
+    sdb_vm *svm = lsqlite_getvm(L, 1);
+    lua_pushboolean(L, svm->vm != NULL ? 1 : 0);
+    return 1;
+}
+
+static int dbvm_tostring(lua_State *L) {
+    char buff[39];
+    sdb_vm *svm = lsqlite_getvm(L, 1);
+    if (svm->vm == NULL)
+        strcpy(buff, "closed");
+    else
+        sprintf(buff, "%p", svm);
+    lua_pushfstring(L, "sqlite virtual machine (%s)", buff);
+    return 1;
+}
+
+static int dbvm_gc(lua_State *L) {
+    sdb_vm *svm = lsqlite_getvm(L, 1);
+    if (svm->vm != NULL)  /* ignore closed vms */
+        cleanupvm(L, svm);
+    return 0;
+}
+
+static int dbvm_step(lua_State *L) {
+    int result;
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+
+    result = stepvm(L, svm);
+    svm->has_values = result == SQLITE_ROW ? 1 : 0;
+    svm->columns = sqlite3_data_count(svm->vm);
+
+    lua_pushinteger(L, result);
+    return 1;
+}
+
+static int dbvm_finalize(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    return cleanupvm(L, svm);
+}
+
+static int dbvm_reset(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_reset(svm->vm);
+    lua_pushinteger(L, sqlite3_errcode(svm->db->db));
+    return 1;
+}
+
+static void dbvm_check_contents(lua_State *L, sdb_vm *svm) {
+    if (!svm->has_values) {
+        luaL_error(L, "misuse of function");
+    }
+}
+
+static void dbvm_check_index(lua_State *L, sdb_vm *svm, int index) {
+    if (index < 0 || index >= svm->columns) {
+        luaL_error(L, "index out of range [0..%d]", svm->columns - 1);
+    }
+}
+
+static void dbvm_check_bind_index(lua_State *L, sdb_vm *svm, int index) {
+    if (index < 1 || index > sqlite3_bind_parameter_count(svm->vm)) {
+        luaL_error(L, "bind index out of range [1..%d]", sqlite3_bind_parameter_count(svm->vm));
+    }
+}
+
+static int dbvm_last_insert_rowid(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    /* conversion warning: int64 -> luaNumber */
+    sqlite_int64 rowid = sqlite3_last_insert_rowid(svm->db->db);
+    PUSH_INT64(L, rowid, lua_pushfstring(L, "%ll", rowid));
+    return 1;
+}
+
+/*
+** =======================================================
+** Virtual Machine - generic info
+** =======================================================
+*/
+static int dbvm_columns(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    lua_pushinteger(L, sqlite3_column_count(svm->vm));
+    return 1;
+}
+
+/*
+** =======================================================
+** Virtual Machine - getters
+** =======================================================
+*/
+
+static int dbvm_get_value(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    int index = luaL_checkint(L, 2);
+    dbvm_check_contents(L, svm);
+    dbvm_check_index(L, svm, index);
+    vm_push_column(L, svm->vm, index);
+    return 1;
+}
+
+static int dbvm_get_name(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    int index = luaL_checknumber(L, 2);
+    dbvm_check_index(L, svm, index);
+    lua_pushstring(L, sqlite3_column_name(svm->vm, index));
+    return 1;
+}
+
+static int dbvm_get_type(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    int index = luaL_checknumber(L, 2);
+    dbvm_check_index(L, svm, index);
+    lua_pushstring(L, sqlite3_column_decltype(svm->vm, index));
+    return 1;
+}
+
+static int dbvm_get_values(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int columns = svm->columns;
+    int n;
+    dbvm_check_contents(L, svm);
+
+    lua_createtable(L, columns, 0);
+    for (n = 0; n < columns;) {
+        vm_push_column(L, vm, n++);
+        lua_rawseti(L, -2, n);
+    }
+    return 1;
+}
+
+static int dbvm_get_names(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int columns = sqlite3_column_count(vm); /* valid as soon as statement prepared */
+    int n;
+
+    lua_createtable(L, columns, 0);
+    for (n = 0; n < columns;) {
+        lua_pushstring(L, sqlite3_column_name(vm, n++));
+        lua_rawseti(L, -2, n);
+    }
+    return 1;
+}
+
+static int dbvm_get_types(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int columns = sqlite3_column_count(vm); /* valid as soon as statement prepared */
+    int n;
+
+    lua_createtable(L, columns, 0);
+    for (n = 0; n < columns;) {
+        lua_pushstring(L, sqlite3_column_decltype(vm, n++));
+        lua_rawseti(L, -2, n);
+    }
+    return 1;
+}
+
+static int dbvm_get_uvalues(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int columns = svm->columns;
+    int n;
+    dbvm_check_contents(L, svm);
+
+    lua_checkstack(L, columns);
+    for (n = 0; n < columns; ++n)
+        vm_push_column(L, vm, n);
+    return columns;
+}
+
+static int dbvm_get_unames(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int columns = sqlite3_column_count(vm); /* valid as soon as statement prepared */
+    int n;
+
+    lua_checkstack(L, columns);
+    for (n = 0; n < columns; ++n)
+        lua_pushstring(L, sqlite3_column_name(vm, n));
+    return columns;
+}
+
+static int dbvm_get_utypes(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int columns = sqlite3_column_count(vm); /* valid as soon as statement prepared */
+    int n;
+
+    lua_checkstack(L, columns);
+    for (n = 0; n < columns; ++n)
+        lua_pushstring(L, sqlite3_column_decltype(vm, n));
+    return columns;
+}
+
+static int dbvm_get_named_values(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int columns = svm->columns;
+    int n;
+    dbvm_check_contents(L, svm);
+
+    lua_createtable(L, 0, columns);
+    for (n = 0; n < columns; ++n) {
+        lua_pushstring(L, sqlite3_column_name(vm, n));
+        vm_push_column(L, vm, n);
+        lua_rawset(L, -3);
+    }
+    return 1;
+}
+
+static int dbvm_get_named_types(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int columns = sqlite3_column_count(vm);
+    int n;
+
+    lua_createtable(L, 0, columns);
+    for (n = 0; n < columns; ++n) {
+        lua_pushstring(L, sqlite3_column_name(vm, n));
+        lua_pushstring(L, sqlite3_column_decltype(vm, n));
+        lua_rawset(L, -3);
+    }
+    return 1;
+}
+
+/*
+** =======================================================
+** Virtual Machine - Bind
+** =======================================================
+*/
+
+static int dbvm_bind_index(lua_State *L, sqlite3_stmt *vm, int index, int lindex) {
+    switch (lua_type(L, lindex)) {
+        case LUA_TSTRING:
+            return sqlite3_bind_text(vm, index, lua_tostring(L, lindex), lua_strlen(L, lindex), SQLITE_TRANSIENT);
+        case LUA_TNUMBER:
+#if LUA_VERSION_NUM > 502
+            if (lua_isinteger(L, lindex))
+                return sqlite3_bind_int64(vm, index, lua_tointeger(L, lindex));
+#endif
+            return sqlite3_bind_double(vm, index, lua_tonumber(L, lindex));
+        case LUA_TBOOLEAN:
+            return sqlite3_bind_int(vm, index, lua_toboolean(L, lindex) ? 1 : 0);
+        case LUA_TNONE:
+        case LUA_TNIL:
+            return sqlite3_bind_null(vm, index);
+        default:
+            luaL_error(L, "index (%d) - invalid data type for bind (%s)", index, lua_typename(L, lua_type(L, lindex)));
+            return SQLITE_MISUSE; /*!*/
+    }
+}
 
 
+static int dbvm_bind_parameter_count(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    lua_pushinteger(L, sqlite3_bind_parameter_count(svm->vm));
+    return 1;
+}
+
+static int dbvm_bind_parameter_name(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    int index = luaL_checknumber(L, 2);
+    dbvm_check_bind_index(L, svm, index);
+    lua_pushstring(L, sqlite3_bind_parameter_name(svm->vm, index));
+    return 1;
+}
+
+static int dbvm_bind(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int index = luaL_checkint(L, 2);
+    int result;
+
+    dbvm_check_bind_index(L, svm, index);
+    result = dbvm_bind_index(L, vm, index, 3);
+
+    lua_pushinteger(L, result);
+    return 1;
+}
+
+static int dbvm_bind_blob(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    int index = luaL_checkint(L, 2);
+    const char *value = luaL_checkstring(L, 3);
+    int len = lua_strlen(L, 3);
+
+    lua_pushinteger(L, sqlite3_bind_blob(svm->vm, index, value, len, SQLITE_TRANSIENT));
+    return 1;
+}
+
+static int dbvm_bind_values(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int top = lua_gettop(L);
+    int result, n;
+
+    if (top - 1 != sqlite3_bind_parameter_count(vm))
+        luaL_error(L,
+            "incorrect number of parameters to bind (%d given, %d to bind)",
+            top - 1,
+            sqlite3_bind_parameter_count(vm)
+        );
+
+    for (n = 2; n <= top; ++n) {
+        if ((result = dbvm_bind_index(L, vm, n - 1, n)) != SQLITE_OK) {
+            lua_pushinteger(L, result);
+            return 1;
+        }
+    }
+
+    lua_pushinteger(L, SQLITE_OK);
+    return 1;
+}
+
+static int dbvm_bind_table_fields (lua_State *L, int idx, int n, sqlite3_stmt *vm) {
+    const char *name;
+    int result, i;
+
+    for ( i = 1; i <= n; ++i ) {
+        name = sqlite3_bind_parameter_name(vm, i );
+        if (name && (name[0] == ':' || name[0] == '$')) {
+            lua_pushstring(L, ++name);
+            lua_gettable(L, idx);
+            result = dbvm_bind_index(L, vm, i, -1);
+            lua_pop(L, 1);
+        }
+        else {
+            lua_pushinteger(L, i );
+            lua_gettable(L, idx);
+            result = dbvm_bind_index(L, vm, i, -1);
+            lua_pop(L, 1);
+        }
+
+        if (result != SQLITE_OK) {
+            return result;
+        }
+    }
+    return SQLITE_OK;
+}
+
+static int dbvm_bind_names(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm = svm->vm;
+    int count = sqlite3_bind_parameter_count(vm);
+    int result;
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    result = dbvm_bind_table_fields (L, 2, count, vm);
+    lua_pushinteger(L, result);
+    return 1;
+}
+
+/*
+** =======================================================
+** Database (internal management)
+** =======================================================
+*/
+
+/*
+** When creating database handles, always creates a `closed' database handle
+** before opening the actual database; so, if there is a memory error, the
+** database is not left opened.
+**
+** Creates a new 'table' and leaves it in the stack
+*/
+static sdb *newdb (lua_State *L) {
+    sdb *db = (sdb*)lua_newuserdata(L, sizeof(sdb));
+    db->L = L;
+    db->db = NULL;  /* database handle is currently `closed' */
+    db->func = NULL;
+
+    db->busy_cb =
+    db->busy_udata =
+    db->progress_cb =
+    db->progress_udata =
+    db->trace_cb =
+    db->trace_udata = 
+#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK
+    db->update_hook_cb =
+    db->update_hook_udata =
+    db->commit_hook_cb =
+    db->commit_hook_udata =
+    db->rollback_hook_cb =
+    db->rollback_hook_udata =
+#endif
+     LUA_NOREF;
+
+    luaL_getmetatable(L, sqlite_meta);
+    lua_setmetatable(L, -2);        /* set metatable */
+
+    /* to keep track of 'open' virtual machines */
+    lua_pushlightuserdata(L, db);
+    lua_newtable(L);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+
+    return db;
+}
+
+static int cleanupdb(lua_State *L, sdb *db) {
+    sdb_func *func;
+    sdb_func *func_next;
+    int top;
+    int result;
+
+    /* free associated virtual machines */
+    lua_pushlightuserdata(L, db);
+    lua_rawget(L, LUA_REGISTRYINDEX);
+
+    /* close all used handles */
+    top = lua_gettop(L);
+    lua_pushnil(L);
+    while (lua_next(L, -2)) {
+        sdb_vm *svm = lua_touserdata(L, -2); /* key: vm; val: sql text */
+        cleanupvm(L, svm);
+
+        lua_settop(L, top);
+        lua_pushnil(L);
+    }
+
+    lua_pop(L, 1); /* pop vm table */
+
+    /* remove entry in lua registry table */
+    lua_pushlightuserdata(L, db);
+    lua_pushnil(L);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+
+    /* 'free' all references */
+    luaL_unref(L, LUA_REGISTRYINDEX, db->busy_cb);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->busy_udata);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->progress_cb);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->progress_udata);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->trace_cb);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->trace_udata);
+#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK
+    luaL_unref(L, LUA_REGISTRYINDEX, db->update_hook_cb);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->update_hook_udata);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->commit_hook_cb);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->commit_hook_udata);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->rollback_hook_cb);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->rollback_hook_udata);
+#endif
+
+    /* close database */
+    result = sqlite3_close(db->db);
+    db->db = NULL;
+
+    /* free associated memory with created functions */
+    func = db->func;
+    while (func) {
+        func_next = func->next;
+        luaL_unref(L, LUA_REGISTRYINDEX, func->fn_step);
+        luaL_unref(L, LUA_REGISTRYINDEX, func->fn_finalize);
+        luaL_unref(L, LUA_REGISTRYINDEX, func->udata);
+        free(func);
+        func = func_next;
+    }
+    db->func = NULL;
+    return result;
+}
+
+static sdb *lsqlite_getdb(lua_State *L, int index) {
+    sdb *db = (sdb*)luaL_checkudata(L, index, sqlite_meta);
+    if (db == NULL) luaL_typerror(L, index, "sqlite database");
+    return db;
+}
+
+static sdb *lsqlite_checkdb(lua_State *L, int index) {
+    sdb *db = lsqlite_getdb(L, index);
+    if (db->db == NULL) luaL_argerror(L, index, "attempt to use closed sqlite database");
+    return db;
+}
 
 
+/*
+** =======================================================
+** User Defined Functions - Context Methods
+** =======================================================
+*/
+typedef struct {
+    sqlite3_context *ctx;
+    int ud;
+} lcontext;
 
+static lcontext *lsqlite_make_context(lua_State *L) {
+    lcontext *ctx = (lcontext*)lua_newuserdata(L, sizeof(lcontext));
+    lua_rawgeti(L, LUA_REGISTRYINDEX, sqlite_ctx_meta_ref);
+    lua_setmetatable(L, -2);
+    ctx->ctx = NULL;
+    ctx->ud = LUA_NOREF;
+    return ctx;
+}
 
-<!DOCTYPE html>
-<html
-  lang="en"
-  
-  data-color-mode="auto" data-light-theme="light" data-dark-theme="dark"
-  data-a11y-animated-images="system" data-a11y-link-underlines="true"
-  >
+static lcontext *lsqlite_getcontext(lua_State *L, int index) {
+    lcontext *ctx = (lcontext*)luaL_checkudata(L, index, sqlite_ctx_meta);
+    if (ctx == NULL) luaL_typerror(L, index, "sqlite context");
+    return ctx;
+}
 
+static lcontext *lsqlite_checkcontext(lua_State *L, int index) {
+    lcontext *ctx = lsqlite_getcontext(L, index);
+    if (ctx->ctx == NULL) luaL_argerror(L, index, "invalid sqlite context");
+    return ctx;
+}
 
+static int lcontext_tostring(lua_State *L) {
+    char buff[39];
+    lcontext *ctx = lsqlite_getcontext(L, 1);
+    if (ctx->ctx == NULL)
+        strcpy(buff, "closed");
+    else
+        sprintf(buff, "%p", ctx->ctx);
+    lua_pushfstring(L, "sqlite function context (%s)", buff);
+    return 1;
+}
 
+static void lcontext_check_aggregate(lua_State *L, lcontext *ctx) {
+    sdb_func *func = (sdb_func*)sqlite3_user_data(ctx->ctx);
+    if (!func->aggregate) {
+        luaL_error(L, "attempt to call aggregate method from scalar function");
+    }
+}
 
-  <head>
-    <meta charset="utf-8">
-  <link rel="dns-prefetch" href="https://github.githubassets.com">
-  <link rel="dns-prefetch" href="https://avatars.githubusercontent.com">
-  <link rel="dns-prefetch" href="https://github-cloud.s3.amazonaws.com">
-  <link rel="dns-prefetch" href="https://user-images.githubusercontent.com/">
-  <link rel="preconnect" href="https://github.githubassets.com" crossorigin>
-  <link rel="preconnect" href="https://avatars.githubusercontent.com">
+static int lcontext_user_data(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    sdb_func *func = (sdb_func*)sqlite3_user_data(ctx->ctx);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, func->udata);
+    return 1;
+}
 
-  
+static int lcontext_get_aggregate_context(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    lcontext_check_aggregate(L, ctx);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->ud);
+    return 1;
+}
 
+static int lcontext_set_aggregate_context(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    lcontext_check_aggregate(L, ctx);
+    lua_settop(L, 2);
+    luaL_unref(L, LUA_REGISTRYINDEX, ctx->ud);
+    ctx->ud = luaL_ref(L, LUA_REGISTRYINDEX);
+    return 0;
+}
 
-  <link crossorigin="anonymous" media="all" rel="stylesheet" href="https://github.githubassets.com/assets/light-0eace2597ca3.css" /><link crossorigin="anonymous" media="all" rel="stylesheet" href="https://github.githubassets.com/assets/dark-a167e256da9c.css" /><link data-color-theme="dark_dimmed" crossorigin="anonymous" media="all" rel="stylesheet" data-href="https://github.githubassets.com/assets/dark_dimmed-d11f2cf8009b.css" /><link data-color-theme="dark_high_contrast" crossorigin="anonymous" media="all" rel="stylesheet" data-href="https://github.githubassets.com/assets/dark_high_contrast-ea7373db06c8.css" /><link data-color-theme="dark_colorblind" crossorigin="anonymous" media="all" rel="stylesheet" data-href="https://github.githubassets.com/assets/dark_colorblind-afa99dcf40f7.css" /><link data-color-theme="light_colorblind" crossorigin="anonymous" media="all" rel="stylesheet" data-href="https://github.githubassets.com/assets/light_colorblind-af6c685139ba.css" /><link data-color-theme="light_high_contrast" crossorigin="anonymous" media="all" rel="stylesheet" data-href="https://github.githubassets.com/assets/light_high_contrast-578cdbc8a5a9.css" /><link data-color-theme="light_tritanopia" crossorigin="anonymous" media="all" rel="stylesheet" data-href="https://github.githubassets.com/assets/light_tritanopia-5cb699a7e247.css" /><link data-color-theme="dark_tritanopia" crossorigin="anonymous" media="all" rel="stylesheet" data-href="https://github.githubassets.com/assets/dark_tritanopia-9b32204967c6.css" />
-    <link crossorigin="anonymous" media="all" rel="stylesheet" href="https://github.githubassets.com/assets/primer-primitives-366b5c973fad.css" />
-    <link crossorigin="anonymous" media="all" rel="stylesheet" href="https://github.githubassets.com/assets/primer-f3607eccaaae.css" />
-    <link crossorigin="anonymous" media="all" rel="stylesheet" href="https://github.githubassets.com/assets/global-1dc4ce41ba30.css" />
-    <link crossorigin="anonymous" media="all" rel="stylesheet" href="https://github.githubassets.com/assets/github-19c85be4af9c.css" />
-  <link crossorigin="anonymous" media="all" rel="stylesheet" href="https://github.githubassets.com/assets/repository-6247ca238fd4.css" />
-<link crossorigin="anonymous" media="all" rel="stylesheet" href="https://github.githubassets.com/assets/code-ad2fce00d003.css" />
+static int lcontext_aggregate_count(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    lcontext_check_aggregate(L, ctx);
+    lua_pushinteger(L, sqlite3_aggregate_count(ctx->ctx));
+    return 1;
+}
 
-  
+#if 0
+void *sqlite3_get_auxdata(sqlite3_context*, int);
+void sqlite3_set_auxdata(sqlite3_context*, int, void*, void (*)(void*));
+#endif
 
+static int lcontext_result(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    switch (lua_type(L, 2)) {
+        case LUA_TNUMBER:
+#if LUA_VERSION_NUM > 502
+            if (lua_isinteger(L, 2))
+                sqlite3_result_int64(ctx->ctx, luaL_checkinteger(L, 2));
+            else
+#endif
+            sqlite3_result_double(ctx->ctx, luaL_checknumber(L, 2));
+            break;
+        case LUA_TSTRING:
+            sqlite3_result_text(ctx->ctx, luaL_checkstring(L, 2), lua_strlen(L, 2), SQLITE_TRANSIENT);
+            break;
+        case LUA_TNIL:
+        case LUA_TNONE:
+            sqlite3_result_null(ctx->ctx);
+            break;
+        default:
+            luaL_error(L, "invalid result type %s", lua_typename(L, 2));
+            break;
+    }
 
-  <script type="application/json" id="client-env">{"locale":"en","featureFlags":["code_vulnerability_scanning","copilot_conversational_ux_history_refs","copilot_smell_icebreaker_ux","copilot_implicit_context","failbot_handle_non_errors","geojson_azure_maps","image_metric_tracking","marketing_forms_api_integration_contact_request","marketing_pages_search_explore_provider","turbo_experiment_risky","sample_network_conn_type","no_character_key_shortcuts_in_inputs","react_start_transition_for_navigations","custom_inp","remove_child_patch","site_features_copilot_cli_ga","copilot_code_chat_diff_header_button"]}</script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/wp-runtime-3d46c905c50b.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_dompurify_dist_purify_js-6890e890956f.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_stacktrace-parser_dist_stack-trace-parser_esm_js-node_modules_github_bro-a4c183-79f9611c275b.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_oddbird_popover-polyfill_dist_popover_js-7bd350d761f4.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/ui_packages_failbot_failbot_ts-5bd9ba639cc0.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/environment-27057bd9ed0b.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_selector-observer_dist_index_esm_js-9f960d9b217c.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_behaviors_dist_esm_focus-zone_js-086f7a27bac0.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_relative-time-element_dist_index_js-c76945c5961a.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_combobox-nav_dist_index_js-node_modules_github_markdown-toolbar-e-820fc0-bc8f02b96749.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_delegated-events_dist_index_js-node_modules_github_auto-complete-element-81d69b-d1813ba335d8.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_text-expander-element_dist_index_js-8a621df59e80.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_filter-input-element_dist_index_js-node_modules_github_remote-inp-b7d8f4-654130b7cde5.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_file-attachment-element_dist_index_js-node_modules_primer_view-co-3959a9-68b3d6c8feb2.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/github-elements-369bd99876f6.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/element-registry-fb4b8d40f206.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_mini-throttle_dist_index_js-node_modules_github_alive-client_dist-bf5aa2-5a0e291a0298.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_lit-html_lit-html_js-5b376145beff.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_morphdom_dist_morphdom-esm_js-5bff297a06de.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_turbo_dist_turbo_es2017-esm_js-c91f4ad18b62.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_remote-form_dist_index_js-node_modules_scroll-anchoring_dist_scro-52dc4b-4fecca2d00e4.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_color-convert_index_js-72c9fbde5ad4.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_behaviors_dist_esm_dimensions_js-node_modules_github_jtml_lib_index_js-95b84ee6bc34.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_paste-markdown_dist_index_esm_js-node_modules_github_quote-select-cbac5f-c7885f4526c5.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/app_assets_modules_github_updatable-content_ts-ee3fc84d7fb0.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/app_assets_modules_github_behaviors_task-list_ts-app_assets_modules_github_onfocus_ts-app_ass-421cec-9de4213015af.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/app_assets_modules_github_sticky-scroll-into-view_ts-94209c43e6af.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/app_assets_modules_github_behaviors_ajax-error_ts-app_assets_modules_github_behaviors_include-467754-244ee9d9ed77.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/app_assets_modules_github_behaviors_commenting_edit_ts-app_assets_modules_github_behaviors_ht-83c235-9285faa0e011.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/behaviors-4e25e265ef84.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_delegated-events_dist_index_js-node_modules_github_catalyst_lib_index_js-d0256ebff5cd.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/notifications-global-352d84c6cc82.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/code-menu-614feb194539.js"></script>
-  
-  <script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/react-lib-1fbfc5be2c18.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_octicons-react_dist_index_esm_js-node_modules_primer_react_lib-es-2e8e7c-a58d7c11e858.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_Box_Box_js-8f8c5e2a2cbf.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_Button_Button_js-d5726d25c548.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_ActionList_index_js-1501d3ef83c2.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_Overlay_Overlay_js-node_modules_primer_react_lib-es-fa1130-829932cf63db.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_Text_Text_js-node_modules_primer_react_lib-esm_Text-7845da-c300384a527b.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_FormControl_FormControl_js-f17f2abffb7f.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_ActionMenu_ActionMenu_js-eaf74522e470.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_catalyst_lib_index_js-node_modules_github_hydro-analytics-client_-978abc0-add939c751ce.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_react-router-dom_dist_index_js-3b41341d50fe.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_PageLayout_PageLayout_js-5a4a31c01bca.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_ConfirmationDialog_ConfirmationDialog_js-8ab472e2f924.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_Dialog_js-node_modules_primer_react_lib-esm_TabNav_-8321f5-2969c7508f3a.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_TreeView_TreeView_js-4d087b8e0c8a.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_Avatar_Avatar_js-node_modules_primer_react_lib-esm_-4e97c6-949a0431d8c0.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/ui_packages_react-core_create-browser-history_ts-ui_packages_react-core_AppContextProvider_ts-809ab9-4a2cf4ad7f60.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/ui_packages_react-core_register-app_ts-3208e4c5b7c1.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/ui_packages_paths_index_ts-654469d743cd.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/ui_packages_ref-selector_RefSelector_tsx-dbbdef4348e2.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/ui_packages_commit-attribution_index_ts-ui_packages_commit-checks-status_index_ts-ui_packages-a73d65-239b92c64d22.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/app_assets_modules_react-shared_hooks_use-canonical-object_ts-ui_packages_code-view-shared_ho-3e492a-f8db4e5bb6ca.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/app_assets_modules_github_blob-anchor_ts-app_assets_modules_github_filter-sort_ts-app_assets_-e50ab6-fd8396d2490b.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/react-code-view-f9851645d723.js"></script>
+    return 0;
+}
 
+static int lcontext_result_blob(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    const char *blob = luaL_checkstring(L, 2);
+    int size = lua_strlen(L, 2);
+    sqlite3_result_blob(ctx->ctx, (const void*)blob, size, SQLITE_TRANSIENT);
+    return 0;
+}
 
-  <title>ao/dev-cli/container/src/lsqlite3.c at sqlite · elliotsayes/ao · GitHub</title>
+static int lcontext_result_double(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    double d = luaL_checknumber(L, 2);
+    sqlite3_result_double(ctx->ctx, d);
+    return 0;
+}
 
+static int lcontext_result_error(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    const char *err = luaL_checkstring(L, 2);
+    int size = lua_strlen(L, 2);
+    sqlite3_result_error(ctx->ctx, err, size);
+    return 0;
+}
 
+static int lcontext_result_int(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    int i = luaL_checkint(L, 2);
+    sqlite3_result_int(ctx->ctx, i);
+    return 0;
+}
 
-  <meta name="route-pattern" content="/:user_id/:repository/blob/*name(/*path)" data-turbo-transient>
-  <meta name="route-controller" content="blob" data-turbo-transient>
-  <meta name="route-action" content="show" data-turbo-transient>
+static int lcontext_result_null(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    sqlite3_result_null(ctx->ctx);
+    return 0;
+}
 
+static int lcontext_result_text(lua_State *L) {
+    lcontext *ctx = lsqlite_checkcontext(L, 1);
+    const char *text = luaL_checkstring(L, 2);
+    int size = lua_strlen(L, 2);
+    sqlite3_result_text(ctx->ctx, text, size, SQLITE_TRANSIENT);
+    return 0;
+}
+
+/*
+** =======================================================
+** Database Methods
+** =======================================================
+*/
+
+static int db_isopen(lua_State *L) {
+    sdb *db = lsqlite_getdb(L, 1);
+    lua_pushboolean(L, db->db != NULL ? 1 : 0);
+    return 1;
+}
+
+static int db_last_insert_rowid(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    /* conversion warning: int64 -> luaNumber */
+    sqlite_int64 rowid = sqlite3_last_insert_rowid(db->db);
+    PUSH_INT64(L, rowid, lua_pushfstring(L, "%ll", rowid));
+    return 1;
+}
+
+static int db_changes(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    lua_pushinteger(L, sqlite3_changes(db->db));
+    return 1;
+}
+
+static int db_total_changes(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    lua_pushinteger(L, sqlite3_total_changes(db->db));
+    return 1;
+}
+
+static int db_errcode(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    lua_pushinteger(L, sqlite3_errcode(db->db));
+    return 1;
+}
+
+static int db_errmsg(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    lua_pushstring(L, sqlite3_errmsg(db->db));
+    return 1;
+}
+
+static int db_interrupt(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    sqlite3_interrupt(db->db);
+    return 0;
+}
+
+static int db_db_filename(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    const char *db_name = luaL_checkstring(L, 2);
+    /* sqlite3_db_filename may return NULL, in that case Lua pushes nil... */
+    lua_pushstring(L, sqlite3_db_filename(db->db, db_name));
+    return 1;
+}
+
+/*
+** Registering SQL functions:
+*/
+
+static void db_push_value(lua_State *L, sqlite3_value *value) {
+    switch (sqlite3_value_type(value)) {
+        case SQLITE_TEXT:
+            lua_pushlstring(L, (const char*)sqlite3_value_text(value), sqlite3_value_bytes(value));
+            break;
+
+        case SQLITE_INTEGER:
+            PUSH_INT64(L, sqlite3_value_int64(value)
+                        , lua_pushlstring(L, (const char*)sqlite3_value_text(value)
+                                            , sqlite3_value_bytes(value)));
+            break;
+
+        case SQLITE_FLOAT:
+            lua_pushnumber(L, sqlite3_value_double(value));
+            break;
+
+        case SQLITE_BLOB:
+            lua_pushlstring(L, sqlite3_value_blob(value), sqlite3_value_bytes(value));
+            break;
+
+        case SQLITE_NULL:
+            lua_pushnil(L);
+            break;
+
+        default:
+            /* things done properly (SQLite + Lua SQLite)
+            ** this should never happen */
+            lua_pushnil(L);
+            break;
+    }
+}
+
+/*
+** callback functions used when calling registered sql functions
+*/
+
+/* scalar function to be called
+** callback params: context, values... */
+static void db_sql_normal_function(sqlite3_context *context, int argc, sqlite3_value **argv) {
+    sdb_func *func = (sdb_func*)sqlite3_user_data(context);
+    lua_State *L = func->db->L;
+    int n;
+    lcontext *ctx;
+
+    int top = lua_gettop(L);
+
+    /* ensure there is enough space in the stack */
+    lua_checkstack(L, argc + 3);
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, func->fn_step);   /* function to call */
+
+    if (!func->aggregate) {
+        ctx = lsqlite_make_context(L); /* push context - used to set results */
+    }
+    else {
+        /* reuse context userdata value */
+        void *p = sqlite3_aggregate_context(context, 1);
+        /* i think it is OK to use assume that using a light user data
+        ** as an entry on LUA REGISTRY table will be unique */
+        lua_pushlightuserdata(L, p);
+        lua_rawget(L, LUA_REGISTRYINDEX);       /* context table */
+
+        if (lua_isnil(L, -1)) { /* not yet created? */
+            lua_pop(L, 1);
+            ctx = lsqlite_make_context(L);
+            lua_pushlightuserdata(L, p);
+            lua_pushvalue(L, -2);
+            lua_rawset(L, LUA_REGISTRYINDEX);
+        }
+        else
+            ctx = lsqlite_getcontext(L, -1);
+    }
+
+    /* push params */
+    for (n = 0; n < argc; ++n) {
+        db_push_value(L, argv[n]);
+    }
+
+    /* set context */
+    ctx->ctx = context;
+
+    if (lua_pcall(L, argc + 1, 0, 0)) {
+        const char *errmsg = lua_tostring(L, -1);
+        int size = lua_strlen(L, -1);
+        sqlite3_result_error(context, errmsg, size);
+    }
+
+    /* invalidate context */
+    ctx->ctx = NULL;
+
+    if (!func->aggregate) {
+        luaL_unref(L, LUA_REGISTRYINDEX, ctx->ud);
+    }
+
+    lua_settop(L, top);
+}
+
+static void db_sql_finalize_function(sqlite3_context *context) {
+    sdb_func *func = (sdb_func*)sqlite3_user_data(context);
+    lua_State *L = func->db->L;
+    void *p = sqlite3_aggregate_context(context, 1); /* minimal mem usage */
+    lcontext *ctx;
+    int top = lua_gettop(L);
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, func->fn_finalize);   /* function to call */
+
+    /* i think it is OK to use assume that using a light user data
+    ** as an entry on LUA REGISTRY table will be unique */
+    lua_pushlightuserdata(L, p);
+    lua_rawget(L, LUA_REGISTRYINDEX);       /* context table */
+
+    if (lua_isnil(L, -1)) { /* not yet created? - shouldn't happen in finalize function */
+        lua_pop(L, 1);
+        ctx = lsqlite_make_context(L);
+        lua_pushlightuserdata(L, p);
+        lua_pushvalue(L, -2);
+        lua_rawset(L, LUA_REGISTRYINDEX);
+    }
+    else
+        ctx = lsqlite_getcontext(L, -1);
+
+    /* set context */
+    ctx->ctx = context;
+
+    if (lua_pcall(L, 1, 0, 0)) {
+        sqlite3_result_error(context, lua_tostring(L, -1), -1);
+    }
+
+    /* invalidate context */
+    ctx->ctx = NULL;
+
+    /* cleanup context */
+    luaL_unref(L, LUA_REGISTRYINDEX, ctx->ud);
+    /* remove it from registry */
+    lua_pushlightuserdata(L, p);
+    lua_pushnil(L);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+
+    lua_settop(L, top);
+}
+
+/*
+** Register a normal function
+** Params: db, function name, number arguments, [ callback | step, finalize], user data
+** Returns: true on sucess
+**
+** Normal function:
+** Params: context, params
+**
+** Aggregate function:
+** Params of step: context, params
+** Params of finalize: context
+*/
+static int db_register_function(lua_State *L, int aggregate) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    const char *name;
+    int args;
+    int result;
+    sdb_func *func;
+
+    /* safety measure */
+    if (aggregate) aggregate = 1;
+
+    name = luaL_checkstring(L, 2);
+    args = luaL_checkint(L, 3);
+    luaL_checktype(L, 4, LUA_TFUNCTION);
+    if (aggregate) luaL_checktype(L, 5, LUA_TFUNCTION);
+
+    /* maybe an alternative way to allocate memory should be used/avoided */
+    func = (sdb_func*)malloc(sizeof(sdb_func));
+    if (func == NULL) {
+        luaL_error(L, "out of memory");
+    }
+
+    result = sqlite3_create_function(
+        db->db, name, args, SQLITE_UTF8, func,
+        aggregate ? NULL : db_sql_normal_function,
+        aggregate ? db_sql_normal_function : NULL,
+        aggregate ? db_sql_finalize_function : NULL
+    );
+
+    if (result == SQLITE_OK) {
+        /* safety measures for userdata field to be present in the stack */
+        lua_settop(L, 5 + aggregate);
+
+        /* save registered function in db function list */
+        func->db = db;
+        func->aggregate = aggregate;
+        func->next = db->func;
+        db->func = func;
+
+        /* save the setp/normal function callback */
+        lua_pushvalue(L, 4);
+        func->fn_step = luaL_ref(L, LUA_REGISTRYINDEX);
+        /* save user data */
+        lua_pushvalue(L, 5+aggregate);
+        func->udata = luaL_ref(L, LUA_REGISTRYINDEX);
+
+        if (aggregate) {
+            lua_pushvalue(L, 5);
+            func->fn_finalize = luaL_ref(L, LUA_REGISTRYINDEX);
+        }
+        else
+            func->fn_finalize = LUA_NOREF;
+    }
+    else {
+        /* free allocated memory */
+        free(func);
+    }
+
+    lua_pushboolean(L, result == SQLITE_OK ? 1 : 0);
+    return 1;
+}
+
+static int db_create_function(lua_State *L) {
+    return db_register_function(L, 0);
+}
+
+static int db_create_aggregate(lua_State *L) {
+    return db_register_function(L, 1);
+}
+
+/* create_collation; contributed by Thomas Lauer
+*/
+
+typedef struct {
+    lua_State *L;
+    int ref;
+} scc;
+
+static int collwrapper(scc *co,int l1,const void *p1,
+                        int l2,const void *p2) {
+    int res=0;
+    lua_State *L=co->L;
+    lua_rawgeti(L,LUA_REGISTRYINDEX,co->ref);
+    lua_pushlstring(L,p1,l1);
+    lua_pushlstring(L,p2,l2);
+    if (lua_pcall(L,2,1,0)==0) res=(int)lua_tonumber(L,-1);
+    lua_pop(L,1);
+    return res;
+}
+
+static void collfree(scc *co) {
+    if (co) {
+        luaL_unref(co->L,LUA_REGISTRYINDEX,co->ref);
+        free(co);
+    }
+}
+
+static int db_create_collation(lua_State *L) {
+    sdb *db=lsqlite_checkdb(L,1);
+    const char *collname=luaL_checkstring(L,2);
+    scc *co=NULL;
+    int (*collfunc)(scc *,int,const void *,int,const void *)=NULL;
+    lua_settop(L,3); /* default args to nil, and exclude extras */
+    if (lua_isfunction(L,3)) collfunc=collwrapper;
+    else if (!lua_isnil(L,3))
+        luaL_error(L,"create_collation: function or nil expected");
+    if (collfunc != NULL) {
+        co=(scc *)malloc(sizeof(scc)); /* userdata is a no-no as it
+                                          will be garbage-collected */
+        if (co) {
+            co->L=L;
+            /* lua_settop(L,3) above means we don't need: lua_pushvalue(L,3); */
+            co->ref=luaL_ref(L,LUA_REGISTRYINDEX);
+        }
+        else luaL_error(L,"create_collation: could not allocate callback");
+    }
+    sqlite3_create_collation_v2(db->db, collname, SQLITE_UTF8,
+        (void *)co,
+        (int(*)(void*,int,const void*,int,const void*))collfunc,
+        (void(*)(void*))collfree);
+    return 0;
+}
+
+/* Thanks to Wolfgang Oertl...
+*/
+static int db_load_extension(lua_State *L) {
+    sdb *db=lsqlite_checkdb(L,1);
+    const char *extname=luaL_optstring(L,2,NULL);
+    const char *entrypoint=luaL_optstring(L,3,NULL);
+    int result;
+    char *errmsg = NULL;
+
+    if (extname == NULL) {
+        result = sqlite3_enable_load_extension(db->db,0); /* disable extension loading */
+    }
+    else {
+        sqlite3_enable_load_extension(db->db,1); /* enable extension loading */
+        result = sqlite3_load_extension(db->db,extname,entrypoint,&errmsg);
+    }
+
+    if (result == SQLITE_OK) {
+        lua_pushboolean(L,1);
+        return 1;
+    }
+
+    lua_pushboolean(L,0); /* so, assert(load_extension(...)) works */
+    lua_pushstring(L,errmsg);
+    sqlite3_free(errmsg);
+    return 2;
+}
+
+/*
+** trace callback:
+** Params: database, callback function, userdata
+**
+** callback function:
+** Params: userdata, sql
+*/
+static void db_trace_callback(void *user, const char *sql) {
+    sdb *db = (sdb*)user;
+    lua_State *L = db->L;
+    int top = lua_gettop(L);
+
+    /* setup lua callback call */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->trace_cb);    /* get callback */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->trace_udata); /* get callback user data */
+    lua_pushstring(L, sql); /* traced sql statement */
+
+    /* call lua function */
+    lua_pcall(L, 2, 0, 0);
+    /* ignore any error generated by this function */
+
+    lua_settop(L, top);
+}
+
+static int db_trace(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+
+    if (lua_gettop(L) < 2 || lua_isnil(L, 2)) {
+        luaL_unref(L, LUA_REGISTRYINDEX, db->trace_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->trace_udata);
+
+        db->trace_cb =
+        db->trace_udata = LUA_NOREF;
+
+        /* clear trace handler */
+        sqlite3_trace(db->db, NULL, NULL);
+    }
+    else {
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+
+        /* make sure we have an userdata field (even if nil) */
+        lua_settop(L, 3);
+
+        luaL_unref(L, LUA_REGISTRYINDEX, db->trace_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->trace_udata);
+
+        db->trace_udata = luaL_ref(L, LUA_REGISTRYINDEX);
+        db->trace_cb = luaL_ref(L, LUA_REGISTRYINDEX);
+
+        /* set trace handler */
+        sqlite3_trace(db->db, db_trace_callback, db);
+    }
+
+    return 0;
+}
+
+#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK
+
+/*
+** update_hook callback:
+** Params: database, callback function, userdata
+**
+** callback function:
+** Params: userdata, {one of SQLITE_INSERT, SQLITE_DELETE, or SQLITE_UPDATE}, 
+**          database name, table name (containing the affected row), rowid of the row
+*/
+static void db_update_hook_callback(void *user, int op, char const *dbname, char const *tblname, sqlite3_int64 rowid) {
+    sdb *db = (sdb*)user;
+    lua_State *L = db->L;
+    int top = lua_gettop(L);
+
+    /* setup lua callback call */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->update_hook_cb);    /* get callback */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->update_hook_udata); /* get callback user data */
+    lua_pushinteger(L, op);
+    lua_pushstring(L, dbname); /* update_hook database name */
+    lua_pushstring(L, tblname); /* update_hook database name */
     
-  <meta name="current-catalog-service-hash" content="82c569b93da5c18ed649ebd4c2c79437db4611a6a1373e805a3cb001c64130b7">
+    PUSH_INT64(L, rowid, lua_pushfstring(L, "%ll", rowid));
 
+    /* call lua function */
+    lua_pcall(L, 5, 0, 0);
+    /* ignore any error generated by this function */
 
-  <meta name="request-id" content="7B05:38E5B5:313CFE:3D0DB4:66034D94" data-pjax-transient="true"/><meta name="html-safe-nonce" content="48c4a6e5e14e96d650a370f69b25a0232c3bc83dd9a4e34c9b6a0537837b754f" data-pjax-transient="true"/><meta name="visitor-payload" content="eyJyZWZlcnJlciI6IiIsInJlcXVlc3RfaWQiOiI3QjA1OjM4RTVCNTozMTNDRkU6M0QwREI0OjY2MDM0RDk0IiwidmlzaXRvcl9pZCI6IjM3NTQ1NjM5NTEyMDQxOTE2MzYiLCJyZWdpb25fZWRnZSI6Ind1czItMDEiLCJyZWdpb25fcmVuZGVyIjoid2VzdHVzMiJ9" data-pjax-transient="true"/><meta name="visitor-hmac" content="c3fb1a32faeae5934b52b23b49e2c6f27654a48391ce607f067e8a4f6827dd2f" data-pjax-transient="true"/>
+    lua_settop(L, top);
+}
 
+static int db_update_hook(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
 
-    <meta name="hovercard-subject-tag" content="repository:774396487" data-turbo-transient>
+    if (lua_gettop(L) < 2 || lua_isnil(L, 2)) {
+        luaL_unref(L, LUA_REGISTRYINDEX, db->update_hook_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->update_hook_udata);
 
+        db->update_hook_cb =
+        db->update_hook_udata = LUA_NOREF;
 
-  <meta name="github-keyboard-shortcuts" content="repository,source-code,file-tree,copilot" data-turbo-transient="true" />
-  
+        /* clear update_hook handler */
+        sqlite3_update_hook(db->db, NULL, NULL);
+    }
+    else {
+        luaL_checktype(L, 2, LUA_TFUNCTION);
 
-  <meta name="selected-link" value="repo_source" data-turbo-transient>
-  <link rel="assets" href="https://github.githubassets.com/">
+        /* make sure we have an userdata field (even if nil) */
+        lua_settop(L, 3);
 
-    <meta name="google-site-verification" content="c1kuD-K2HIVF635lypcsWPoD4kilo5-jA_wBFyT4uMY">
-  <meta name="google-site-verification" content="KT5gs8h0wvaagLKAVWq8bbeNwnZZK1r1XQysX3xurLU">
-  <meta name="google-site-verification" content="ZzhVyEFwb7w3e0-uOTltm8Jsck2F5StVihD0exw2fsA">
-  <meta name="google-site-verification" content="GXs5KoUUkNCoaAZn7wPN-t01Pywp9M3sEjnt_3_ZWPc">
-  <meta name="google-site-verification" content="Apib7-x98H0j5cPqHWwSMm6dNU4GmODRoqxLiDzdx9I">
+        luaL_unref(L, LUA_REGISTRYINDEX, db->update_hook_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->update_hook_udata);
 
-<meta name="octolytics-url" content="https://collector.github.com/github/collect" />
+        db->update_hook_udata = luaL_ref(L, LUA_REGISTRYINDEX);
+        db->update_hook_cb = luaL_ref(L, LUA_REGISTRYINDEX);
 
-  <meta name="analytics-location" content="/&lt;user-name&gt;/&lt;repo-name&gt;/blob/show" data-turbo-transient="true" />
+        /* set update_hook handler */
+        sqlite3_update_hook(db->db, db_update_hook_callback, db);
+    }
 
-  
+    return 0;
+}
 
+/*
+** commit_hook callback:
+** Params: database, callback function, userdata
+**
+** callback function:
+** Params: userdata
+** Returned value: Return false or nil to continue the COMMIT operation normally.
+**  return true (non false, non nil), then the COMMIT is converted into a ROLLBACK. 
+*/
+static int db_commit_hook_callback(void *user) {
+    sdb *db = (sdb*)user;
+    lua_State *L = db->L;
+    int top = lua_gettop(L);
+    int rollback = 0;
 
+    /* setup lua callback call */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->commit_hook_cb);    /* get callback */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->commit_hook_udata); /* get callback user data */
 
+    /* call lua function */
+    if (!lua_pcall(L, 1, 1, 0))
+        rollback = lua_toboolean(L, -1); /* use result if there was no error */
 
+    lua_settop(L, top);
+    return rollback;
+}
 
-    <meta name="user-login" content="">
+static int db_commit_hook(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
 
-  
+    if (lua_gettop(L) < 2 || lua_isnil(L, 2)) {
+        luaL_unref(L, LUA_REGISTRYINDEX, db->commit_hook_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->commit_hook_udata);
 
-    <meta name="viewport" content="width=device-width">
+        db->commit_hook_cb =
+        db->commit_hook_udata = LUA_NOREF;
+
+        /* clear commit_hook handler */
+        sqlite3_commit_hook(db->db, NULL, NULL);
+    }
+    else {
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+
+        /* make sure we have an userdata field (even if nil) */
+        lua_settop(L, 3);
+
+        luaL_unref(L, LUA_REGISTRYINDEX, db->commit_hook_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->commit_hook_udata);
+
+        db->commit_hook_udata = luaL_ref(L, LUA_REGISTRYINDEX);
+        db->commit_hook_cb = luaL_ref(L, LUA_REGISTRYINDEX);
+
+        /* set commit_hook handler */
+        sqlite3_commit_hook(db->db, db_commit_hook_callback, db);
+    }
+
+    return 0;
+}
+
+/*
+** rollback hook callback:
+** Params: database, callback function, userdata
+**
+** callback function:
+** Params: userdata
+*/
+static void db_rollback_hook_callback(void *user) {
+    sdb *db = (sdb*)user;
+    lua_State *L = db->L;
+    int top = lua_gettop(L);
+
+    /* setup lua callback call */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->rollback_hook_cb);    /* get callback */
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->rollback_hook_udata); /* get callback user data */
+
+    /* call lua function */
+    lua_pcall(L, 1, 0, 0);
+    /* ignore any error generated by this function */
+
+    lua_settop(L, top);
+}
+
+static int db_rollback_hook(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+
+    if (lua_gettop(L) < 2 || lua_isnil(L, 2)) {
+        luaL_unref(L, LUA_REGISTRYINDEX, db->rollback_hook_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->rollback_hook_udata);
+
+        db->rollback_hook_cb =
+        db->rollback_hook_udata = LUA_NOREF;
+
+        /* clear rollback_hook handler */
+        sqlite3_rollback_hook(db->db, NULL, NULL);
+    }
+    else {
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+
+        /* make sure we have an userdata field (even if nil) */
+        lua_settop(L, 3);
+
+        luaL_unref(L, LUA_REGISTRYINDEX, db->rollback_hook_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->rollback_hook_udata);
+
+        db->rollback_hook_udata = luaL_ref(L, LUA_REGISTRYINDEX);
+        db->rollback_hook_cb = luaL_ref(L, LUA_REGISTRYINDEX);
+
+        /* set rollback_hook handler */
+        sqlite3_rollback_hook(db->db, db_rollback_hook_callback, db);
+    }
+
+    return 0;
+}
+
+#endif /* #if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK */
+
+#if !defined(SQLITE_OMIT_PROGRESS_CALLBACK) || !SQLITE_OMIT_PROGRESS_CALLBACK
+
+/*
+** progress handler:
+** Params: database, number of opcodes, callback function, userdata
+**
+** callback function:
+** Params: userdata
+** returns: 0 to return immediatly and return SQLITE_ABORT, non-zero to continue
+*/
+static int db_progress_callback(void *user) {
+    int result = 1; /* abort by default */
+    sdb *db = (sdb*)user;
+    lua_State *L = db->L;
+    int top = lua_gettop(L);
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->progress_cb);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->progress_udata);
+
+    /* call lua function */
+    if (!lua_pcall(L, 1, 1, 0))
+        result = lua_toboolean(L, -1);
+
+    lua_settop(L, top);
+    return result;
+}
+
+static int db_progress_handler(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+
+    if (lua_gettop(L) < 2 || lua_isnil(L, 2)) {
+        luaL_unref(L, LUA_REGISTRYINDEX, db->progress_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->progress_udata);
+
+        db->progress_cb =
+        db->progress_udata = LUA_NOREF;
+
+        /* clear busy handler */
+        sqlite3_progress_handler(db->db, 0, NULL, NULL);
+    }
+    else {
+        int nop = luaL_checkint(L, 2);  /* number of opcodes */
+        luaL_checktype(L, 3, LUA_TFUNCTION);
+
+        /* make sure we have an userdata field (even if nil) */
+        lua_settop(L, 4);
+
+        luaL_unref(L, LUA_REGISTRYINDEX, db->progress_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->progress_udata);
+
+        db->progress_udata = luaL_ref(L, LUA_REGISTRYINDEX);
+        db->progress_cb = luaL_ref(L, LUA_REGISTRYINDEX);
+
+        /* set progress callback */
+        sqlite3_progress_handler(db->db, nop, db_progress_callback, db);
+    }
+
+    return 0;
+}
+
+#else /* #if !defined(SQLITE_OMIT_PROGRESS_CALLBACK) || !SQLITE_OMIT_PROGRESS_CALLBACK */
+
+static int db_progress_handler(lua_State *L) {
+    lua_pushliteral(L, "progress callback support disabled at compile time");
+    lua_error(L);
+    return 0;
+}
+
+#endif /* #if !defined(SQLITE_OMIT_PROGRESS_CALLBACK) || !SQLITE_OMIT_PROGRESS_CALLBACK */
+
+/* Online Backup API */
+#if 0
+sqlite3_backup *sqlite3_backup_init(
+  sqlite3 *pDest,                        /* Destination database handle */
+  const char *zDestName,                 /* Destination database name */
+  sqlite3 *pSource,                      /* Source database handle */
+  const char *zSourceName                /* Source database name */
+);
+int sqlite3_backup_step(sqlite3_backup *p, int nPage);
+int sqlite3_backup_finish(sqlite3_backup *p);
+int sqlite3_backup_remaining(sqlite3_backup *p);
+int sqlite3_backup_pagecount(sqlite3_backup *p);
+#endif
+
+struct sdb_bu {
+    sqlite3_backup *bu;     /* backup structure */
+};
+
+static int cleanupbu(lua_State *L, sdb_bu *sbu) {
+
+    if (!sbu->bu) return 0; /* already finished */
+
+    /* remove table from registry */
+    lua_pushlightuserdata(L, sbu->bu);
+    lua_pushnil(L);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+
+    lua_pushinteger(L, sqlite3_backup_finish(sbu->bu));
+    sbu->bu = NULL;
+
+    return 1;
+}
+
+static int lsqlite_backup_init(lua_State *L) {
+
+    sdb *target_db = lsqlite_checkdb(L, 1);
+    const char *target_nm = luaL_checkstring(L, 2);
+    sdb *source_db = lsqlite_checkdb(L, 3);
+    const char *source_nm = luaL_checkstring(L, 4);
+
+    sqlite3_backup *bu = sqlite3_backup_init(target_db->db, target_nm, source_db->db, source_nm);
+
+    if (NULL != bu) {
+        sdb_bu *sbu = (sdb_bu*)lua_newuserdata(L, sizeof(sdb_bu));
+
+        luaL_getmetatable(L, sqlite_bu_meta);
+        lua_setmetatable(L, -2);        /* set metatable */
+        sbu->bu = bu;
+
+        /* create table from registry */
+        /* to prevent referenced databases from being garbage collected while bu is live */
+        lua_pushlightuserdata(L, bu);
+        lua_createtable(L, 2, 0);
+        /* add source and target dbs to table at indices 1 and 2 */
+        lua_pushvalue(L, 1); /* target db */
+        lua_rawseti(L, -2, 1);
+        lua_pushvalue(L, 3); /* source db */
+        lua_rawseti(L, -2, 2);
+        /* put table in registry with key lightuserdata bu */
+        lua_rawset(L, LUA_REGISTRYINDEX);
+
+        return 1;
+    }
+    else {
+        return 0;
+    }
+}
+
+static sdb_bu *lsqlite_getbu(lua_State *L, int index) {
+    sdb_bu *sbu = (sdb_bu*)luaL_checkudata(L, index, sqlite_bu_meta);
+    if (sbu == NULL) luaL_typerror(L, index, "sqlite database backup");
+    return sbu;
+}
+
+static sdb_bu *lsqlite_checkbu(lua_State *L, int index) {
+    sdb_bu *sbu = lsqlite_getbu(L, index);
+    if (sbu->bu == NULL) luaL_argerror(L, index, "attempt to use closed sqlite database backup");
+    return sbu;
+}
+
+static int dbbu_gc(lua_State *L) {
+    sdb_bu *sbu = lsqlite_getbu(L, 1);
+    if (sbu->bu != NULL) {
+        cleanupbu(L, sbu);
+        lua_pop(L, 1);
+    }
+    /* else ignore if already finished */
+    return 0;
+}
+
+static int dbbu_step(lua_State *L) {
+    sdb_bu *sbu = lsqlite_checkbu(L, 1);
+    int nPage = luaL_checkint(L, 2);
+    lua_pushinteger(L, sqlite3_backup_step(sbu->bu, nPage));
+    return 1;
+}
+
+static int dbbu_remaining(lua_State *L) {
+    sdb_bu *sbu = lsqlite_checkbu(L, 1);
+    lua_pushinteger(L, sqlite3_backup_remaining(sbu->bu));
+    return 1;
+}
+
+static int dbbu_pagecount(lua_State *L) {
+    sdb_bu *sbu = lsqlite_checkbu(L, 1);
+    lua_pushinteger(L, sqlite3_backup_pagecount(sbu->bu));
+    return 1;
+}
+
+static int dbbu_finish(lua_State *L) {
+    sdb_bu *sbu = lsqlite_checkbu(L, 1);
+    return cleanupbu(L, sbu);
+}
+
+/* end of Online Backup API */
+
+/*
+** busy handler:
+** Params: database, callback function, userdata
+**
+** callback function:
+** Params: userdata, number of tries
+** returns: 0 to return immediatly and return SQLITE_BUSY, non-zero to try again
+*/
+static int db_busy_callback(void *user, int tries) {
+    int retry = 0; /* abort by default */
+    sdb *db = (sdb*)user;
+    lua_State *L = db->L;
+    int top = lua_gettop(L);
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->busy_cb);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, db->busy_udata);
+    lua_pushinteger(L, tries);
+
+    /* call lua function */
+    if (!lua_pcall(L, 2, 1, 0))
+        retry = lua_toboolean(L, -1);
+
+    lua_settop(L, top);
+    return retry;
+}
+
+static int db_busy_handler(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+
+    if (lua_gettop(L) < 2 || lua_isnil(L, 2)) {
+        luaL_unref(L, LUA_REGISTRYINDEX, db->busy_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->busy_udata);
+
+        db->busy_cb =
+        db->busy_udata = LUA_NOREF;
+
+        /* clear busy handler */
+        sqlite3_busy_handler(db->db, NULL, NULL);
+    }
+    else {
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+        /* make sure we have an userdata field (even if nil) */
+        lua_settop(L, 3);
+
+        luaL_unref(L, LUA_REGISTRYINDEX, db->busy_cb);
+        luaL_unref(L, LUA_REGISTRYINDEX, db->busy_udata);
+
+        db->busy_udata = luaL_ref(L, LUA_REGISTRYINDEX);
+        db->busy_cb = luaL_ref(L, LUA_REGISTRYINDEX);
+
+        /* set busy handler */
+        sqlite3_busy_handler(db->db, db_busy_callback, db);
+    }
+
+    return 0;
+}
+
+static int db_busy_timeout(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    int timeout = luaL_checkint(L, 2);
+    sqlite3_busy_timeout(db->db, timeout);
+
+    /* if there was a timeout callback registered, it is now
+    ** invalid/useless. free any references we may have */
+    luaL_unref(L, LUA_REGISTRYINDEX, db->busy_cb);
+    luaL_unref(L, LUA_REGISTRYINDEX, db->busy_udata);
+    db->busy_cb =
+    db->busy_udata = LUA_NOREF;
+
+    return 0;
+}
+
+/*
+** Params: db, sql, callback, user
+** returns: code [, errmsg]
+**
+** Callback:
+** Params: user, number of columns, values, names
+** Returns: 0 to continue, other value will cause abort
+*/
+static int db_exec_callback(void* user, int columns, char **data, char **names) {
+    int result = SQLITE_ABORT; /* abort by default */
+    lua_State *L = (lua_State*)user;
+    int n;
+
+    int top = lua_gettop(L);
+
+    lua_pushvalue(L, 3); /* function to call */
+    lua_pushvalue(L, 4); /* user data */
+    lua_pushinteger(L, columns); /* total number of rows in result */
+
+    /* column values */
+    lua_pushvalue(L, 6);
+    for (n = 0; n < columns;) {
+        lua_pushstring(L, data[n++]);
+        lua_rawseti(L, -2, n);
+    }
+
+    /* columns names */
+    lua_pushvalue(L, 5);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        lua_createtable(L, columns, 0);
+        lua_pushvalue(L, -1);
+        lua_replace(L, 5);
+        for (n = 0; n < columns;) {
+            lua_pushstring(L, names[n++]);
+            lua_rawseti(L, -2, n);
+        }
+    }
+
+    /* call lua function */
+    if (!lua_pcall(L, 4, 1, 0)) {
+
+#if LUA_VERSION_NUM > 502
+        if (lua_isinteger(L, -1))
+            result = lua_tointeger(L, -1);
+        else
+#endif
+        if (lua_isnumber(L, -1))
+            result = lua_tonumber(L, -1);
+    }
+
+    lua_settop(L, top);
+    return result;
+}
+
+static int db_exec(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    const char *sql = luaL_checkstring(L, 2);
+    int result;
+
+    if (!lua_isnoneornil(L, 3)) {
+        /* stack:
+        **  3: callback function
+        **  4: userdata
+        **  5: column names
+        **  6: reusable column values
+        */
+        luaL_checktype(L, 3, LUA_TFUNCTION);
+        lua_settop(L, 4);   /* 'trap' userdata - nil extra parameters */
+        lua_pushnil(L);     /* column names not known at this point */
+        lua_newtable(L);    /* column values table */
+
+        result = sqlite3_exec(db->db, sql, db_exec_callback, L, NULL);
+    }
+    else {
+        /* no callbacks */
+        result = sqlite3_exec(db->db, sql, NULL, NULL, NULL);
+    }
+
+    lua_pushinteger(L, result);
+    return 1;
+}
+
+/*
+** Params: db, sql
+** returns: code, compiled length or error message
+*/
+static int db_prepare(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    const char *sql = luaL_checkstring(L, 2);
+    int sql_len = lua_strlen(L, 2);
+    const char *sqltail;
+    sdb_vm *svm;
+    lua_settop(L,2); /* db,sql is on top of stack for call to newvm */
+    svm = newvm(L, db);
+
+    if (sqlite3_prepare_v2(db->db, sql, sql_len, &svm->vm, &sqltail) != SQLITE_OK) {
+        lua_pushnil(L);
+        lua_pushinteger(L, sqlite3_errcode(db->db));
+        if (cleanupvm(L, svm) == 1)
+            lua_pop(L, 1); /* this should not happen since sqlite3_prepare_v2 will not set ->vm on error */
+        return 2;
+    }
+
+    /* vm already in the stack */
+    lua_pushstring(L, sqltail);
+    return 2;
+}
+
+static int db_do_next_row(lua_State *L, int packed) {
+    int result;
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    sqlite3_stmt *vm;
+    int columns;
+    int i;
+
+    result = stepvm(L, svm);
+    vm = svm->vm; /* stepvm may change svm->vm if re-prepare is needed */
+    svm->has_values = result == SQLITE_ROW ? 1 : 0;
+    svm->columns = columns = sqlite3_data_count(vm);
+
+    if (result == SQLITE_ROW) {
+        if (packed) {
+            if (packed == 1) {
+                lua_createtable(L, columns, 0);
+                for (i = 0; i < columns;) {
+                    vm_push_column(L, vm, i);
+                    lua_rawseti(L, -2, ++i);
+                }
+            }
+            else {
+                lua_createtable(L, 0, columns);
+                for (i = 0; i < columns; ++i) {
+                    lua_pushstring(L, sqlite3_column_name(vm, i));
+                    vm_push_column(L, vm, i);
+                    lua_rawset(L, -3);
+                }
+            }
+            return 1;
+        }
+        else {
+            lua_checkstack(L, columns);
+            for (i = 0; i < columns; ++i)
+                vm_push_column(L, vm, i);
+            return svm->columns;
+        }
+    }
+
+    if (svm->temp) {
+        /* finalize and check for errors */
+        result = sqlite3_finalize(vm);
+        svm->vm = NULL;
+        cleanupvm(L, svm);
+    }
+    else if (result == SQLITE_DONE) {
+        result = sqlite3_reset(vm);
+    }
+
+    if (result != SQLITE_OK) {
+        lua_pushstring(L, sqlite3_errmsg(svm->db->db));
+        lua_error(L);
+    }
+    return 0;
+}
+
+static int db_next_row(lua_State *L) {
+    return db_do_next_row(L, 0);
+}
+
+static int db_next_packed_row(lua_State *L) {
+    return db_do_next_row(L, 1);
+}
+
+static int db_next_named_row(lua_State *L) {
+    return db_do_next_row(L, 2);
+}
+
+static int dbvm_do_rows(lua_State *L, int(*f)(lua_State *)) {
+    /* sdb_vm *svm =  */
+    lsqlite_checkvm(L, 1);
+    lua_pushvalue(L,1);
+    lua_pushcfunction(L, f);
+    lua_insert(L, -2);
+    return 2;
+}
+
+static int dbvm_rows(lua_State *L) {
+    return dbvm_do_rows(L, db_next_packed_row);
+}
+
+static int dbvm_nrows(lua_State *L) {
+    return dbvm_do_rows(L, db_next_named_row);
+}
+
+static int dbvm_urows(lua_State *L) {
+    return dbvm_do_rows(L, db_next_row);
+}
+
+static int db_do_rows(lua_State *L, int(*f)(lua_State *)) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    const char *sql = luaL_checkstring(L, 2);
+    sdb_vm *svm;
+
+    int nargs = lua_gettop(L) - 2;
+    if (nargs > 0) {
+        lua_pushvalue(L, 1);
+        lua_pushvalue(L, 2);    /* copy db,sql on top of the stack for newvm */
+    }
+
+    svm = newvm(L, db);
+    svm->temp = 1;
+
+    if (sqlite3_prepare_v2(db->db, sql, -1, &svm->vm, NULL) != SQLITE_OK) {
+        lua_pushstring(L, sqlite3_errmsg(svm->db->db));
+        if (cleanupvm(L, svm) == 1)
+            lua_pop(L, 1); /* this should not happen since sqlite3_prepare_v2 will not set ->vm on error */
+        lua_error(L);
+    }
+
+    if (nargs > 0) {
+        lua_replace(L, 1);
+        lua_remove(L, 2);  /* stack: vm, args.. */
+
+        if (nargs == 1 && lua_istable(L, 2)) {
+            int result;
+            if ((result = dbvm_bind_table_fields (L, 2, nargs, svm->vm)) != SQLITE_OK) {
+                lua_pushstring(L, sqlite3_errstr(result));
+                cleanupvm(L, svm);
+                lua_error(L);
+            }
+        } else if (nargs == sqlite3_bind_parameter_count(svm->vm)) {
+            int result, i;
+            for (i = 1; i <= nargs; i++) {
+                if ((result = dbvm_bind_index(L, svm->vm, i, i + 1)) != SQLITE_OK) {
+                    lua_pushstring(L, sqlite3_errstr(result));
+                    cleanupvm(L, svm);
+                    lua_error(L);
+                }
+            }
+        } else {
+            luaL_error(L, "Required either %d parameters or a single table, got %d.",
+                sqlite3_bind_parameter_count(svm->vm), nargs);
+        }
+        lua_pop(L, nargs);
+        lua_pushvalue(L, 1);
+    }
+
+    lua_pushcfunction(L, f);
+    lua_insert(L, -2);
+    return 2;
+}
+
+static int db_rows(lua_State *L) {
+    return db_do_rows(L, db_next_packed_row);
+}
+
+static int db_nrows(lua_State *L) {
+    return db_do_rows(L, db_next_named_row);
+}
+
+/* unpacked version of db:rows */
+static int db_urows(lua_State *L) {
+    return db_do_rows(L, db_next_row);
+}
+
+static int db_tostring(lua_State *L) {
+    char buff[32];
+    sdb *db = lsqlite_getdb(L, 1);
+    if (db->db == NULL)
+        strcpy(buff, "closed");
+    else
+        sprintf(buff, "%p", lua_touserdata(L, 1));
+    lua_pushfstring(L, "sqlite database (%s)", buff);
+    return 1;
+}
+
+static int db_close(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    lua_pushinteger(L, cleanupdb(L, db));
+    return 1;
+}
+
+static int db_close_vm(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    /* cleanup temporary only tables? */
+    int temp = lua_toboolean(L, 2);
+
+    /* free associated virtual machines */
+    lua_pushlightuserdata(L, db);
+    lua_rawget(L, LUA_REGISTRYINDEX);
+
+    /* close all used handles */
+    lua_pushnil(L);
+    while (lua_next(L, -2)) {
+        sdb_vm *svm = lua_touserdata(L, -2); /* key: vm; val: sql text */
+
+        if ((!temp || svm->temp) && svm->vm)
+        {
+            sqlite3_finalize(svm->vm);
+            svm->vm = NULL;
+        }
+
+        /* leave key in the stack */
+        lua_pop(L, 1);
+    }
+    return 0;
+}
+
+/* From: Wolfgang Oertl
+When using lsqlite3 in a multithreaded environment, each thread has a separate Lua 
+environment, but full userdata structures can't be passed from one thread to another.
+This is possible with lightuserdata, however. See: lsqlite_open_ptr().
+*/
+static int db_get_ptr(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    lua_pushlightuserdata(L, db->db);
+    return 1;
+}
+
+static int db_gc(lua_State *L) {
+    sdb *db = lsqlite_getdb(L, 1);
+    if (db->db != NULL)  /* ignore closed databases */
+        cleanupdb(L, db);
+    return 0;
+}
+
+/*
+** =======================================================
+** General library functions
+** =======================================================
+*/
+
+static int lsqlite_version(lua_State *L) {
+    lua_pushstring(L, sqlite3_libversion());
+    return 1;
+}
+
+static int lsqlite_complete(lua_State *L) {
+    const char *sql = luaL_checkstring(L, 1);
+    lua_pushboolean(L, sqlite3_complete(sql));
+    return 1;
+}
+
+#ifndef _WIN32
+static int lsqlite_temp_directory(lua_State *L) {
+    const char *oldtemp = sqlite3_temp_directory;
+
+    if (!lua_isnone(L, 1)) {
+        const char *temp = luaL_optstring(L, 1, NULL);
+        if (sqlite3_temp_directory) {
+            sqlite3_free((char*)sqlite3_temp_directory);
+        }
+        if (temp) {
+            sqlite3_temp_directory = sqlite3_mprintf("%s", temp);
+        }
+        else {
+            sqlite3_temp_directory = NULL;
+        }
+    }
+    lua_pushstring(L, oldtemp);
+    return 1;
+}
+#endif
+
+#if defined(SQLITE_ENABLE_CEROD)
+static int lsqlite_activate_cerod(lua_State *L) {
+    const char *s = luaL_checkstring(L, 1);
+    sqlite3_activate_cerod(s);
+    lua_pushnil(L);
+    return 0;
+}
+#endif
+
+static int lsqlite_do_open(lua_State *L, const char *filename, int flags) {
+    sdb *db = newdb(L); /* create and leave in stack */
+
+    if (SQLITE3_OPEN(filename, &db->db, flags) == SQLITE_OK) {
+        /* database handle already in the stack - return it */
+        return 1;
+    }
+
+    /* failed to open database */
+    lua_pushnil(L);                             /* push nil */
+    lua_pushinteger(L, sqlite3_errcode(db->db));
+    lua_pushstring(L, sqlite3_errmsg(db->db));  /* push error message */
+
+    /* clean things up */
+    cleanupdb(L, db);
+
+    /* return */
+    return 3;
+}
+
+static int lsqlite_open(lua_State *L) {
+    const char *filename = luaL_checkstring(L, 1);
+    int flags = luaL_optinteger(L, 2, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    return lsqlite_do_open(L, filename, flags);
+}
+
+static int lsqlite_open_memory(lua_State *L) {
+    return lsqlite_do_open(L, ":memory:", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+}
+
+/* From: Wolfgang Oertl
+When using lsqlite3 in a multithreaded environment, each thread has a separate Lua 
+environment, but full userdata structures can't be passed from one thread to another.
+This is possible with lightuserdata, however. See: db_get_ptr().
+*/
+static int lsqlite_open_ptr(lua_State *L) {
+    sqlite3 *db_ptr;
+    sdb *db;
+    int rc;
+
+    luaL_checktype(L, 1, LUA_TLIGHTUSERDATA);
+    db_ptr = lua_touserdata(L, 1);
+    /* This is the only API function that runs sqlite3SafetyCheck regardless of
+     * SQLITE_ENABLE_API_ARMOR and does almost nothing (without an SQL
+     * statement) */
+    rc = sqlite3_exec(db_ptr, NULL, NULL, NULL, NULL);
+    if (rc != SQLITE_OK)
+        luaL_argerror(L, 1, "not a valid SQLite3 pointer");
+
+    db = newdb(L); /* create and leave in stack */
+    db->db = db_ptr;
+    return 1;
+}
+
+static int lsqlite_newindex(lua_State *L) {
+    lua_pushliteral(L, "attempt to change readonly table");
+    lua_error(L);
+    return 0;
+}
+
+#ifndef LSQLITE_VERSION
+/* should be defined in rockspec, but just in case... */
+#define LSQLITE_VERSION "unknown"
+#endif
+
+/* Version number of this library
+*/
+static int lsqlite_lversion(lua_State *L) {
+    lua_pushstring(L, LSQLITE_VERSION);
+    return 1;
+}
+
+/*
+** =======================================================
+** Register functions
+** =======================================================
+*/
+
+#define SC(s)   { #s, SQLITE_ ## s },
+#define LSC(s)  { #s, LSQLITE_ ## s },
+
+static const struct {
+    const char* name;
+    int value;
+} sqlite_constants[] = {
+    /* error codes */
+    SC(OK)          SC(ERROR)       SC(INTERNAL)    SC(PERM)
+    SC(ABORT)       SC(BUSY)        SC(LOCKED)      SC(NOMEM)
+    SC(READONLY)    SC(INTERRUPT)   SC(IOERR)       SC(CORRUPT)
+    SC(NOTFOUND)    SC(FULL)        SC(CANTOPEN)    SC(PROTOCOL)
+    SC(EMPTY)       SC(SCHEMA)      SC(TOOBIG)      SC(CONSTRAINT)
+    SC(MISMATCH)    SC(MISUSE)      SC(NOLFS)
+    SC(FORMAT)      SC(NOTADB)
+
+    /* sqlite_step specific return values */
+    SC(RANGE)       SC(ROW)         SC(DONE)
+
+    /* column types */
+    SC(INTEGER)     SC(FLOAT)       SC(TEXT)        SC(BLOB)
+    SC(NULL)
+
+    /* Authorizer Action Codes */
+    SC(CREATE_INDEX       )
+    SC(CREATE_TABLE       )
+    SC(CREATE_TEMP_INDEX  )
+    SC(CREATE_TEMP_TABLE  )
+    SC(CREATE_TEMP_TRIGGER)
+    SC(CREATE_TEMP_VIEW   )
+    SC(CREATE_TRIGGER     )
+    SC(CREATE_VIEW        )
+    SC(DELETE             )
+    SC(DROP_INDEX         )
+    SC(DROP_TABLE         )
+    SC(DROP_TEMP_INDEX    )
+    SC(DROP_TEMP_TABLE    )
+    SC(DROP_TEMP_TRIGGER  )
+    SC(DROP_TEMP_VIEW     )
+    SC(DROP_TRIGGER       )
+    SC(DROP_VIEW          )
+    SC(INSERT             )
+    SC(PRAGMA             )
+    SC(READ               )
+    SC(SELECT             )
+    SC(TRANSACTION        )
+    SC(UPDATE             )
+    SC(ATTACH             )
+    SC(DETACH             )
+    SC(ALTER_TABLE        )
+    SC(REINDEX            )
+    SC(ANALYZE            )
+    SC(CREATE_VTABLE      )
+    SC(DROP_VTABLE        )
+    SC(FUNCTION           )
+    SC(SAVEPOINT          )
+
+    /* file open flags */
+    SC(OPEN_READONLY)
+    SC(OPEN_READWRITE)
+    SC(OPEN_CREATE)
+    SC(OPEN_URI)
+    SC(OPEN_MEMORY)
+    SC(OPEN_NOMUTEX)
+    SC(OPEN_FULLMUTEX)
+    SC(OPEN_SHAREDCACHE)
+    SC(OPEN_PRIVATECACHE)
     
-      <meta name="description" content="The ao component and tools Monorepo  - 🐰 🕳️ 👈. Contribute to elliotsayes/ao development by creating an account on GitHub.">
-      <link rel="search" type="application/opensearchdescription+xml" href="/opensearch.xml" title="GitHub">
-    <link rel="fluid-icon" href="https://github.com/fluidicon.png" title="GitHub">
-    <meta property="fb:app_id" content="1401488693436528">
-    <meta name="apple-itunes-app" content="app-id=1477376905, app-argument=https://github.com/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c" />
-      <meta name="twitter:image:src" content="https://opengraph.githubassets.com/516fc21ce692983e05fc29dcc4d2797ac8b0ac811a997ed2e3d8e6103953eed1/elliotsayes/ao" /><meta name="twitter:site" content="@github" /><meta name="twitter:card" content="summary_large_image" /><meta name="twitter:title" content="ao/dev-cli/container/src/lsqlite3.c at sqlite · elliotsayes/ao" /><meta name="twitter:description" content="The ao component and tools Monorepo  - 🐰 🕳️ 👈. Contribute to elliotsayes/ao development by creating an account on GitHub." />
-      <meta property="og:image" content="https://opengraph.githubassets.com/516fc21ce692983e05fc29dcc4d2797ac8b0ac811a997ed2e3d8e6103953eed1/elliotsayes/ao" /><meta property="og:image:alt" content="The ao component and tools Monorepo  - 🐰 🕳️ 👈. Contribute to elliotsayes/ao development by creating an account on GitHub." /><meta property="og:image:width" content="1200" /><meta property="og:image:height" content="600" /><meta property="og:site_name" content="GitHub" /><meta property="og:type" content="object" /><meta property="og:title" content="ao/dev-cli/container/src/lsqlite3.c at sqlite · elliotsayes/ao" /><meta property="og:url" content="https://github.com/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c" /><meta property="og:description" content="The ao component and tools Monorepo  - 🐰 🕳️ 👈. Contribute to elliotsayes/ao development by creating an account on GitHub." />
-      
-
-
-
-        <meta name="hostname" content="github.com">
-
-
-
-        <meta name="expected-hostname" content="github.com">
-
-
-  <meta http-equiv="x-pjax-version" content="f69737d19421da5f89b794aa3b9606932fbdf4448db0036a86e4be2f889d32b3" data-turbo-track="reload">
-  <meta http-equiv="x-pjax-csp-version" content="5dcfbec3488c5fd5a334e287ce6a17058b7d4beb91db2d4d184e4d55bbf1d7d7" data-turbo-track="reload">
-  <meta http-equiv="x-pjax-css-version" content="c67cdc7fb3b2a4277361bf2e353e8fcbaf6357d01716ba7a1f8b2a17552aee2d" data-turbo-track="reload">
-  <meta http-equiv="x-pjax-js-version" content="928189e1ac9b5d5a3064ca76161ef79107ba689ba932ff48cef43fbc729c92a1" data-turbo-track="reload">
-
-  <meta name="turbo-cache-control" content="no-preview" data-turbo-transient="">
-
-      <meta name="turbo-cache-control" content="no-cache" data-turbo-transient>
-    <meta data-hydrostats="publish">
-  <link crossorigin="anonymous" media="all" rel="stylesheet" href="https://github.githubassets.com/assets/react-code-view.959fb0b61e6a1de773e7.module.css" />
-
-  <meta name="go-import" content="github.com/elliotsayes/ao git https://github.com/elliotsayes/ao.git">
-
-  <meta name="octolytics-dimension-user_id" content="7699058" /><meta name="octolytics-dimension-user_login" content="elliotsayes" /><meta name="octolytics-dimension-repository_id" content="774396487" /><meta name="octolytics-dimension-repository_nwo" content="elliotsayes/ao" /><meta name="octolytics-dimension-repository_public" content="true" /><meta name="octolytics-dimension-repository_is_fork" content="true" /><meta name="octolytics-dimension-repository_parent_id" content="673773996" /><meta name="octolytics-dimension-repository_parent_nwo" content="permaweb/ao" /><meta name="octolytics-dimension-repository_network_root_id" content="673773996" /><meta name="octolytics-dimension-repository_network_root_nwo" content="permaweb/ao" />
-
-
-
-  <meta name="turbo-body-classes" content="logged-out env-production page-responsive">
-
-
-  <meta name="browser-stats-url" content="https://api.github.com/_private/browser/stats">
-
-  <meta name="browser-errors-url" content="https://api.github.com/_private/browser/errors">
-
-  <link rel="mask-icon" href="https://github.githubassets.com/assets/pinned-octocat-093da3e6fa40.svg" color="#000000">
-  <link rel="alternate icon" class="js-site-favicon" type="image/png" href="https://github.githubassets.com/favicons/favicon.png">
-  <link rel="icon" class="js-site-favicon" type="image/svg+xml" href="https://github.githubassets.com/favicons/favicon.svg">
-
-<meta name="theme-color" content="#1e2327">
-<meta name="color-scheme" content="light dark" />
-
-
-  <link rel="manifest" href="/manifest.json" crossOrigin="use-credentials">
-
-  </head>
-
-  <body class="logged-out env-production page-responsive" style="word-wrap: break-word;">
-    <div data-turbo-body class="logged-out env-production page-responsive" style="word-wrap: break-word;">
-      
-
-
-    <div class="position-relative js-header-wrapper ">
-      <a href="#start-of-content" class="px-2 py-4 color-bg-accent-emphasis color-fg-on-emphasis show-on-focus js-skip-to-content">Skip to content</a>
-      <span data-view-component="true" class="progress-pjax-loader Progress position-fixed width-full">
-    <span style="width: 0%;" data-view-component="true" class="Progress-item progress-pjax-loader-bar left-0 top-0 color-bg-accent-emphasis"></span>
-</span>      
-      
-  
-
-
-
-
-
-
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_primer_react_lib-esm_Button_IconButton_js-node_modules_primer_react_lib--23bcad-01764c79fa41.js"></script>
-
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/keyboard-shortcuts-dialog-48a8478d8ac2.js"></script>
-
-<react-partial
-  partial-name="keyboard-shortcuts-dialog"
-  data-ssr="false"
->
-  
-  <script type="application/json" data-target="react-partial.embeddedData">{"props":{}}</script>
-  <div data-target="react-partial.reactRoot"></div>
-</react-partial>
-
-
-
-      
-
-        
-
-            
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/vendors-node_modules_github_remote-form_dist_index_js-node_modules_delegated-events_dist_inde-94fd67-11f6759e1cef.js"></script>
-<script crossorigin="anonymous" defer="defer" type="application/javascript" src="https://github.githubassets.com/assets/sessions-694c8423e347.js"></script>
-<header class="Header-old header-logged-out js-details-container Details position-relative f4 py-3" role="banner" data-color-mode=light data-light-theme=light data-dark-theme=dark>
-  <button type="button" class="Header-backdrop d-lg-none border-0 position-fixed top-0 left-0 width-full height-full js-details-target" aria-label="Toggle navigation">
-    <span class="d-none">Toggle navigation</span>
-  </button>
-
-  <div class=" d-flex flex-column flex-lg-row flex-items-center p-responsive height-full position-relative z-1">
-    <div class="d-flex flex-justify-between flex-items-center width-full width-lg-auto">
-      <a class="mr-lg-3 color-fg-inherit flex-order-2" href="https://github.com/" aria-label="Homepage" data-ga-click="(Logged out) Header, go to homepage, icon:logo-wordmark">
-        <svg height="32" aria-hidden="true" viewBox="0 0 16 16" version="1.1" width="32" data-view-component="true" class="octicon octicon-mark-github">
-    <path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path>
-</svg>
-      </a>
-
-      <div class="flex-1">
-        <a href="/login?return_to=https%3A%2F%2Fgithub.com%2Felliotsayes%2Fao%2Fblob%2Fsqlite%2Fdev-cli%2Fcontainer%2Fsrc%2Flsqlite3.c"
-          class="d-inline-block d-lg-none flex-order-1 f5 no-underline border color-border-default rounded-2 px-2 py-1 color-fg-inherit"
-          data-hydro-click="{&quot;event_type&quot;:&quot;authentication.click&quot;,&quot;payload&quot;:{&quot;location_in_page&quot;:&quot;site header menu&quot;,&quot;repository_id&quot;:null,&quot;auth_type&quot;:&quot;SIGN_UP&quot;,&quot;originating_url&quot;:&quot;https://github.com/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c&quot;,&quot;user_id&quot;:null}}" data-hydro-click-hmac="996ecbb4ef2fc9a696038301d98d53a6042ce0c896a500c46ac6378b561ce7f1"
-          data-ga-click="(Logged out) Header, clicked Sign in, text:sign-in">
-          Sign in
-        </a>
-      </div>
-
-      <div class="flex-1 flex-order-2 text-right">
-        <button aria-label="Toggle navigation" aria-expanded="false" type="button" data-view-component="true" class="js-details-target Button--link Button--medium Button d-lg-none color-fg-inherit p-1">  <span class="Button-content">
-    <span class="Button-label"><div class="HeaderMenu-toggle-bar rounded my-1"></div>
-            <div class="HeaderMenu-toggle-bar rounded my-1"></div>
-            <div class="HeaderMenu-toggle-bar rounded my-1"></div></span>
-  </span>
-</button>
-      </div>
-    </div>
-
-
-    <div class="HeaderMenu--logged-out p-responsive height-fit position-lg-relative d-lg-flex flex-column flex-auto pt-7 pb-4 top-0">
-      <div class="header-menu-wrapper d-flex flex-column flex-self-end flex-lg-row flex-justify-between flex-auto p-3 p-lg-0 rounded rounded-lg-0 mt-3 mt-lg-0">
-          <nav class="mt-0 px-3 px-lg-0 mb-3 mb-lg-0" aria-label="Global">
-            <ul class="d-lg-flex list-style-none">
-                <li class="HeaderMenu-item position-relative flex-wrap flex-justify-between flex-items-center d-block d-lg-flex flex-lg-nowrap flex-lg-items-center js-details-container js-header-menu-item">
-      <button type="button" class="HeaderMenu-link border-0 width-full width-lg-auto px-0 px-lg-2 py-3 py-lg-2 no-wrap d-flex flex-items-center flex-justify-between js-details-target" aria-expanded="false">
-        Product
-        <svg opacity="0.5" aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-chevron-down HeaderMenu-icon ml-1">
-    <path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"></path>
-</svg>
-      </button>
-      <div class="HeaderMenu-dropdown dropdown-menu rounded m-0 p-0 py-2 py-lg-4 position-relative position-lg-absolute left-0 left-lg-n3 d-lg-flex dropdown-menu-wide">
-          <div class="px-lg-4 border-lg-right mb-4 mb-lg-0 pr-lg-7">
-            <ul class="list-style-none f5" >
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center pb-lg-3" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Actions&quot;,&quot;label&quot;:&quot;ref_cta:Actions;&quot;}" href="/features/actions">
-      <svg aria-hidden="true" height="24" viewBox="0 0 24 24" version="1.1" width="24" data-view-component="true" class="octicon octicon-workflow color-fg-subtle mr-3">
-    <path d="M1 3a2 2 0 0 1 2-2h6.5a2 2 0 0 1 2 2v6.5a2 2 0 0 1-2 2H7v4.063C7 16.355 7.644 17 8.438 17H12.5v-2.5a2 2 0 0 1 2-2H21a2 2 0 0 1 2 2V21a2 2 0 0 1-2 2h-6.5a2 2 0 0 1-2-2v-2.5H8.437A2.939 2.939 0 0 1 5.5 15.562V11.5H3a2 2 0 0 1-2-2Zm2-.5a.5.5 0 0 0-.5.5v6.5a.5.5 0 0 0 .5.5h6.5a.5.5 0 0 0 .5-.5V3a.5.5 0 0 0-.5-.5ZM14.5 14a.5.5 0 0 0-.5.5V21a.5.5 0 0 0 .5.5H21a.5.5 0 0 0 .5-.5v-6.5a.5.5 0 0 0-.5-.5Z"></path>
-</svg>
-      <div>
-        <div class="color-fg-default h4">Actions</div>
-        Automate any workflow
-      </div>
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center pb-lg-3" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Packages&quot;,&quot;label&quot;:&quot;ref_cta:Packages;&quot;}" href="/features/packages">
-      <svg aria-hidden="true" height="24" viewBox="0 0 24 24" version="1.1" width="24" data-view-component="true" class="octicon octicon-package color-fg-subtle mr-3">
-    <path d="M12.876.64V.639l8.25 4.763c.541.313.875.89.875 1.515v9.525a1.75 1.75 0 0 1-.875 1.516l-8.25 4.762a1.748 1.748 0 0 1-1.75 0l-8.25-4.763a1.75 1.75 0 0 1-.875-1.515V6.917c0-.625.334-1.202.875-1.515L11.126.64a1.748 1.748 0 0 1 1.75 0Zm-1 1.298L4.251 6.34l7.75 4.474 7.75-4.474-7.625-4.402a.248.248 0 0 0-.25 0Zm.875 19.123 7.625-4.402a.25.25 0 0 0 .125-.216V7.639l-7.75 4.474ZM3.501 7.64v8.803c0 .09.048.172.125.216l7.625 4.402v-8.947Z"></path>
-</svg>
-      <div>
-        <div class="color-fg-default h4">Packages</div>
-        Host and manage packages
-      </div>
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center pb-lg-3" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Security&quot;,&quot;label&quot;:&quot;ref_cta:Security;&quot;}" href="/features/security">
-      <svg aria-hidden="true" height="24" viewBox="0 0 24 24" version="1.1" width="24" data-view-component="true" class="octicon octicon-shield-check color-fg-subtle mr-3">
-    <path d="M16.53 9.78a.75.75 0 0 0-1.06-1.06L11 13.19l-1.97-1.97a.75.75 0 0 0-1.06 1.06l2.5 2.5a.75.75 0 0 0 1.06 0l5-5Z"></path><path d="m12.54.637 8.25 2.675A1.75 1.75 0 0 1 22 4.976V10c0 6.19-3.771 10.704-9.401 12.83a1.704 1.704 0 0 1-1.198 0C5.77 20.705 2 16.19 2 10V4.976c0-.758.489-1.43 1.21-1.664L11.46.637a1.748 1.748 0 0 1 1.08 0Zm-.617 1.426-8.25 2.676a.249.249 0 0 0-.173.237V10c0 5.46 3.28 9.483 8.43 11.426a.199.199 0 0 0 .14 0C17.22 19.483 20.5 15.461 20.5 10V4.976a.25.25 0 0 0-.173-.237l-8.25-2.676a.253.253 0 0 0-.154 0Z"></path>
-</svg>
-      <div>
-        <div class="color-fg-default h4">Security</div>
-        Find and fix vulnerabilities
-      </div>
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center pb-lg-3" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Codespaces&quot;,&quot;label&quot;:&quot;ref_cta:Codespaces;&quot;}" href="/features/codespaces">
-      <svg aria-hidden="true" height="24" viewBox="0 0 24 24" version="1.1" width="24" data-view-component="true" class="octicon octicon-codespaces color-fg-subtle mr-3">
-    <path d="M3.5 3.75C3.5 2.784 4.284 2 5.25 2h13.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 18.75 13H5.25a1.75 1.75 0 0 1-1.75-1.75Zm-2 12c0-.966.784-1.75 1.75-1.75h17.5c.966 0 1.75.784 1.75 1.75v4a1.75 1.75 0 0 1-1.75 1.75H3.25a1.75 1.75 0 0 1-1.75-1.75ZM5.25 3.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h13.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Zm-2 12a.25.25 0 0 0-.25.25v4c0 .138.112.25.25.25h17.5a.25.25 0 0 0 .25-.25v-4a.25.25 0 0 0-.25-.25Z"></path><path d="M10 17.75a.75.75 0 0 1 .75-.75h6.5a.75.75 0 0 1 0 1.5h-6.5a.75.75 0 0 1-.75-.75Zm-4 0a.75.75 0 0 1 .75-.75h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1-.75-.75Z"></path>
-</svg>
-      <div>
-        <div class="color-fg-default h4">Codespaces</div>
-        Instant dev environments
-      </div>
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center pb-lg-3" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Copilot&quot;,&quot;label&quot;:&quot;ref_cta:Copilot;&quot;}" href="/features/copilot">
-      <svg aria-hidden="true" height="24" viewBox="0 0 24 24" version="1.1" width="24" data-view-component="true" class="octicon octicon-copilot color-fg-subtle mr-3">
-    <path d="M23.922 16.992c-.861 1.495-5.859 5.023-11.922 5.023-6.063 0-11.061-3.528-11.922-5.023A.641.641 0 0 1 0 16.736v-2.869a.841.841 0 0 1 .053-.22c.372-.935 1.347-2.292 2.605-2.656.167-.429.414-1.055.644-1.517a10.195 10.195 0 0 1-.052-1.086c0-1.331.282-2.499 1.132-3.368.397-.406.89-.717 1.474-.952 1.399-1.136 3.392-2.093 6.122-2.093 2.731 0 4.767.957 6.166 2.093.584.235 1.077.546 1.474.952.85.869 1.132 2.037 1.132 3.368 0 .368-.014.733-.052 1.086.23.462.477 1.088.644 1.517 1.258.364 2.233 1.721 2.605 2.656a.832.832 0 0 1 .053.22v2.869a.641.641 0 0 1-.078.256ZM12.172 11h-.344a4.323 4.323 0 0 1-.355.508C10.703 12.455 9.555 13 7.965 13c-1.725 0-2.989-.359-3.782-1.259a2.005 2.005 0 0 1-.085-.104L4 11.741v6.585c1.435.779 4.514 2.179 8 2.179 3.486 0 6.565-1.4 8-2.179v-6.585l-.098-.104s-.033.045-.085.104c-.793.9-2.057 1.259-3.782 1.259-1.59 0-2.738-.545-3.508-1.492a4.323 4.323 0 0 1-.355-.508h-.016.016Zm.641-2.935c.136 1.057.403 1.913.878 2.497.442.544 1.134.938 2.344.938 1.573 0 2.292-.337 2.657-.751.384-.435.558-1.15.558-2.361 0-1.14-.243-1.847-.705-2.319-.477-.488-1.319-.862-2.824-1.025-1.487-.161-2.192.138-2.533.529-.269.307-.437.808-.438 1.578v.021c0 .265.021.562.063.893Zm-1.626 0c.042-.331.063-.628.063-.894v-.02c-.001-.77-.169-1.271-.438-1.578-.341-.391-1.046-.69-2.533-.529-1.505.163-2.347.537-2.824 1.025-.462.472-.705 1.179-.705 2.319 0 1.211.175 1.926.558 2.361.365.414 1.084.751 2.657.751 1.21 0 1.902-.394 2.344-.938.475-.584.742-1.44.878-2.497Z"></path><path d="M14.5 14.25a1 1 0 0 1 1 1v2a1 1 0 0 1-2 0v-2a1 1 0 0 1 1-1Zm-5 0a1 1 0 0 1 1 1v2a1 1 0 0 1-2 0v-2a1 1 0 0 1 1-1Z"></path>
-</svg>
-      <div>
-        <div class="color-fg-default h4">Copilot</div>
-        Write better code with AI
-      </div>
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center pb-lg-3" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Code review&quot;,&quot;label&quot;:&quot;ref_cta:Code review;&quot;}" href="/features/code-review">
-      <svg aria-hidden="true" height="24" viewBox="0 0 24 24" version="1.1" width="24" data-view-component="true" class="octicon octicon-code-review color-fg-subtle mr-3">
-    <path d="M10.3 6.74a.75.75 0 0 1-.04 1.06l-2.908 2.7 2.908 2.7a.75.75 0 1 1-1.02 1.1l-3.5-3.25a.75.75 0 0 1 0-1.1l3.5-3.25a.75.75 0 0 1 1.06.04Zm3.44 1.06a.75.75 0 1 1 1.02-1.1l3.5 3.25a.75.75 0 0 1 0 1.1l-3.5 3.25a.75.75 0 1 1-1.02-1.1l2.908-2.7-2.908-2.7Z"></path><path d="M1.5 4.25c0-.966.784-1.75 1.75-1.75h17.5c.966 0 1.75.784 1.75 1.75v12.5a1.75 1.75 0 0 1-1.75 1.75h-9.69l-3.573 3.573A1.458 1.458 0 0 1 5 21.043V18.5H3.25a1.75 1.75 0 0 1-1.75-1.75ZM3.25 4a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h2.5a.75.75 0 0 1 .75.75v3.19l3.72-3.72a.749.749 0 0 1 .53-.22h10a.25.25 0 0 0 .25-.25V4.25a.25.25 0 0 0-.25-.25Z"></path>
-</svg>
-      <div>
-        <div class="color-fg-default h4">Code review</div>
-        Manage code changes
-      </div>
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center pb-lg-3" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Issues&quot;,&quot;label&quot;:&quot;ref_cta:Issues;&quot;}" href="/features/issues">
-      <svg aria-hidden="true" height="24" viewBox="0 0 24 24" version="1.1" width="24" data-view-component="true" class="octicon octicon-issue-opened color-fg-subtle mr-3">
-    <path d="M12 1c6.075 0 11 4.925 11 11s-4.925 11-11 11S1 18.075 1 12 5.925 1 12 1ZM2.5 12a9.5 9.5 0 0 0 9.5 9.5 9.5 9.5 0 0 0 9.5-9.5A9.5 9.5 0 0 0 12 2.5 9.5 9.5 0 0 0 2.5 12Zm9.5 2a2 2 0 1 1-.001-3.999A2 2 0 0 1 12 14Z"></path>
-</svg>
-      <div>
-        <div class="color-fg-default h4">Issues</div>
-        Plan and track work
-      </div>
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Discussions&quot;,&quot;label&quot;:&quot;ref_cta:Discussions;&quot;}" href="/features/discussions">
-      <svg aria-hidden="true" height="24" viewBox="0 0 24 24" version="1.1" width="24" data-view-component="true" class="octicon octicon-comment-discussion color-fg-subtle mr-3">
-    <path d="M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v9.5A1.75 1.75 0 0 1 14.25 14H8.061l-2.574 2.573A1.458 1.458 0 0 1 3 15.543V14H1.75A1.75 1.75 0 0 1 0 12.25v-9.5C0 1.784.784 1 1.75 1ZM1.5 2.75v9.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h6.5a.25.25 0 0 0 .25-.25v-9.5a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Z"></path><path d="M22.5 8.75a.25.25 0 0 0-.25-.25h-3.5a.75.75 0 0 1 0-1.5h3.5c.966 0 1.75.784 1.75 1.75v9.5A1.75 1.75 0 0 1 22.25 20H21v1.543a1.457 1.457 0 0 1-2.487 1.03L15.939 20H10.75A1.75 1.75 0 0 1 9 18.25v-1.465a.75.75 0 0 1 1.5 0v1.465c0 .138.112.25.25.25h5.5a.75.75 0 0 1 .53.22l2.72 2.72v-2.19a.75.75 0 0 1 .75-.75h2a.25.25 0 0 0 .25-.25v-9.5Z"></path>
-</svg>
-      <div>
-        <div class="color-fg-default h4">Discussions</div>
-        Collaborate outside of code
-      </div>
-
-    
-</a></li>
-
-            </ul>
-          </div>
-          <div class="px-lg-4">
-              <span class="d-block h4 color-fg-default my-1" id="product-explore-heading">Explore</span>
-            <ul class="list-style-none f5" aria-labelledby="product-explore-heading">
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to All features&quot;,&quot;label&quot;:&quot;ref_cta:All features;&quot;}" href="/features">
-      All features
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" target="_blank" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Documentation&quot;,&quot;label&quot;:&quot;ref_cta:Documentation;&quot;}" href="https://docs.github.com">
-      Documentation
-
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-link-external HeaderMenu-external-icon color-fg-subtle">
-    <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path>
-</svg>
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" target="_blank" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to GitHub Skills&quot;,&quot;label&quot;:&quot;ref_cta:GitHub Skills;&quot;}" href="https://skills.github.com/">
-      GitHub Skills
-
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-link-external HeaderMenu-external-icon color-fg-subtle">
-    <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path>
-</svg>
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" target="_blank" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Product&quot;,&quot;action&quot;:&quot;click to go to Blog&quot;,&quot;label&quot;:&quot;ref_cta:Blog;&quot;}" href="https://github.blog">
-      Blog
-
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-link-external HeaderMenu-external-icon color-fg-subtle">
-    <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path>
-</svg>
-</a></li>
-
-            </ul>
-          </div>
-      </div>
-</li>
-
-
-                <li class="HeaderMenu-item position-relative flex-wrap flex-justify-between flex-items-center d-block d-lg-flex flex-lg-nowrap flex-lg-items-center js-details-container js-header-menu-item">
-      <button type="button" class="HeaderMenu-link border-0 width-full width-lg-auto px-0 px-lg-2 py-3 py-lg-2 no-wrap d-flex flex-items-center flex-justify-between js-details-target" aria-expanded="false">
-        Solutions
-        <svg opacity="0.5" aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-chevron-down HeaderMenu-icon ml-1">
-    <path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"></path>
-</svg>
-      </button>
-      <div class="HeaderMenu-dropdown dropdown-menu rounded m-0 p-0 py-2 py-lg-4 position-relative position-lg-absolute left-0 left-lg-n3 px-lg-4">
-          <div class="border-bottom pb-3 mb-3">
-              <span class="d-block h4 color-fg-default my-1" id="solutions-for-heading">For</span>
-            <ul class="list-style-none f5" aria-labelledby="solutions-for-heading">
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to Enterprise&quot;,&quot;label&quot;:&quot;ref_cta:Enterprise;&quot;}" href="/enterprise">
-      Enterprise
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to Teams&quot;,&quot;label&quot;:&quot;ref_cta:Teams;&quot;}" href="/team">
-      Teams
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to Startups&quot;,&quot;label&quot;:&quot;ref_cta:Startups;&quot;}" href="/enterprise/startups">
-      Startups
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" target="_blank" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to Education&quot;,&quot;label&quot;:&quot;ref_cta:Education;&quot;}" href="https://education.github.com">
-      Education
-
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-link-external HeaderMenu-external-icon color-fg-subtle">
-    <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path>
-</svg>
-</a></li>
-
-            </ul>
-          </div>
-          <div class="border-bottom pb-3 mb-3">
-              <span class="d-block h4 color-fg-default my-1" id="solutions-by-solution-heading">By Solution</span>
-            <ul class="list-style-none f5" aria-labelledby="solutions-by-solution-heading">
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to CI/CD &amp;amp; Automation&quot;,&quot;label&quot;:&quot;ref_cta:CI/CD &amp;amp; Automation;&quot;}" href="/solutions/ci-cd/">
-      CI/CD &amp; Automation
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to DevOps&quot;,&quot;label&quot;:&quot;ref_cta:DevOps;&quot;}" href="/solutions/devops/">
-      DevOps
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" target="_blank" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to DevSecOps&quot;,&quot;label&quot;:&quot;ref_cta:DevSecOps;&quot;}" href="https://resources.github.com/devops/fundamentals/devsecops/">
-      DevSecOps
-
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-link-external HeaderMenu-external-icon color-fg-subtle">
-    <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path>
-</svg>
-</a></li>
-
-            </ul>
-          </div>
-          <div class="">
-              <span class="d-block h4 color-fg-default my-1" id="solutions-resources-heading">Resources</span>
-            <ul class="list-style-none f5" aria-labelledby="solutions-resources-heading">
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" target="_blank" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to Learning Pathways&quot;,&quot;label&quot;:&quot;ref_cta:Learning Pathways;&quot;}" href="https://resources.github.com/learn/pathways/">
-      Learning Pathways
-
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-link-external HeaderMenu-external-icon color-fg-subtle">
-    <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path>
-</svg>
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" target="_blank" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to White papers, Ebooks, Webinars&quot;,&quot;label&quot;:&quot;ref_cta:White papers, Ebooks, Webinars;&quot;}" href="https://resources.github.com/">
-      White papers, Ebooks, Webinars
-
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-link-external HeaderMenu-external-icon color-fg-subtle">
-    <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path>
-</svg>
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to Customer Stories&quot;,&quot;label&quot;:&quot;ref_cta:Customer Stories;&quot;}" href="/customer-stories">
-      Customer Stories
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" target="_blank" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Solutions&quot;,&quot;action&quot;:&quot;click to go to Partners&quot;,&quot;label&quot;:&quot;ref_cta:Partners;&quot;}" href="https://partner.github.com/">
-      Partners
-
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-link-external HeaderMenu-external-icon color-fg-subtle">
-    <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z"></path>
-</svg>
-</a></li>
-
-            </ul>
-          </div>
-      </div>
-</li>
-
-
-                <li class="HeaderMenu-item position-relative flex-wrap flex-justify-between flex-items-center d-block d-lg-flex flex-lg-nowrap flex-lg-items-center js-details-container js-header-menu-item">
-      <button type="button" class="HeaderMenu-link border-0 width-full width-lg-auto px-0 px-lg-2 py-3 py-lg-2 no-wrap d-flex flex-items-center flex-justify-between js-details-target" aria-expanded="false">
-        Open Source
-        <svg opacity="0.5" aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-chevron-down HeaderMenu-icon ml-1">
-    <path d="M12.78 5.22a.749.749 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.06 0L3.22 6.28a.749.749 0 1 1 1.06-1.06L8 8.939l3.72-3.719a.749.749 0 0 1 1.06 0Z"></path>
-</svg>
-      </button>
-      <div class="HeaderMenu-dropdown dropdown-menu rounded m-0 p-0 py-2 py-lg-4 position-relative position-lg-absolute left-0 left-lg-n3 px-lg-4">
-          <div class="border-bottom pb-3 mb-3">
-            <ul class="list-style-none f5" >
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Open Source&quot;,&quot;action&quot;:&quot;click to go to GitHub Sponsors&quot;,&quot;label&quot;:&quot;ref_cta:GitHub Sponsors;&quot;}" href="/sponsors">
-      
-      <div>
-        <div class="color-fg-default h4">GitHub Sponsors</div>
-        Fund open source developers
-      </div>
-
-    
-</a></li>
-
-            </ul>
-          </div>
-          <div class="border-bottom pb-3 mb-3">
-            <ul class="list-style-none f5" >
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary d-flex flex-items-center" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Open Source&quot;,&quot;action&quot;:&quot;click to go to The ReadME Project&quot;,&quot;label&quot;:&quot;ref_cta:The ReadME Project;&quot;}" href="/readme">
-      
-      <div>
-        <div class="color-fg-default h4">The ReadME Project</div>
-        GitHub community articles
-      </div>
-
-    
-</a></li>
-
-            </ul>
-          </div>
-          <div class="">
-              <span class="d-block h4 color-fg-default my-1" id="open-source-repositories-heading">Repositories</span>
-            <ul class="list-style-none f5" aria-labelledby="open-source-repositories-heading">
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Open Source&quot;,&quot;action&quot;:&quot;click to go to Topics&quot;,&quot;label&quot;:&quot;ref_cta:Topics;&quot;}" href="/topics">
-      Topics
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Open Source&quot;,&quot;action&quot;:&quot;click to go to Trending&quot;,&quot;label&quot;:&quot;ref_cta:Trending;&quot;}" href="/trending">
-      Trending
-
-    
-</a></li>
-
-                <li>
-  <a class="HeaderMenu-dropdown-link lh-condensed d-block no-underline position-relative py-2 Link--secondary" data-analytics-event="{&quot;category&quot;:&quot;Header dropdown (logged out), Open Source&quot;,&quot;action&quot;:&quot;click to go to Collections&quot;,&quot;label&quot;:&quot;ref_cta:Collections;&quot;}" href="/collections">
-      Collections
-
-    
-</a></li>
-
-            </ul>
-          </div>
-      </div>
-</li>
-
-
-                <li class="HeaderMenu-item position-relative flex-wrap flex-justify-between flex-items-center d-block d-lg-flex flex-lg-nowrap flex-lg-items-center js-details-container js-header-menu-item">
-    <a class="HeaderMenu-link no-underline px-0 px-lg-2 py-3 py-lg-2 d-block d-lg-inline-block" data-analytics-event="{&quot;category&quot;:&quot;Header menu top item (logged out)&quot;,&quot;action&quot;:&quot;click to go to Pricing&quot;,&quot;label&quot;:&quot;ref_cta:Pricing;&quot;}" href="/pricing">Pricing</a>
-</li>
-
-            </ul>
-          </nav>
-
-        <div class="d-lg-flex flex-items-center mb-3 mb-lg-0 text-center text-lg-left ml-3" style="">
-                
-
-
-<qbsearch-input class="search-input" data-scope="repo:elliotsayes/ao" data-custom-scopes-path="/search/custom_scopes" data-delete-custom-scopes-csrf="NvA716OJNqFpu0Zx-fLnlwoTmAAJnfcd_BEM7ujMrgpwtXrLyzMnrVZS41_pct0y497kERzW-9yb5jIbyQRpzw" data-max-custom-scopes="10" data-header-redesign-enabled="false" data-initial-value="" data-blackbird-suggestions-path="/search/suggestions" data-jump-to-suggestions-path="/_graphql/GetSuggestedNavigationDestinations" data-current-repository="elliotsayes/ao" data-current-org="" data-current-owner="elliotsayes" data-logged-in="false" data-copilot-chat-enabled="false" data-blackbird-indexed-repo-csrf="<esi:include src=&quot;/_esi/rails_csrf_token_form_hidden?r=h2iLg%2FxG8GWjnL3LMwesMyyl%2FkUPG6r4kvlf0BGy1mkvBmUSzbHjAMPmfQqqPAdK4isQHrZUhxyfvkrnds0tOCzcto0mFTfaLV9zm60beDE3GFaLI8%2Fs%2F%2BBYQs2zd%2BH2t%2FZ5Yu1bX0RIL7k3OGZs95zq4I%2BlPQXFuJcY6BEEJmDgxS5k9h7eU4y8LvE43uZO2%2FSSx%2BwSUks6SvjIfaIWSu0IR86kUpbjERWrpKR1f4RI3oJSubAdqbIqaoyO%2Fz7FjUdlnXfR8J%2BPDEW0oGuek6Mo1eLnWAFyx2jdOmYUfl7GKSogS%2FhdeUjJoNzZE0a2aa%2FMbo6ZvaJiD%2Fj6FWPG0V2rhz7lFsYmkuctzE0pX5j0PT9Whd9s%2BL%2B44sDz875g%2BYsuqn8AWREMkc9qypYB9n145uZoCx2Q3xtuGF7ZEivIirlS15C6%2BuNBlys7PhfgNNX7FdXcmM8mtmOLGq04E5J7HWF5aKjzMTy5kLojVCsqEAVtjtuRYXmH7wTboahn2FHdW7O9WP5NHao80zAn4JLcgkS3Y%2F9bET4zlOyPUX6aVod%2BFtayFxBzQjZf2FGKrg3%2FnF6wiiauYgEgPccPJ%2FjKbFaKfw%3D%3D--NTISrX%2BE20%2Fvz96Y--7K%2BIwK%2B%2FVluzUl1VUdbzwg%3D%3D&quot; />">
-  <div
-    class="search-input-container search-with-dialog position-relative d-flex flex-row flex-items-center mr-4 rounded"
-    data-action="click:qbsearch-input#searchInputContainerClicked"
-  >
-      <button
-        type="button"
-        class="header-search-button placeholder  input-button form-control d-flex flex-1 flex-self-stretch flex-items-center no-wrap width-full py-0 pl-2 pr-0 text-left border-0 box-shadow-none"
-        data-target="qbsearch-input.inputButton"
-        placeholder="Search or jump to..."
-        data-hotkey=s,/
-        autocapitalize="off"
-        data-action="click:qbsearch-input#handleExpand"
-      >
-        <div class="mr-2 color-fg-muted">
-          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-search">
-    <path d="M10.68 11.74a6 6 0 0 1-7.922-8.982 6 6 0 0 1 8.982 7.922l3.04 3.04a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215ZM11.5 7a4.499 4.499 0 1 0-8.997 0A4.499 4.499 0 0 0 11.5 7Z"></path>
-</svg>
-        </div>
-        <span class="flex-1" data-target="qbsearch-input.inputButtonText">Search or jump to...</span>
-          <div class="d-flex" data-target="qbsearch-input.hotkeyIndicator">
-            <svg xmlns="http://www.w3.org/2000/svg" width="22" height="20" aria-hidden="true" class="mr-1"><path fill="none" stroke="#979A9C" opacity=".4" d="M3.5.5h12c1.7 0 3 1.3 3 3v13c0 1.7-1.3 3-3 3h-12c-1.7 0-3-1.3-3-3v-13c0-1.7 1.3-3 3-3z"></path><path fill="#979A9C" d="M11.8 6L8 15.1h-.9L10.8 6h1z"></path></svg>
-
-          </div>
-      </button>
-
-    <input type="hidden" name="type" class="js-site-search-type-field">
-
-    
-<div class="Overlay--hidden " data-modal-dialog-overlay>
-  <modal-dialog data-action="close:qbsearch-input#handleClose cancel:qbsearch-input#handleClose" data-target="qbsearch-input.searchSuggestionsDialog" role="dialog" id="search-suggestions-dialog" aria-modal="true" aria-labelledby="search-suggestions-dialog-header" data-view-component="true" class="Overlay Overlay--width-large Overlay--height-auto">
-      <h1 id="search-suggestions-dialog-header" class="sr-only">Search code, repositories, users, issues, pull requests...</h1>
-    <div class="Overlay-body Overlay-body--paddingNone">
-      
-          <div data-view-component="true">        <div class="search-suggestions position-fixed width-full color-shadow-large border color-fg-default color-bg-default overflow-hidden d-flex flex-column query-builder-container"
-          style="border-radius: 12px;"
-          data-target="qbsearch-input.queryBuilderContainer"
-          hidden
-        >
-          <!-- '"` --><!-- </textarea></xmp> --></option></form><form id="query-builder-test-form" action="" accept-charset="UTF-8" method="get">
-  <query-builder data-target="qbsearch-input.queryBuilder" id="query-builder-query-builder-test" data-filter-key=":" data-view-component="true" class="QueryBuilder search-query-builder">
-    <div class="FormControl FormControl--fullWidth">
-      <label id="query-builder-test-label" for="query-builder-test" class="FormControl-label sr-only">
-        Search
-      </label>
-      <div
-        class="QueryBuilder-StyledInput width-fit "
-        data-target="query-builder.styledInput"
-      >
-          <span id="query-builder-test-leadingvisual-wrap" class="FormControl-input-leadingVisualWrap QueryBuilder-leadingVisualWrap">
-            <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-search FormControl-input-leadingVisual">
-    <path d="M10.68 11.74a6 6 0 0 1-7.922-8.982 6 6 0 0 1 8.982 7.922l3.04 3.04a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215ZM11.5 7a4.499 4.499 0 1 0-8.997 0A4.499 4.499 0 0 0 11.5 7Z"></path>
-</svg>
-          </span>
-        <div data-target="query-builder.styledInputContainer" class="QueryBuilder-StyledInputContainer">
-          <div
-            aria-hidden="true"
-            class="QueryBuilder-StyledInputContent"
-            data-target="query-builder.styledInputContent"
-          ></div>
-          <div class="QueryBuilder-InputWrapper">
-            <div aria-hidden="true" class="QueryBuilder-Sizer" data-target="query-builder.sizer"></div>
-            <input id="query-builder-test" name="query-builder-test" value="" autocomplete="off" type="text" role="combobox" spellcheck="false" aria-expanded="false" aria-describedby="validation-edae8576-77cd-4aa1-b895-dfa5ec78f775" data-target="query-builder.input" data-action="
-          input:query-builder#inputChange
-          blur:query-builder#inputBlur
-          keydown:query-builder#inputKeydown
-          focus:query-builder#inputFocus
-        " data-view-component="true" class="FormControl-input QueryBuilder-Input FormControl-medium" />
-          </div>
-        </div>
-          <span class="sr-only" id="query-builder-test-clear">Clear</span>
-          <button role="button" id="query-builder-test-clear-button" aria-labelledby="query-builder-test-clear query-builder-test-label" data-target="query-builder.clearButton" data-action="
-                click:query-builder#clear
-                focus:query-builder#clearButtonFocus
-                blur:query-builder#clearButtonBlur
-              " variant="small" hidden="hidden" type="button" data-view-component="true" class="Button Button--iconOnly Button--invisible Button--medium mr-1 px-2 py-0 d-flex flex-items-center rounded-1 color-fg-muted">  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-x-circle-fill Button-visual">
-    <path d="M2.343 13.657A8 8 0 1 1 13.658 2.343 8 8 0 0 1 2.343 13.657ZM6.03 4.97a.751.751 0 0 0-1.042.018.751.751 0 0 0-.018 1.042L6.94 8 4.97 9.97a.749.749 0 0 0 .326 1.275.749.749 0 0 0 .734-.215L8 9.06l1.97 1.97a.749.749 0 0 0 1.275-.326.749.749 0 0 0-.215-.734L9.06 8l1.97-1.97a.749.749 0 0 0-.326-1.275.749.749 0 0 0-.734.215L8 6.94Z"></path>
-</svg>
-</button>
-
-      </div>
-      <template id="search-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-search">
-    <path d="M10.68 11.74a6 6 0 0 1-7.922-8.982 6 6 0 0 1 8.982 7.922l3.04 3.04a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215ZM11.5 7a4.499 4.499 0 1 0-8.997 0A4.499 4.499 0 0 0 11.5 7Z"></path>
-</svg>
-</template>
-
-<template id="code-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-code">
-    <path d="m11.28 3.22 4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734L13.94 8l-3.72-3.72a.749.749 0 0 1 .326-1.275.749.749 0 0 1 .734.215Zm-6.56 0a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042L2.06 8l3.72 3.72a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L.47 8.53a.75.75 0 0 1 0-1.06Z"></path>
-</svg>
-</template>
-
-<template id="file-code-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-file-code">
-    <path d="M4 1.75C4 .784 4.784 0 5.75 0h5.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v8.586A1.75 1.75 0 0 1 14.25 15h-9a.75.75 0 0 1 0-1.5h9a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 10 4.25V1.5H5.75a.25.25 0 0 0-.25.25v2.5a.75.75 0 0 1-1.5 0Zm1.72 4.97a.75.75 0 0 1 1.06 0l2 2a.75.75 0 0 1 0 1.06l-2 2a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734l1.47-1.47-1.47-1.47a.75.75 0 0 1 0-1.06ZM3.28 7.78 1.81 9.25l1.47 1.47a.751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018l-2-2a.75.75 0 0 1 0-1.06l2-2a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042Zm8.22-6.218V4.25c0 .138.112.25.25.25h2.688l-.011-.013-2.914-2.914-.013-.011Z"></path>
-</svg>
-</template>
-
-<template id="history-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-history">
-    <path d="m.427 1.927 1.215 1.215a8.002 8.002 0 1 1-1.6 5.685.75.75 0 1 1 1.493-.154 6.5 6.5 0 1 0 1.18-4.458l1.358 1.358A.25.25 0 0 1 3.896 6H.25A.25.25 0 0 1 0 5.75V2.104a.25.25 0 0 1 .427-.177ZM7.75 4a.75.75 0 0 1 .75.75v2.992l2.028.812a.75.75 0 0 1-.557 1.392l-2.5-1A.751.751 0 0 1 7 8.25v-3.5A.75.75 0 0 1 7.75 4Z"></path>
-</svg>
-</template>
-
-<template id="repo-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-repo">
-    <path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8ZM5 12.25a.25.25 0 0 1 .25-.25h3.5a.25.25 0 0 1 .25.25v3.25a.25.25 0 0 1-.4.2l-1.45-1.087a.249.249 0 0 0-.3 0L5.4 15.7a.25.25 0 0 1-.4-.2Z"></path>
-</svg>
-</template>
-
-<template id="bookmark-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-bookmark">
-    <path d="M3 2.75C3 1.784 3.784 1 4.75 1h6.5c.966 0 1.75.784 1.75 1.75v11.5a.75.75 0 0 1-1.227.579L8 11.722l-3.773 3.107A.751.751 0 0 1 3 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v9.91l3.023-2.489a.75.75 0 0 1 .954 0l3.023 2.49V2.75a.25.25 0 0 0-.25-.25Z"></path>
-</svg>
-</template>
-
-<template id="plus-circle-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-plus-circle">
-    <path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm7.25-3.25v2.5h2.5a.75.75 0 0 1 0 1.5h-2.5v2.5a.75.75 0 0 1-1.5 0v-2.5h-2.5a.75.75 0 0 1 0-1.5h2.5v-2.5a.75.75 0 0 1 1.5 0Z"></path>
-</svg>
-</template>
-
-<template id="circle-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-dot-fill">
-    <path d="M8 4a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z"></path>
-</svg>
-</template>
-
-<template id="trash-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-trash">
-    <path d="M11 1.75V3h2.25a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75ZM4.496 6.675l.66 6.6a.25.25 0 0 0 .249.225h5.19a.25.25 0 0 0 .249-.225l.66-6.6a.75.75 0 0 1 1.492.149l-.66 6.6A1.748 1.748 0 0 1 10.595 15h-5.19a1.75 1.75 0 0 1-1.741-1.575l-.66-6.6a.75.75 0 1 1 1.492-.15ZM6.5 1.75V3h3V1.75a.25.25 0 0 0-.25-.25h-2.5a.25.25 0 0 0-.25.25Z"></path>
-</svg>
-</template>
-
-<template id="team-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-people">
-    <path d="M2 5.5a3.5 3.5 0 1 1 5.898 2.549 5.508 5.508 0 0 1 3.034 4.084.75.75 0 1 1-1.482.235 4 4 0 0 0-7.9 0 .75.75 0 0 1-1.482-.236A5.507 5.507 0 0 1 3.102 8.05 3.493 3.493 0 0 1 2 5.5ZM11 4a3.001 3.001 0 0 1 2.22 5.018 5.01 5.01 0 0 1 2.56 3.012.749.749 0 0 1-.885.954.752.752 0 0 1-.549-.514 3.507 3.507 0 0 0-2.522-2.372.75.75 0 0 1-.574-.73v-.352a.75.75 0 0 1 .416-.672A1.5 1.5 0 0 0 11 5.5.75.75 0 0 1 11 4Zm-5.5-.5a2 2 0 1 0-.001 3.999A2 2 0 0 0 5.5 3.5Z"></path>
-</svg>
-</template>
-
-<template id="project-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-project">
-    <path d="M1.75 0h12.5C15.216 0 16 .784 16 1.75v12.5A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25V1.75C0 .784.784 0 1.75 0ZM1.5 1.75v12.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25ZM11.75 3a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5a.75.75 0 0 1 .75-.75Zm-8.25.75a.75.75 0 0 1 1.5 0v5.5a.75.75 0 0 1-1.5 0ZM8 3a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 3Z"></path>
-</svg>
-</template>
-
-<template id="pencil-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-pencil">
-    <path d="M11.013 1.427a1.75 1.75 0 0 1 2.474 0l1.086 1.086a1.75 1.75 0 0 1 0 2.474l-8.61 8.61c-.21.21-.47.364-.756.445l-3.251.93a.75.75 0 0 1-.927-.928l.929-3.25c.081-.286.235-.547.445-.758l8.61-8.61Zm.176 4.823L9.75 4.81l-6.286 6.287a.253.253 0 0 0-.064.108l-.558 1.953 1.953-.558a.253.253 0 0 0 .108-.064Zm1.238-3.763a.25.25 0 0 0-.354 0L10.811 3.75l1.439 1.44 1.263-1.263a.25.25 0 0 0 0-.354Z"></path>
-</svg>
-</template>
-
-<template id="copilot-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-copilot">
-    <path d="M7.998 15.035c-4.562 0-7.873-2.914-7.998-3.749V9.338c.085-.628.677-1.686 1.588-2.065.013-.07.024-.143.036-.218.029-.183.06-.384.126-.612-.201-.508-.254-1.084-.254-1.656 0-.87.128-1.769.693-2.484.579-.733 1.494-1.124 2.724-1.261 1.206-.134 2.262.034 2.944.765.05.053.096.108.139.165.044-.057.094-.112.143-.165.682-.731 1.738-.899 2.944-.765 1.23.137 2.145.528 2.724 1.261.566.715.693 1.614.693 2.484 0 .572-.053 1.148-.254 1.656.066.228.098.429.126.612.012.076.024.148.037.218.924.385 1.522 1.471 1.591 2.095v1.872c0 .766-3.351 3.795-8.002 3.795Zm0-1.485c2.28 0 4.584-1.11 5.002-1.433V7.862l-.023-.116c-.49.21-1.075.291-1.727.291-1.146 0-2.059-.327-2.71-.991A3.222 3.222 0 0 1 8 6.303a3.24 3.24 0 0 1-.544.743c-.65.664-1.563.991-2.71.991-.652 0-1.236-.081-1.727-.291l-.023.116v4.255c.419.323 2.722 1.433 5.002 1.433ZM6.762 2.83c-.193-.206-.637-.413-1.682-.297-1.019.113-1.479.404-1.713.7-.247.312-.369.789-.369 1.554 0 .793.129 1.171.308 1.371.162.181.519.379 1.442.379.853 0 1.339-.235 1.638-.54.315-.322.527-.827.617-1.553.117-.935-.037-1.395-.241-1.614Zm4.155-.297c-1.044-.116-1.488.091-1.681.297-.204.219-.359.679-.242 1.614.091.726.303 1.231.618 1.553.299.305.784.54 1.638.54.922 0 1.28-.198 1.442-.379.179-.2.308-.578.308-1.371 0-.765-.123-1.242-.37-1.554-.233-.296-.693-.587-1.713-.7Z"></path><path d="M6.25 9.037a.75.75 0 0 1 .75.75v1.501a.75.75 0 0 1-1.5 0V9.787a.75.75 0 0 1 .75-.75Zm4.25.75v1.501a.75.75 0 0 1-1.5 0V9.787a.75.75 0 0 1 1.5 0Z"></path>
-</svg>
-</template>
-
-<template id="workflow-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-workflow">
-    <path d="M0 1.75C0 .784.784 0 1.75 0h3.5C6.216 0 7 .784 7 1.75v3.5A1.75 1.75 0 0 1 5.25 7H4v4a1 1 0 0 0 1 1h4v-1.25C9 9.784 9.784 9 10.75 9h3.5c.966 0 1.75.784 1.75 1.75v3.5A1.75 1.75 0 0 1 14.25 16h-3.5A1.75 1.75 0 0 1 9 14.25v-.75H5A2.5 2.5 0 0 1 2.5 11V7h-.75A1.75 1.75 0 0 1 0 5.25Zm1.75-.25a.25.25 0 0 0-.25.25v3.5c0 .138.112.25.25.25h3.5a.25.25 0 0 0 .25-.25v-3.5a.25.25 0 0 0-.25-.25Zm9 9a.25.25 0 0 0-.25.25v3.5c0 .138.112.25.25.25h3.5a.25.25 0 0 0 .25-.25v-3.5a.25.25 0 0 0-.25-.25Z"></path>
-</svg>
-</template>
-
-<template id="book-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-book">
-    <path d="M0 1.75A.75.75 0 0 1 .75 1h4.253c1.227 0 2.317.59 3 1.501A3.743 3.743 0 0 1 11.006 1h4.245a.75.75 0 0 1 .75.75v10.5a.75.75 0 0 1-.75.75h-4.507a2.25 2.25 0 0 0-1.591.659l-.622.621a.75.75 0 0 1-1.06 0l-.622-.621A2.25 2.25 0 0 0 5.258 13H.75a.75.75 0 0 1-.75-.75Zm7.251 10.324.004-5.073-.002-2.253A2.25 2.25 0 0 0 5.003 2.5H1.5v9h3.757a3.75 3.75 0 0 1 1.994.574ZM8.755 4.75l-.004 7.322a3.752 3.752 0 0 1 1.992-.572H14.5v-9h-3.495a2.25 2.25 0 0 0-2.25 2.25Z"></path>
-</svg>
-</template>
-
-<template id="code-review-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-code-review">
-    <path d="M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 13H8.061l-2.574 2.573A1.458 1.458 0 0 1 3 14.543V13H1.75A1.75 1.75 0 0 1 0 11.25v-8.5C0 1.784.784 1 1.75 1ZM1.5 2.75v8.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h6.5a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm5.28 1.72a.75.75 0 0 1 0 1.06L5.31 7l1.47 1.47a.751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018l-2-2a.75.75 0 0 1 0-1.06l2-2a.75.75 0 0 1 1.06 0Zm2.44 0a.75.75 0 0 1 1.06 0l2 2a.75.75 0 0 1 0 1.06l-2 2a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L10.69 7 9.22 5.53a.75.75 0 0 1 0-1.06Z"></path>
-</svg>
-</template>
-
-<template id="codespaces-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-codespaces">
-    <path d="M0 11.25c0-.966.784-1.75 1.75-1.75h12.5c.966 0 1.75.784 1.75 1.75v3A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25Zm2-9.5C2 .784 2.784 0 3.75 0h8.5C13.216 0 14 .784 14 1.75v5a1.75 1.75 0 0 1-1.75 1.75h-8.5A1.75 1.75 0 0 1 2 6.75Zm1.75-.25a.25.25 0 0 0-.25.25v5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-5a.25.25 0 0 0-.25-.25Zm-2 9.5a.25.25 0 0 0-.25.25v3c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-3a.25.25 0 0 0-.25-.25Z"></path><path d="M7 12.75a.75.75 0 0 1 .75-.75h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1-.75-.75Zm-4 0a.75.75 0 0 1 .75-.75h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1-.75-.75Z"></path>
-</svg>
-</template>
-
-<template id="comment-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-comment">
-    <path d="M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H9.06l-2.573 2.573A1.458 1.458 0 0 1 4 13.543V12H2.75A1.75 1.75 0 0 1 1 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h4.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path>
-</svg>
-</template>
-
-<template id="comment-discussion-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-comment-discussion">
-    <path d="M1.75 1h8.5c.966 0 1.75.784 1.75 1.75v5.5A1.75 1.75 0 0 1 10.25 10H7.061l-2.574 2.573A1.458 1.458 0 0 1 2 11.543V10h-.25A1.75 1.75 0 0 1 0 8.25v-5.5C0 1.784.784 1 1.75 1ZM1.5 2.75v5.5c0 .138.112.25.25.25h1a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h3.5a.25.25 0 0 0 .25-.25v-5.5a.25.25 0 0 0-.25-.25h-8.5a.25.25 0 0 0-.25.25Zm13 2a.25.25 0 0 0-.25-.25h-.5a.75.75 0 0 1 0-1.5h.5c.966 0 1.75.784 1.75 1.75v5.5A1.75 1.75 0 0 1 14.25 12H14v1.543a1.458 1.458 0 0 1-2.487 1.03L9.22 12.28a.749.749 0 0 1 .326-1.275.749.749 0 0 1 .734.215l2.22 2.22v-2.19a.75.75 0 0 1 .75-.75h1a.25.25 0 0 0 .25-.25Z"></path>
-</svg>
-</template>
-
-<template id="organization-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-organization">
-    <path d="M1.75 16A1.75 1.75 0 0 1 0 14.25V1.75C0 .784.784 0 1.75 0h8.5C11.216 0 12 .784 12 1.75v12.5c0 .085-.006.168-.018.25h2.268a.25.25 0 0 0 .25-.25V8.285a.25.25 0 0 0-.111-.208l-1.055-.703a.749.749 0 1 1 .832-1.248l1.055.703c.487.325.779.871.779 1.456v5.965A1.75 1.75 0 0 1 14.25 16h-3.5a.766.766 0 0 1-.197-.026c-.099.017-.2.026-.303.026h-3a.75.75 0 0 1-.75-.75V14h-1v1.25a.75.75 0 0 1-.75.75Zm-.25-1.75c0 .138.112.25.25.25H4v-1.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 .75.75v1.25h2.25a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25h-8.5a.25.25 0 0 0-.25.25ZM3.75 6h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5ZM3 3.75A.75.75 0 0 1 3.75 3h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 3.75Zm4 3A.75.75 0 0 1 7.75 6h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 7 6.75ZM7.75 3h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5ZM3 9.75A.75.75 0 0 1 3.75 9h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 9.75ZM7.75 9h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5Z"></path>
-</svg>
-</template>
-
-<template id="rocket-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-rocket">
-    <path d="M14.064 0h.186C15.216 0 16 .784 16 1.75v.186a8.752 8.752 0 0 1-2.564 6.186l-.458.459c-.314.314-.641.616-.979.904v3.207c0 .608-.315 1.172-.833 1.49l-2.774 1.707a.749.749 0 0 1-1.11-.418l-.954-3.102a1.214 1.214 0 0 1-.145-.125L3.754 9.816a1.218 1.218 0 0 1-.124-.145L.528 8.717a.749.749 0 0 1-.418-1.11l1.71-2.774A1.748 1.748 0 0 1 3.31 4h3.204c.288-.338.59-.665.904-.979l.459-.458A8.749 8.749 0 0 1 14.064 0ZM8.938 3.623h-.002l-.458.458c-.76.76-1.437 1.598-2.02 2.5l-1.5 2.317 2.143 2.143 2.317-1.5c.902-.583 1.74-1.26 2.499-2.02l.459-.458a7.25 7.25 0 0 0 2.123-5.127V1.75a.25.25 0 0 0-.25-.25h-.186a7.249 7.249 0 0 0-5.125 2.123ZM3.56 14.56c-.732.732-2.334 1.045-3.005 1.148a.234.234 0 0 1-.201-.064.234.234 0 0 1-.064-.201c.103-.671.416-2.273 1.15-3.003a1.502 1.502 0 1 1 2.12 2.12Zm6.94-3.935c-.088.06-.177.118-.266.175l-2.35 1.521.548 1.783 1.949-1.2a.25.25 0 0 0 .119-.213ZM3.678 8.116 5.2 5.766c.058-.09.117-.178.176-.266H3.309a.25.25 0 0 0-.213.119l-1.2 1.95ZM12 5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path>
-</svg>
-</template>
-
-<template id="shield-check-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-shield-check">
-    <path d="m8.533.133 5.25 1.68A1.75 1.75 0 0 1 15 3.48V7c0 1.566-.32 3.182-1.303 4.682-.983 1.498-2.585 2.813-5.032 3.855a1.697 1.697 0 0 1-1.33 0c-2.447-1.042-4.049-2.357-5.032-3.855C1.32 10.182 1 8.566 1 7V3.48a1.75 1.75 0 0 1 1.217-1.667l5.25-1.68a1.748 1.748 0 0 1 1.066 0Zm-.61 1.429.001.001-5.25 1.68a.251.251 0 0 0-.174.237V7c0 1.36.275 2.666 1.057 3.859.784 1.194 2.121 2.342 4.366 3.298a.196.196 0 0 0 .154 0c2.245-.957 3.582-2.103 4.366-3.297C13.225 9.666 13.5 8.358 13.5 7V3.48a.25.25 0 0 0-.174-.238l-5.25-1.68a.25.25 0 0 0-.153 0ZM11.28 6.28l-3.5 3.5a.75.75 0 0 1-1.06 0l-1.5-1.5a.749.749 0 0 1 .326-1.275.749.749 0 0 1 .734.215l.97.97 2.97-2.97a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042Z"></path>
-</svg>
-</template>
-
-<template id="heart-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-heart">
-    <path d="m8 14.25.345.666a.75.75 0 0 1-.69 0l-.008-.004-.018-.01a7.152 7.152 0 0 1-.31-.17 22.055 22.055 0 0 1-3.434-2.414C2.045 10.731 0 8.35 0 5.5 0 2.836 2.086 1 4.25 1 5.797 1 7.153 1.802 8 3.02 8.847 1.802 10.203 1 11.75 1 13.914 1 16 2.836 16 5.5c0 2.85-2.045 5.231-3.885 6.818a22.066 22.066 0 0 1-3.744 2.584l-.018.01-.006.003h-.002ZM4.25 2.5c-1.336 0-2.75 1.164-2.75 3 0 2.15 1.58 4.144 3.365 5.682A20.58 20.58 0 0 0 8 13.393a20.58 20.58 0 0 0 3.135-2.211C12.92 9.644 14.5 7.65 14.5 5.5c0-1.836-1.414-3-2.75-3-1.373 0-2.609.986-3.029 2.456a.749.749 0 0 1-1.442 0C6.859 3.486 5.623 2.5 4.25 2.5Z"></path>
-</svg>
-</template>
-
-<template id="server-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-server">
-    <path d="M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v4c0 .372-.116.717-.314 1 .198.283.314.628.314 1v4a1.75 1.75 0 0 1-1.75 1.75H1.75A1.75 1.75 0 0 1 0 12.75v-4c0-.358.109-.707.314-1a1.739 1.739 0 0 1-.314-1v-4C0 1.784.784 1 1.75 1ZM1.5 2.75v4c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-4a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm.25 5.75a.25.25 0 0 0-.25.25v4c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-4a.25.25 0 0 0-.25-.25ZM7 4.75A.75.75 0 0 1 7.75 4h4.5a.75.75 0 0 1 0 1.5h-4.5A.75.75 0 0 1 7 4.75ZM7.75 10h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM3 4.75A.75.75 0 0 1 3.75 4h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 4.75ZM3.75 10h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5Z"></path>
-</svg>
-</template>
-
-<template id="globe-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-globe">
-    <path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM5.78 8.75a9.64 9.64 0 0 0 1.363 4.177c.255.426.542.832.857 1.215.245-.296.551-.705.857-1.215A9.64 9.64 0 0 0 10.22 8.75Zm4.44-1.5a9.64 9.64 0 0 0-1.363-4.177c-.307-.51-.612-.919-.857-1.215a9.927 9.927 0 0 0-.857 1.215A9.64 9.64 0 0 0 5.78 7.25Zm-5.944 1.5H1.543a6.507 6.507 0 0 0 4.666 5.5c-.123-.181-.24-.365-.352-.552-.715-1.192-1.437-2.874-1.581-4.948Zm-2.733-1.5h2.733c.144-2.074.866-3.756 1.58-4.948.12-.197.237-.381.353-.552a6.507 6.507 0 0 0-4.666 5.5Zm10.181 1.5c-.144 2.074-.866 3.756-1.58 4.948-.12.197-.237.381-.353.552a6.507 6.507 0 0 0 4.666-5.5Zm2.733-1.5a6.507 6.507 0 0 0-4.666-5.5c.123.181.24.365.353.552.714 1.192 1.436 2.874 1.58 4.948Z"></path>
-</svg>
-</template>
-
-<template id="issue-opened-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-issue-opened">
-    <path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Z"></path>
-</svg>
-</template>
-
-<template id="device-mobile-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-device-mobile">
-    <path d="M3.75 0h8.5C13.216 0 14 .784 14 1.75v12.5A1.75 1.75 0 0 1 12.25 16h-8.5A1.75 1.75 0 0 1 2 14.25V1.75C2 .784 2.784 0 3.75 0ZM3.5 1.75v12.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25h-8.5a.25.25 0 0 0-.25.25ZM8 13a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"></path>
-</svg>
-</template>
-
-<template id="package-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-package">
-    <path d="m8.878.392 5.25 3.045c.54.314.872.89.872 1.514v6.098a1.75 1.75 0 0 1-.872 1.514l-5.25 3.045a1.75 1.75 0 0 1-1.756 0l-5.25-3.045A1.75 1.75 0 0 1 1 11.049V4.951c0-.624.332-1.201.872-1.514L7.122.392a1.75 1.75 0 0 1 1.756 0ZM7.875 1.69l-4.63 2.685L8 7.133l4.755-2.758-4.63-2.685a.248.248 0 0 0-.25 0ZM2.5 5.677v5.372c0 .09.047.171.125.216l4.625 2.683V8.432Zm6.25 8.271 4.625-2.683a.25.25 0 0 0 .125-.216V5.677L8.75 8.432Z"></path>
-</svg>
-</template>
-
-<template id="credit-card-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-credit-card">
-    <path d="M10.75 9a.75.75 0 0 0 0 1.5h1.5a.75.75 0 0 0 0-1.5h-1.5Z"></path><path d="M0 3.75C0 2.784.784 2 1.75 2h12.5c.966 0 1.75.784 1.75 1.75v8.5A1.75 1.75 0 0 1 14.25 14H1.75A1.75 1.75 0 0 1 0 12.25ZM14.5 6.5h-13v5.75c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25Zm0-2.75a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25V5h13Z"></path>
-</svg>
-</template>
-
-<template id="play-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-play">
-    <path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm4.879-2.773 4.264 2.559a.25.25 0 0 1 0 .428l-4.264 2.559A.25.25 0 0 1 6 10.559V5.442a.25.25 0 0 1 .379-.215Z"></path>
-</svg>
-</template>
-
-<template id="gift-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-gift">
-    <path d="M2 2.75A2.75 2.75 0 0 1 4.75 0c.983 0 1.873.42 2.57 1.232.268.318.497.668.68 1.042.183-.375.411-.725.68-1.044C9.376.42 10.266 0 11.25 0a2.75 2.75 0 0 1 2.45 4h.55c.966 0 1.75.784 1.75 1.75v2c0 .698-.409 1.301-1 1.582v4.918A1.75 1.75 0 0 1 13.25 16H2.75A1.75 1.75 0 0 1 1 14.25V9.332C.409 9.05 0 8.448 0 7.75v-2C0 4.784.784 4 1.75 4h.55c-.192-.375-.3-.8-.3-1.25ZM7.25 9.5H2.5v4.75c0 .138.112.25.25.25h4.5Zm1.5 0v5h4.5a.25.25 0 0 0 .25-.25V9.5Zm0-4V8h5.5a.25.25 0 0 0 .25-.25v-2a.25.25 0 0 0-.25-.25Zm-7 0a.25.25 0 0 0-.25.25v2c0 .138.112.25.25.25h5.5V5.5h-5.5Zm3-4a1.25 1.25 0 0 0 0 2.5h2.309c-.233-.818-.542-1.401-.878-1.793-.43-.502-.915-.707-1.431-.707ZM8.941 4h2.309a1.25 1.25 0 0 0 0-2.5c-.516 0-1 .205-1.43.707-.337.392-.646.975-.879 1.793Z"></path>
-</svg>
-</template>
-
-<template id="code-square-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-code-square">
-    <path d="M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v12.5A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V1.75a.25.25 0 0 0-.25-.25Zm7.47 3.97a.75.75 0 0 1 1.06 0l2 2a.75.75 0 0 1 0 1.06l-2 2a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734L10.69 8 9.22 6.53a.75.75 0 0 1 0-1.06ZM6.78 6.53 5.31 8l1.47 1.47a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215l-2-2a.75.75 0 0 1 0-1.06l2-2a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042Z"></path>
-</svg>
-</template>
-
-<template id="device-desktop-icon">
-  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-device-desktop">
-    <path d="M14.25 1c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 14.25 12h-3.727c.099 1.041.52 1.872 1.292 2.757A.752.752 0 0 1 11.25 16h-6.5a.75.75 0 0 1-.565-1.243c.772-.885 1.192-1.716 1.292-2.757H1.75A1.75 1.75 0 0 1 0 10.25v-7.5C0 1.784.784 1 1.75 1ZM1.75 2.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25ZM9.018 12H6.982a5.72 5.72 0 0 1-.765 2.5h3.566a5.72 5.72 0 0 1-.765-2.5Z"></path>
-</svg>
-</template>
-
-        <div class="position-relative">
-                <ul
-                  role="listbox"
-                  class="ActionListWrap QueryBuilder-ListWrap"
-                  aria-label="Suggestions"
-                  data-action="
-                    combobox-commit:query-builder#comboboxCommit
-                    mousedown:query-builder#resultsMousedown
-                  "
-                  data-target="query-builder.resultsList"
-                  data-persist-list=false
-                  id="query-builder-test-results"
-                ></ul>
-        </div>
-      <div class="FormControl-inlineValidation" id="validation-edae8576-77cd-4aa1-b895-dfa5ec78f775" hidden="hidden">
-        <span class="FormControl-inlineValidation--visual">
-          <svg aria-hidden="true" height="12" viewBox="0 0 12 12" version="1.1" width="12" data-view-component="true" class="octicon octicon-alert-fill">
-    <path d="M4.855.708c.5-.896 1.79-.896 2.29 0l4.675 8.351a1.312 1.312 0 0 1-1.146 1.954H1.33A1.313 1.313 0 0 1 .183 9.058ZM7 7V3H5v4Zm-1 3a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"></path>
-</svg>
-        </span>
-        <span></span>
-</div>    </div>
-    <div data-target="query-builder.screenReaderFeedback" aria-live="polite" aria-atomic="true" class="sr-only"></div>
-</query-builder></form>
-          <div class="d-flex flex-row color-fg-muted px-3 text-small color-bg-default search-feedback-prompt">
-            <a target="_blank" href="https://docs.github.com/search-github/github-code-search/understanding-github-code-search-syntax" data-view-component="true" class="Link color-fg-accent text-normal ml-2">
-              Search syntax tips
-</a>            <div class="d-flex flex-1"></div>
-          </div>
-        </div>
-</div>
-
-    </div>
-</modal-dialog></div>
-  </div>
-  <div data-action="click:qbsearch-input#retract" class="dark-backdrop position-fixed" hidden data-target="qbsearch-input.darkBackdrop"></div>
-  <div class="color-fg-default">
-    
-<dialog-helper>
-  <dialog data-target="qbsearch-input.feedbackDialog" data-action="close:qbsearch-input#handleDialogClose cancel:qbsearch-input#handleDialogClose" id="feedback-dialog" aria-modal="true" aria-labelledby="feedback-dialog-title" aria-describedby="feedback-dialog-description" data-view-component="true" class="Overlay Overlay-whenNarrow Overlay--size-medium Overlay--motion-scaleFade">
-    <div data-view-component="true" class="Overlay-header">
-  <div class="Overlay-headerContentWrap">
-    <div class="Overlay-titleWrap">
-      <h1 class="Overlay-title " id="feedback-dialog-title">
-        Provide feedback
-      </h1>
-    </div>
-    <div class="Overlay-actionWrap">
-      <button data-close-dialog-id="feedback-dialog" aria-label="Close" type="button" data-view-component="true" class="close-button Overlay-closeButton"><svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-x">
-    <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"></path>
-</svg></button>
-    </div>
-  </div>
-</div>
-      <scrollable-region data-labelled-by="feedback-dialog-title">
-        <div data-view-component="true" class="Overlay-body">        <!-- '"` --><!-- </textarea></xmp> --></option></form><form id="code-search-feedback-form" data-turbo="false" action="/search/feedback" accept-charset="UTF-8" method="post"><input type="hidden" data-csrf="true" name="authenticity_token" value="uzhfM0Vd0M9+2lphBmXfbIUQttjk6xFDcnoqEopxne0gxUNssurib6+ZjbAHgLRtSJSepVSM81FbmR3Qzr/Bwg==" />
-          <p>We read every piece of feedback, and take your input very seriously.</p>
-          <textarea name="feedback" class="form-control width-full mb-2" style="height: 120px" id="feedback"></textarea>
-          <input name="include_email" id="include_email" aria-label="Include my email address so I can be contacted" class="form-control mr-2" type="checkbox">
-          <label for="include_email" style="font-weight: normal">Include my email address so I can be contacted</label>
-</form></div>
-      </scrollable-region>
-      <div data-view-component="true" class="Overlay-footer Overlay-footer--alignEnd">          <button data-close-dialog-id="feedback-dialog" type="button" data-view-component="true" class="btn">    Cancel
-</button>
-          <button form="code-search-feedback-form" data-action="click:qbsearch-input#submitFeedback" type="submit" data-view-component="true" class="btn-primary btn">    Submit feedback
-</button>
-</div>
-</dialog></dialog-helper>
-
-    <custom-scopes data-target="qbsearch-input.customScopesManager">
-    
-<dialog-helper>
-  <dialog data-target="custom-scopes.customScopesModalDialog" data-action="close:qbsearch-input#handleDialogClose cancel:qbsearch-input#handleDialogClose" id="custom-scopes-dialog" aria-modal="true" aria-labelledby="custom-scopes-dialog-title" aria-describedby="custom-scopes-dialog-description" data-view-component="true" class="Overlay Overlay-whenNarrow Overlay--size-medium Overlay--motion-scaleFade">
-    <div data-view-component="true" class="Overlay-header Overlay-header--divided">
-  <div class="Overlay-headerContentWrap">
-    <div class="Overlay-titleWrap">
-      <h1 class="Overlay-title " id="custom-scopes-dialog-title">
-        Saved searches
-      </h1>
-        <h2 id="custom-scopes-dialog-description" class="Overlay-description">Use saved searches to filter your results more quickly</h2>
-    </div>
-    <div class="Overlay-actionWrap">
-      <button data-close-dialog-id="custom-scopes-dialog" aria-label="Close" type="button" data-view-component="true" class="close-button Overlay-closeButton"><svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-x">
-    <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"></path>
-</svg></button>
-    </div>
-  </div>
-</div>
-      <scrollable-region data-labelled-by="custom-scopes-dialog-title">
-        <div data-view-component="true" class="Overlay-body">        <div data-target="custom-scopes.customScopesModalDialogFlash"></div>
-
-        <div hidden class="create-custom-scope-form" data-target="custom-scopes.createCustomScopeForm">
-        <!-- '"` --><!-- </textarea></xmp> --></option></form><form id="custom-scopes-dialog-form" data-turbo="false" action="/search/custom_scopes" accept-charset="UTF-8" method="post"><input type="hidden" data-csrf="true" name="authenticity_token" value="jU+VoLNtWHlXXigV6cJnOWDqH+PGjq30ko8D099+RX8SLMw5OBdHJ3v1kd9Dt/OIC/w9NYQ6TEmPHhZELoEDLQ==" />
-          <div data-target="custom-scopes.customScopesModalDialogFlash"></div>
-
-          <input type="hidden" id="custom_scope_id" name="custom_scope_id" data-target="custom-scopes.customScopesIdField">
-
-          <div class="form-group">
-            <label for="custom_scope_name">Name</label>
-            <auto-check src="/search/custom_scopes/check_name" required>
-              <input
-                type="text"
-                name="custom_scope_name"
-                id="custom_scope_name"
-                data-target="custom-scopes.customScopesNameField"
-                class="form-control"
-                autocomplete="off"
-                placeholder="github-ruby"
-                required
-                maxlength="50">
-              <input type="hidden" data-csrf="true" value="rYOc+wl8KSfyNSyMSdj6RI1GHg/uDQ9H3mG6A7d0lS2SjqWH8UPDh9K5nQF+is8pJWObIX1rFQwLTdHjZu7S/A==" />
-            </auto-check>
-          </div>
-
-          <div class="form-group">
-            <label for="custom_scope_query">Query</label>
-            <input
-              type="text"
-              name="custom_scope_query"
-              id="custom_scope_query"
-              data-target="custom-scopes.customScopesQueryField"
-              class="form-control"
-              autocomplete="off"
-              placeholder="(repo:mona/a OR repo:mona/b) AND lang:python"
-              required
-              maxlength="500">
-          </div>
-
-          <p class="text-small color-fg-muted">
-            To see all available qualifiers, see our <a class="Link--inTextBlock" href="https://docs.github.com/search-github/github-code-search/understanding-github-code-search-syntax">documentation</a>.
-          </p>
-</form>        </div>
-
-        <div data-target="custom-scopes.manageCustomScopesForm">
-          <div data-target="custom-scopes.list"></div>
-        </div>
-
-</div>
-      </scrollable-region>
-      <div data-view-component="true" class="Overlay-footer Overlay-footer--alignEnd Overlay-footer--divided">          <button data-action="click:custom-scopes#customScopesCancel" type="button" data-view-component="true" class="btn">    Cancel
-</button>
-          <button form="custom-scopes-dialog-form" data-action="click:custom-scopes#customScopesSubmit" data-target="custom-scopes.customScopesSubmitButton" type="submit" data-view-component="true" class="btn-primary btn">    Create saved search
-</button>
-</div>
-</dialog></dialog-helper>
-    </custom-scopes>
-  </div>
-</qbsearch-input><input type="hidden" data-csrf="true" class="js-data-jump-to-suggestions-path-csrf" value="Tl49xtUCACrmzooXzfKzEIFisl3mRN+8zJA1zebs76NfaKmme9uaPlUyRCgzsA7V+3tJa3geZNw9G/fmfrGKDQ==" />
-
-
-          <div class="position-relative mr-lg-3 d-lg-inline-block">
-            <a href="/login?return_to=https%3A%2F%2Fgithub.com%2Felliotsayes%2Fao%2Fblob%2Fsqlite%2Fdev-cli%2Fcontainer%2Fsrc%2Flsqlite3.c"
-              class="HeaderMenu-link HeaderMenu-link--sign-in flex-shrink-0 no-underline d-block d-lg-inline-block border border-lg-0 rounded rounded-lg-0 p-2 p-lg-0"
-              data-hydro-click="{&quot;event_type&quot;:&quot;authentication.click&quot;,&quot;payload&quot;:{&quot;location_in_page&quot;:&quot;site header menu&quot;,&quot;repository_id&quot;:null,&quot;auth_type&quot;:&quot;SIGN_UP&quot;,&quot;originating_url&quot;:&quot;https://github.com/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c&quot;,&quot;user_id&quot;:null}}" data-hydro-click-hmac="996ecbb4ef2fc9a696038301d98d53a6042ce0c896a500c46ac6378b561ce7f1"
-              data-ga-click="(Logged out) Header, clicked Sign in, text:sign-in">
-              Sign in
-            </a>
-          </div>
-
-            <a href="/signup?ref_cta=Sign+up&amp;ref_loc=header+logged+out&amp;ref_page=%2F%3Cuser-name%3E%2F%3Crepo-name%3E%2Fblob%2Fshow&amp;source=header-repo&amp;source_repo=elliotsayes%2Fao"
-              class="HeaderMenu-link HeaderMenu-link--sign-up flex-shrink-0 d-none d-lg-inline-block no-underline border color-border-default rounded px-2 py-1"
-              data-hydro-click="{&quot;event_type&quot;:&quot;authentication.click&quot;,&quot;payload&quot;:{&quot;location_in_page&quot;:&quot;site header menu&quot;,&quot;repository_id&quot;:null,&quot;auth_type&quot;:&quot;SIGN_UP&quot;,&quot;originating_url&quot;:&quot;https://github.com/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c&quot;,&quot;user_id&quot;:null}}" data-hydro-click-hmac="996ecbb4ef2fc9a696038301d98d53a6042ce0c896a500c46ac6378b561ce7f1"
-              data-analytics-event="{&quot;category&quot;:&quot;Sign up&quot;,&quot;action&quot;:&quot;click to sign up for account&quot;,&quot;label&quot;:&quot;ref_page:/&lt;user-name&gt;/&lt;repo-name&gt;/blob/show;ref_cta:Sign up;ref_loc:header logged out&quot;}"
-            >
-              Sign up
-            </a>
-        </div>
-      </div>
-    </div>
-  </div>
-</header>
-
-      <div hidden="hidden" data-view-component="true" class="js-stale-session-flash stale-session-flash flash flash-warn flash-full mb-3">
-  
-        <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-alert">
-    <path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path>
-</svg>
-        <span class="js-stale-session-flash-signed-in" hidden>You signed in with another tab or window. <a class="Link--inTextBlock" href="">Reload</a> to refresh your session.</span>
-        <span class="js-stale-session-flash-signed-out" hidden>You signed out in another tab or window. <a class="Link--inTextBlock" href="">Reload</a> to refresh your session.</span>
-        <span class="js-stale-session-flash-switched" hidden>You switched accounts on another tab or window. <a class="Link--inTextBlock" href="">Reload</a> to refresh your session.</span>
-
-    <button id="icon-button-b0bdfc74-3399-4ed9-93d3-4e16fbc58428" aria-labelledby="tooltip-7c28fa99-3a95-4384-86c4-b865a344c236" type="button" data-view-component="true" class="Button Button--iconOnly Button--invisible Button--medium flash-close js-flash-close">  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-x Button-visual">
-    <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"></path>
-</svg>
-</button><tool-tip id="tooltip-7c28fa99-3a95-4384-86c4-b865a344c236" for="icon-button-b0bdfc74-3399-4ed9-93d3-4e16fbc58428" popover="manual" data-direction="s" data-type="label" data-view-component="true" class="sr-only position-absolute">Dismiss alert</tool-tip>
-
-
-  
-</div>
-    </div>
-
-  <div id="start-of-content" class="show-on-focus"></div>
-
-
-
-
-
-
-
-
-    <div id="js-flash-container" data-turbo-replace>
-
-
-
-
-
-  <template class="js-flash-template">
-    
-<div class="flash flash-full   {{ className }}">
-  <div >
-    <button autofocus class="flash-close js-flash-close" type="button" aria-label="Dismiss this message">
-      <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-x">
-    <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"></path>
-</svg>
-    </button>
-    <div aria-atomic="true" role="alert" class="js-flash-alert">
-      
-      <div>{{ message }}</div>
-
-    </div>
-  </div>
-</div>
-  </template>
-</div>
-
-
-    
-    <include-fragment class="js-notification-shelf-include-fragment" data-base-src="https://github.com/notifications/beta/shelf"></include-fragment>
-
-
-
-
-
-  <div
-    class="application-main "
-    data-commit-hovercards-enabled
-    data-discussion-hovercards-enabled
-    data-issue-and-pr-hovercards-enabled
-  >
-        <div itemscope itemtype="http://schema.org/SoftwareSourceCode" class="">
-    <main id="js-repo-pjax-container" >
-      
-      
-
-
-
-
-
-
-  
-  <div id="repository-container-header"  class="pt-3 hide-full-screen" style="background-color: var(--page-header-bgColor, var(--color-page-header-bg));" data-turbo-replace>
-
-      <div class="d-flex flex-wrap flex-justify-end mb-3  px-3 px-md-4 px-lg-5" style="gap: 1rem;">
-
-        <div class="flex-auto min-width-0 width-fit mr-3">
-            
-  <div class=" d-flex flex-wrap flex-items-center wb-break-word f3 text-normal">
-      <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-repo-forked color-fg-muted mr-2">
-    <path d="M5 5.372v.878c0 .414.336.75.75.75h4.5a.75.75 0 0 0 .75-.75v-.878a2.25 2.25 0 1 1 1.5 0v.878a2.25 2.25 0 0 1-2.25 2.25h-1.5v2.128a2.251 2.251 0 1 1-1.5 0V8.5h-1.5A2.25 2.25 0 0 1 3.5 6.25v-.878a2.25 2.25 0 1 1 1.5 0ZM5 3.25a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Zm6.75.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm-3 8.75a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Z"></path>
-</svg>
-    
-    <span class="author flex-self-stretch" itemprop="author">
-      <a class="url fn" rel="author" data-hovercard-type="user" data-hovercard-url="/users/elliotsayes/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="/elliotsayes">
-        elliotsayes
-</a>    </span>
-    <span class="mx-1 flex-self-stretch color-fg-muted">/</span>
-    <strong itemprop="name" class="mr-2 flex-self-stretch">
-      <a data-pjax="#repo-content-pjax-container" data-turbo-frame="repo-content-turbo-frame" href="/elliotsayes/ao">ao</a>
-    </strong>
-
-    <span></span><span class="Label Label--secondary v-align-middle mr-1">Public</span>
-  </div>
-    <span class="text-small lh-condensed-ultra no-wrap mt-1" data-repository-hovercards-enabled>
-      forked from <a data-hovercard-type="repository" data-hovercard-url="/permaweb/ao/hovercard" class="Link--inTextBlock" href="/permaweb/ao">permaweb/ao</a>
-    </span>
-
-
-        </div>
-
-        <div id="repository-details-container" data-turbo-replace>
-            <ul class="pagehead-actions flex-shrink-0 d-none d-md-inline" style="padding: 2px 0;">
-    
-      
-
-  <li>
-            <a href="/login?return_to=%2Felliotsayes%2Fao" rel="nofollow" data-hydro-click="{&quot;event_type&quot;:&quot;authentication.click&quot;,&quot;payload&quot;:{&quot;location_in_page&quot;:&quot;notification subscription menu watch&quot;,&quot;repository_id&quot;:null,&quot;auth_type&quot;:&quot;LOG_IN&quot;,&quot;originating_url&quot;:&quot;https://github.com/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c&quot;,&quot;user_id&quot;:null}}" data-hydro-click-hmac="f14f1283450269183d9e2b9b0942fec5b159865feb3e745986fd983e55df8ce5" aria-label="You must be signed in to change notification settings" data-view-component="true" class="tooltipped tooltipped-s btn-sm btn">    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-bell mr-2">
-    <path d="M8 16a2 2 0 0 0 1.985-1.75c.017-.137-.097-.25-.235-.25h-3.5c-.138 0-.252.113-.235.25A2 2 0 0 0 8 16ZM3 5a5 5 0 0 1 10 0v2.947c0 .05.015.098.042.139l1.703 2.555A1.519 1.519 0 0 1 13.482 13H2.518a1.516 1.516 0 0 1-1.263-2.36l1.703-2.554A.255.255 0 0 0 3 7.947Zm5-3.5A3.5 3.5 0 0 0 4.5 5v2.947c0 .346-.102.683-.294.97l-1.703 2.556a.017.017 0 0 0-.003.01l.001.006c0 .002.002.004.004.006l.006.004.007.001h10.964l.007-.001.006-.004.004-.006.001-.007a.017.017 0 0 0-.003-.01l-1.703-2.554a1.745 1.745 0 0 1-.294-.97V5A3.5 3.5 0 0 0 8 1.5Z"></path>
-</svg>Notifications
-</a>
-  </li>
-
-  <li>
-          <a icon="repo-forked" id="fork-button" href="/login?return_to=%2Felliotsayes%2Fao" rel="nofollow" data-hydro-click="{&quot;event_type&quot;:&quot;authentication.click&quot;,&quot;payload&quot;:{&quot;location_in_page&quot;:&quot;repo details fork button&quot;,&quot;repository_id&quot;:774396487,&quot;auth_type&quot;:&quot;LOG_IN&quot;,&quot;originating_url&quot;:&quot;https://github.com/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c&quot;,&quot;user_id&quot;:null}}" data-hydro-click-hmac="34c80dc2ec160cd62de2e1b8ebff61796b43b3aef3bdf7027c93229988f24f0a" data-view-component="true" class="btn-sm btn">    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-repo-forked mr-2">
-    <path d="M5 5.372v.878c0 .414.336.75.75.75h4.5a.75.75 0 0 0 .75-.75v-.878a2.25 2.25 0 1 1 1.5 0v.878a2.25 2.25 0 0 1-2.25 2.25h-1.5v2.128a2.251 2.251 0 1 1-1.5 0V8.5h-1.5A2.25 2.25 0 0 1 3.5 6.25v-.878a2.25 2.25 0 1 1 1.5 0ZM5 3.25a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Zm6.75.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm-3 8.75a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Z"></path>
-</svg>Fork
-    <span id="repo-network-counter" data-pjax-replace="true" data-turbo-replace="true" title="1" data-view-component="true" class="Counter">1</span>
-</a>
-  </li>
-
-  <li>
-        <div data-view-component="true" class="BtnGroup d-flex">
-        <a href="/login?return_to=%2Felliotsayes%2Fao" rel="nofollow" data-hydro-click="{&quot;event_type&quot;:&quot;authentication.click&quot;,&quot;payload&quot;:{&quot;location_in_page&quot;:&quot;star button&quot;,&quot;repository_id&quot;:774396487,&quot;auth_type&quot;:&quot;LOG_IN&quot;,&quot;originating_url&quot;:&quot;https://github.com/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c&quot;,&quot;user_id&quot;:null}}" data-hydro-click-hmac="57f2afbad582860059ad13d8f6f1edbac4e2db56c777e2e31c040d403a64bd17" aria-label="You must be signed in to star a repository" data-view-component="true" class="tooltipped tooltipped-s btn-sm btn BtnGroup-item">    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-star v-align-text-bottom d-inline-block mr-2">
-    <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Zm0 2.445L6.615 5.5a.75.75 0 0 1-.564.41l-3.097.45 2.24 2.184a.75.75 0 0 1 .216.664l-.528 3.084 2.769-1.456a.75.75 0 0 1 .698 0l2.77 1.456-.53-3.084a.75.75 0 0 1 .216-.664l2.24-2.183-3.096-.45a.75.75 0 0 1-.564-.41L8 2.694Z"></path>
-</svg><span data-view-component="true" class="d-inline">
-          Star
-</span>          <span id="repo-stars-counter-star" aria-label="0 users starred this repository" data-singular-suffix="user starred this repository" data-plural-suffix="users starred this repository" data-turbo-replace="true" title="0" data-view-component="true" class="Counter js-social-count">0</span>
-</a>        <button aria-label="You must be signed in to add this repository to a list" type="button" disabled="disabled" data-view-component="true" class="btn-sm btn BtnGroup-item px-2">    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-triangle-down">
-    <path d="m4.427 7.427 3.396 3.396a.25.25 0 0 0 .354 0l3.396-3.396A.25.25 0 0 0 11.396 7H4.604a.25.25 0 0 0-.177.427Z"></path>
-</svg>
-</button></div>
-  </li>
-
-    <li>
-        
-
-    </li>
-</ul>
-
-        </div>
-      </div>
-
-        <div id="responsive-meta-container" data-turbo-replace>
-</div>
-
-
-          <nav data-pjax="#js-repo-pjax-container" aria-label="Repository" data-view-component="true" class="js-repo-nav js-sidenav-container-pjax js-responsive-underlinenav overflow-hidden UnderlineNav px-3 px-md-4 px-lg-5">
-
-  <ul data-view-component="true" class="UnderlineNav-body list-style-none">
-      <li data-view-component="true" class="d-inline-flex">
-  <a id="code-tab" href="/elliotsayes/ao/tree/sqlite" data-tab-item="i0code-tab" data-selected-links="repo_source repo_downloads repo_commits repo_releases repo_tags repo_branches repo_packages repo_deployments repo_attestations /elliotsayes/ao/tree/sqlite" data-pjax="#repo-content-pjax-container" data-turbo-frame="repo-content-turbo-frame" data-hotkey="g c" data-analytics-event="{&quot;category&quot;:&quot;Underline navbar&quot;,&quot;action&quot;:&quot;Click tab&quot;,&quot;label&quot;:&quot;Code&quot;,&quot;target&quot;:&quot;UNDERLINE_NAV.TAB&quot;}" aria-current="page" data-view-component="true" class="UnderlineNav-item no-wrap js-responsive-underlinenav-item js-selected-navigation-item selected">
-    
-              <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-code UnderlineNav-octicon d-none d-sm-inline">
-    <path d="m11.28 3.22 4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734L13.94 8l-3.72-3.72a.749.749 0 0 1 .326-1.275.749.749 0 0 1 .734.215Zm-6.56 0a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042L2.06 8l3.72 3.72a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L.47 8.53a.75.75 0 0 1 0-1.06Z"></path>
-</svg>
-        <span data-content="Code">Code</span>
-          <span id="code-repo-tab-count" data-pjax-replace="" data-turbo-replace="" title="Not available" data-view-component="true" class="Counter"></span>
-
-
-    
-</a></li>
-      <li data-view-component="true" class="d-inline-flex">
-  <a id="pull-requests-tab" href="/elliotsayes/ao/pulls" data-tab-item="i1pull-requests-tab" data-selected-links="repo_pulls checks /elliotsayes/ao/pulls" data-pjax="#repo-content-pjax-container" data-turbo-frame="repo-content-turbo-frame" data-hotkey="g p" data-analytics-event="{&quot;category&quot;:&quot;Underline navbar&quot;,&quot;action&quot;:&quot;Click tab&quot;,&quot;label&quot;:&quot;Pull requests&quot;,&quot;target&quot;:&quot;UNDERLINE_NAV.TAB&quot;}" data-view-component="true" class="UnderlineNav-item no-wrap js-responsive-underlinenav-item js-selected-navigation-item">
-    
-              <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-git-pull-request UnderlineNav-octicon d-none d-sm-inline">
-    <path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z"></path>
-</svg>
-        <span data-content="Pull requests">Pull requests</span>
-          <span id="pull-requests-repo-tab-count" data-pjax-replace="" data-turbo-replace="" title="1" data-view-component="true" class="Counter">1</span>
-
-
-    
-</a></li>
-      <li data-view-component="true" class="d-inline-flex">
-  <a id="actions-tab" href="/elliotsayes/ao/actions" data-tab-item="i2actions-tab" data-selected-links="repo_actions /elliotsayes/ao/actions" data-pjax="#repo-content-pjax-container" data-turbo-frame="repo-content-turbo-frame" data-hotkey="g a" data-analytics-event="{&quot;category&quot;:&quot;Underline navbar&quot;,&quot;action&quot;:&quot;Click tab&quot;,&quot;label&quot;:&quot;Actions&quot;,&quot;target&quot;:&quot;UNDERLINE_NAV.TAB&quot;}" data-view-component="true" class="UnderlineNav-item no-wrap js-responsive-underlinenav-item js-selected-navigation-item">
-    
-              <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-play UnderlineNav-octicon d-none d-sm-inline">
-    <path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm4.879-2.773 4.264 2.559a.25.25 0 0 1 0 .428l-4.264 2.559A.25.25 0 0 1 6 10.559V5.442a.25.25 0 0 1 .379-.215Z"></path>
-</svg>
-        <span data-content="Actions">Actions</span>
-          <span id="actions-repo-tab-count" data-pjax-replace="" data-turbo-replace="" title="Not available" data-view-component="true" class="Counter"></span>
-
-
-    
-</a></li>
-      <li data-view-component="true" class="d-inline-flex">
-  <a id="projects-tab" href="/elliotsayes/ao/projects" data-tab-item="i3projects-tab" data-selected-links="repo_projects new_repo_project repo_project /elliotsayes/ao/projects" data-pjax="#repo-content-pjax-container" data-turbo-frame="repo-content-turbo-frame" data-hotkey="g b" data-analytics-event="{&quot;category&quot;:&quot;Underline navbar&quot;,&quot;action&quot;:&quot;Click tab&quot;,&quot;label&quot;:&quot;Projects&quot;,&quot;target&quot;:&quot;UNDERLINE_NAV.TAB&quot;}" data-view-component="true" class="UnderlineNav-item no-wrap js-responsive-underlinenav-item js-selected-navigation-item">
-    
-              <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-table UnderlineNav-octicon d-none d-sm-inline">
-    <path d="M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v12.5A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25ZM6.5 6.5v8h7.75a.25.25 0 0 0 .25-.25V6.5Zm8-1.5V1.75a.25.25 0 0 0-.25-.25H6.5V5Zm-13 1.5v7.75c0 .138.112.25.25.25H5v-8ZM5 5V1.5H1.75a.25.25 0 0 0-.25.25V5Z"></path>
-</svg>
-        <span data-content="Projects">Projects</span>
-          <span id="projects-repo-tab-count" data-pjax-replace="" data-turbo-replace="" title="0" hidden="hidden" data-view-component="true" class="Counter">0</span>
-
-
-    
-</a></li>
-      <li data-view-component="true" class="d-inline-flex">
-  <a id="security-tab" href="/elliotsayes/ao/security" data-tab-item="i4security-tab" data-selected-links="security overview alerts policy token_scanning code_scanning /elliotsayes/ao/security" data-pjax="#repo-content-pjax-container" data-turbo-frame="repo-content-turbo-frame" data-hotkey="g s" data-analytics-event="{&quot;category&quot;:&quot;Underline navbar&quot;,&quot;action&quot;:&quot;Click tab&quot;,&quot;label&quot;:&quot;Security&quot;,&quot;target&quot;:&quot;UNDERLINE_NAV.TAB&quot;}" data-view-component="true" class="UnderlineNav-item no-wrap js-responsive-underlinenav-item js-selected-navigation-item">
-    
-              <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-shield UnderlineNav-octicon d-none d-sm-inline">
-    <path d="M7.467.133a1.748 1.748 0 0 1 1.066 0l5.25 1.68A1.75 1.75 0 0 1 15 3.48V7c0 1.566-.32 3.182-1.303 4.682-.983 1.498-2.585 2.813-5.032 3.855a1.697 1.697 0 0 1-1.33 0c-2.447-1.042-4.049-2.357-5.032-3.855C1.32 10.182 1 8.566 1 7V3.48a1.75 1.75 0 0 1 1.217-1.667Zm.61 1.429a.25.25 0 0 0-.153 0l-5.25 1.68a.25.25 0 0 0-.174.238V7c0 1.358.275 2.666 1.057 3.86.784 1.194 2.121 2.34 4.366 3.297a.196.196 0 0 0 .154 0c2.245-.956 3.582-2.104 4.366-3.298C13.225 9.666 13.5 8.36 13.5 7V3.48a.251.251 0 0 0-.174-.237l-5.25-1.68ZM8.75 4.75v3a.75.75 0 0 1-1.5 0v-3a.75.75 0 0 1 1.5 0ZM9 10.5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path>
-</svg>
-        <span data-content="Security">Security</span>
-          <include-fragment src="/elliotsayes/ao/security/overall-count" accept="text/fragment+html"></include-fragment>
-
-    
-</a></li>
-      <li data-view-component="true" class="d-inline-flex">
-  <a id="insights-tab" href="/elliotsayes/ao/pulse" data-tab-item="i5insights-tab" data-selected-links="repo_graphs repo_contributors dependency_graph dependabot_updates pulse people community /elliotsayes/ao/pulse" data-pjax="#repo-content-pjax-container" data-turbo-frame="repo-content-turbo-frame" data-analytics-event="{&quot;category&quot;:&quot;Underline navbar&quot;,&quot;action&quot;:&quot;Click tab&quot;,&quot;label&quot;:&quot;Insights&quot;,&quot;target&quot;:&quot;UNDERLINE_NAV.TAB&quot;}" data-view-component="true" class="UnderlineNav-item no-wrap js-responsive-underlinenav-item js-selected-navigation-item">
-    
-              <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-graph UnderlineNav-octicon d-none d-sm-inline">
-    <path d="M1.5 1.75V13.5h13.75a.75.75 0 0 1 0 1.5H.75a.75.75 0 0 1-.75-.75V1.75a.75.75 0 0 1 1.5 0Zm14.28 2.53-5.25 5.25a.75.75 0 0 1-1.06 0L7 7.06 4.28 9.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.25-3.25a.75.75 0 0 1 1.06 0L10 7.94l4.72-4.72a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042Z"></path>
-</svg>
-        <span data-content="Insights">Insights</span>
-          <span id="insights-repo-tab-count" data-pjax-replace="" data-turbo-replace="" title="Not available" data-view-component="true" class="Counter"></span>
-
-
-    
-</a></li>
-</ul>
-    <div style="visibility:hidden;" data-view-component="true" class="UnderlineNav-actions js-responsive-underlinenav-overflow position-absolute pr-3 pr-md-4 pr-lg-5 right-0">      <action-menu data-select-variant="none" data-view-component="true">
-  <focus-group direction="vertical" mnemonics retain>
-    <button id="action-menu-ceb005d9-d7a3-4b8b-9574-4a640ae2c454-button" popovertarget="action-menu-ceb005d9-d7a3-4b8b-9574-4a640ae2c454-overlay" aria-controls="action-menu-ceb005d9-d7a3-4b8b-9574-4a640ae2c454-list" aria-haspopup="true" aria-labelledby="tooltip-e4a1ee1e-f0f6-4933-a484-7761e5e0d016" type="button" data-view-component="true" class="Button Button--iconOnly Button--secondary Button--medium UnderlineNav-item">  <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-kebab-horizontal Button-visual">
-    <path d="M8 9a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3ZM1.5 9a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Zm13 0a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"></path>
-</svg>
-</button><tool-tip id="tooltip-e4a1ee1e-f0f6-4933-a484-7761e5e0d016" for="action-menu-ceb005d9-d7a3-4b8b-9574-4a640ae2c454-button" popover="manual" data-direction="s" data-type="label" data-view-component="true" class="sr-only position-absolute">Additional navigation options</tool-tip>
-
-
-<anchored-position id="action-menu-ceb005d9-d7a3-4b8b-9574-4a640ae2c454-overlay" anchor="action-menu-ceb005d9-d7a3-4b8b-9574-4a640ae2c454-button" align="start" side="outside-bottom" anchor-offset="normal" popover="auto" data-view-component="true">
-  <div data-view-component="true" class="Overlay Overlay--size-auto">
-    
-      <div data-view-component="true" class="Overlay-body Overlay-body--paddingNone">          <action-list>
-  <div data-view-component="true">
-    <ul aria-labelledby="action-menu-ceb005d9-d7a3-4b8b-9574-4a640ae2c454-button" id="action-menu-ceb005d9-d7a3-4b8b-9574-4a640ae2c454-list" role="menu" data-view-component="true" class="ActionListWrap--inset ActionListWrap">
-        <li hidden="hidden" data-menu-item="i0code-tab" data-targets="action-list.items" role="none" data-view-component="true" class="ActionListItem">
-    
-    <a tabindex="-1" id="item-561cf33f-1306-4589-805d-af4a1574f842" href="/elliotsayes/ao/tree/sqlite" role="menuitem" data-view-component="true" class="ActionListContent ActionListContent--visual16">
-        <span class="ActionListItem-visual ActionListItem-visual--leading">
-          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-code">
-    <path d="m11.28 3.22 4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734L13.94 8l-3.72-3.72a.749.749 0 0 1 .326-1.275.749.749 0 0 1 .734.215Zm-6.56 0a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042L2.06 8l3.72 3.72a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L.47 8.53a.75.75 0 0 1 0-1.06Z"></path>
-</svg>
-        </span>
-      
-        <span data-view-component="true" class="ActionListItem-label">
-          Code
-</span></a>
-  
-  
-</li>
-        <li hidden="hidden" data-menu-item="i1pull-requests-tab" data-targets="action-list.items" role="none" data-view-component="true" class="ActionListItem">
-    
-    <a tabindex="-1" id="item-7ba364d1-b0ce-4311-a4d8-a421067464db" href="/elliotsayes/ao/pulls" role="menuitem" data-view-component="true" class="ActionListContent ActionListContent--visual16">
-        <span class="ActionListItem-visual ActionListItem-visual--leading">
-          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-git-pull-request">
-    <path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z"></path>
-</svg>
-        </span>
-      
-        <span data-view-component="true" class="ActionListItem-label">
-          Pull requests
-</span></a>
-  
-  
-</li>
-        <li hidden="hidden" data-menu-item="i2actions-tab" data-targets="action-list.items" role="none" data-view-component="true" class="ActionListItem">
-    
-    <a tabindex="-1" id="item-8a786c38-fb3a-409b-aff3-11d81d4aefc5" href="/elliotsayes/ao/actions" role="menuitem" data-view-component="true" class="ActionListContent ActionListContent--visual16">
-        <span class="ActionListItem-visual ActionListItem-visual--leading">
-          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-play">
-    <path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm4.879-2.773 4.264 2.559a.25.25 0 0 1 0 .428l-4.264 2.559A.25.25 0 0 1 6 10.559V5.442a.25.25 0 0 1 .379-.215Z"></path>
-</svg>
-        </span>
-      
-        <span data-view-component="true" class="ActionListItem-label">
-          Actions
-</span></a>
-  
-  
-</li>
-        <li hidden="hidden" data-menu-item="i3projects-tab" data-targets="action-list.items" role="none" data-view-component="true" class="ActionListItem">
-    
-    <a tabindex="-1" id="item-796bd288-d68c-49dd-b42c-252500e7fbde" href="/elliotsayes/ao/projects" role="menuitem" data-view-component="true" class="ActionListContent ActionListContent--visual16">
-        <span class="ActionListItem-visual ActionListItem-visual--leading">
-          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-table">
-    <path d="M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v12.5A1.75 1.75 0 0 1 14.25 16H1.75A1.75 1.75 0 0 1 0 14.25ZM6.5 6.5v8h7.75a.25.25 0 0 0 .25-.25V6.5Zm8-1.5V1.75a.25.25 0 0 0-.25-.25H6.5V5Zm-13 1.5v7.75c0 .138.112.25.25.25H5v-8ZM5 5V1.5H1.75a.25.25 0 0 0-.25.25V5Z"></path>
-</svg>
-        </span>
-      
-        <span data-view-component="true" class="ActionListItem-label">
-          Projects
-</span></a>
-  
-  
-</li>
-        <li hidden="hidden" data-menu-item="i4security-tab" data-targets="action-list.items" role="none" data-view-component="true" class="ActionListItem">
-    
-    <a tabindex="-1" id="item-95cc24a8-df66-4818-8ae8-82d2aa82da35" href="/elliotsayes/ao/security" role="menuitem" data-view-component="true" class="ActionListContent ActionListContent--visual16">
-        <span class="ActionListItem-visual ActionListItem-visual--leading">
-          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-shield">
-    <path d="M7.467.133a1.748 1.748 0 0 1 1.066 0l5.25 1.68A1.75 1.75 0 0 1 15 3.48V7c0 1.566-.32 3.182-1.303 4.682-.983 1.498-2.585 2.813-5.032 3.855a1.697 1.697 0 0 1-1.33 0c-2.447-1.042-4.049-2.357-5.032-3.855C1.32 10.182 1 8.566 1 7V3.48a1.75 1.75 0 0 1 1.217-1.667Zm.61 1.429a.25.25 0 0 0-.153 0l-5.25 1.68a.25.25 0 0 0-.174.238V7c0 1.358.275 2.666 1.057 3.86.784 1.194 2.121 2.34 4.366 3.297a.196.196 0 0 0 .154 0c2.245-.956 3.582-2.104 4.366-3.298C13.225 9.666 13.5 8.36 13.5 7V3.48a.251.251 0 0 0-.174-.237l-5.25-1.68ZM8.75 4.75v3a.75.75 0 0 1-1.5 0v-3a.75.75 0 0 1 1.5 0ZM9 10.5a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path>
-</svg>
-        </span>
-      
-        <span data-view-component="true" class="ActionListItem-label">
-          Security
-</span></a>
-  
-  
-</li>
-        <li hidden="hidden" data-menu-item="i5insights-tab" data-targets="action-list.items" role="none" data-view-component="true" class="ActionListItem">
-    
-    <a tabindex="-1" id="item-c21dd62a-8084-4e5b-a5da-1154786ab773" href="/elliotsayes/ao/pulse" role="menuitem" data-view-component="true" class="ActionListContent ActionListContent--visual16">
-        <span class="ActionListItem-visual ActionListItem-visual--leading">
-          <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-graph">
-    <path d="M1.5 1.75V13.5h13.75a.75.75 0 0 1 0 1.5H.75a.75.75 0 0 1-.75-.75V1.75a.75.75 0 0 1 1.5 0Zm14.28 2.53-5.25 5.25a.75.75 0 0 1-1.06 0L7 7.06 4.28 9.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.25-3.25a.75.75 0 0 1 1.06 0L10 7.94l4.72-4.72a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042Z"></path>
-</svg>
-        </span>
-      
-        <span data-view-component="true" class="ActionListItem-label">
-          Insights
-</span></a>
-  
-  
-</li>
-</ul>    
-</div></action-list>
-
-
-</div>
-      
-</div></anchored-position>  </focus-group>
-</action-menu></div>
-</nav>
-
-  </div>
-
-  
-
-
-
-<turbo-frame id="repo-content-turbo-frame" target="_top" data-turbo-action="advance" class="">
-    <div id="repo-content-pjax-container" class="repository-content " >
-    
-
-
-
-    
-      
-    
-
-
-
-
-
-<react-app
-  app-name="react-code-view"
-  initial-path="/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c"
-  style="min-height: calc(100vh - 64px)" 
-  data-ssr="false"
-  data-lazy="false"
-  data-alternate="false"
->
-  
-  <script type="application/json" data-target="react-app.embeddedData">{"payload":{"allShortcutsEnabled":false,"fileTree":{"dev-cli/container/src":{"items":[{"name":"emcc_lua_lib","path":"dev-cli/container/src/emcc_lua_lib","contentType":"directory"},{"name":"node","path":"dev-cli/container/src/node","contentType":"directory"},{"name":"ao.lua","path":"dev-cli/container/src/ao.lua","contentType":"file"},{"name":"definition.yml","path":"dev-cli/container/src/definition.yml","contentType":"file"},{"name":"emcc-lua","path":"dev-cli/container/src/emcc-lua","contentType":"file"},{"name":"json.lua","path":"dev-cli/container/src/json.lua","contentType":"file"},{"name":"loader.lua","path":"dev-cli/container/src/loader.lua","contentType":"file"},{"name":"lsqlite3.c","path":"dev-cli/container/src/lsqlite3.c","contentType":"file"},{"name":"lsqlite3.h","path":"dev-cli/container/src/lsqlite3.h","contentType":"file"},{"name":"main.c","path":"dev-cli/container/src/main.c","contentType":"file"},{"name":"main.lua","path":"dev-cli/container/src/main.lua","contentType":"file"},{"name":"pack.lua","path":"dev-cli/container/src/pack.lua","contentType":"file"},{"name":"pre.js","path":"dev-cli/container/src/pre.js","contentType":"file"},{"name":"sqlite3.c","path":"dev-cli/container/src/sqlite3.c","contentType":"file"},{"name":"sqlite3.h","path":"dev-cli/container/src/sqlite3.h","contentType":"file"}],"totalCount":15},"dev-cli/container":{"items":[{"name":"src","path":"dev-cli/container/src","contentType":"directory"},{"name":"Dockerfile","path":"dev-cli/container/Dockerfile","contentType":"file"},{"name":"build.sh","path":"dev-cli/container/build.sh","contentType":"file"}],"totalCount":3},"dev-cli":{"items":[{"name":"container","path":"dev-cli/container","contentType":"directory"},{"name":"src","path":"dev-cli/src","contentType":"directory"},{"name":"tools","path":"dev-cli/tools","contentType":"directory"},{"name":".gitignore","path":"dev-cli/.gitignore","contentType":"file"},{"name":"README.md","path":"dev-cli/README.md","contentType":"file"},{"name":"deno.json","path":"dev-cli/deno.json","contentType":"file"},{"name":"deno.lock","path":"dev-cli/deno.lock","contentType":"file"}],"totalCount":7},"":{"items":[{"name":".github","path":".github","contentType":"directory"},{"name":".husky","path":".husky","contentType":"directory"},{"name":"connect","path":"connect","contentType":"directory"},{"name":"design","path":"design","contentType":"directory"},{"name":"dev-cli","path":"dev-cli","contentType":"directory"},{"name":"loader","path":"loader","contentType":"directory"},{"name":"logos","path":"logos","contentType":"directory"},{"name":"lua-examples","path":"lua-examples","contentType":"directory"},{"name":"scheduler-utils","path":"scheduler-utils","contentType":"directory"},{"name":"servers","path":"servers","contentType":"directory"},{"name":".gitignore","path":".gitignore","contentType":"file"},{"name":".gitpod.Dockerfile","path":".gitpod.Dockerfile","contentType":"file"},{"name":".gitpod.yml","path":".gitpod.yml","contentType":"file"},{"name":".npmrc","path":".npmrc","contentType":"file"},{"name":"CONTRIBUTING.md","path":"CONTRIBUTING.md","contentType":"file"},{"name":"DOD.md","path":"DOD.md","contentType":"file"},{"name":"LICENSE","path":"LICENSE","contentType":"file"},{"name":"README.md","path":"README.md","contentType":"file"},{"name":"commitlint.config.cjs","path":"commitlint.config.cjs","contentType":"file"},{"name":"lint-staged.config.cjs","path":"lint-staged.config.cjs","contentType":"file"},{"name":"package-lock.json","path":"package-lock.json","contentType":"file"},{"name":"package.json","path":"package.json","contentType":"file"}],"totalCount":22}},"fileTreeProcessingTime":6.332990000000001,"foldersToFetch":[],"repo":{"id":774396487,"defaultBranch":"main","name":"ao","ownerLogin":"elliotsayes","currentUserCanPush":false,"isFork":true,"isEmpty":false,"createdAt":"2024-03-19T13:32:21.000Z","ownerAvatar":"https://avatars.githubusercontent.com/u/7699058?v=4","public":true,"private":false,"isOrgOwned":false},"codeLineWrapEnabled":false,"symbolsExpanded":false,"treeExpanded":true,"refInfo":{"name":"sqlite","listCacheKey":"v0:1710855190.0","canEdit":false,"refType":"branch","currentOid":"95d306652a5d04d6b623f22edb9f6560228c1945"},"path":"dev-cli/container/src/lsqlite3.c","currentUser":null,"blob":{"rawLines":["/************************************************************************","* lsqlite3                                                              *","* Copyright (C) 2002-2016 Tiago Dionizio, Doug Currie                   *","* All rights reserved.                                                  *","* Author    : Tiago Dionizio \u003ctiago.dionizio@ist.utl.pt\u003e                *","* Author    : Doug Currie \u003cdoug.currie@alum.mit.edu\u003e                    *","* Library   : lsqlite3 - an SQLite 3 database binding for Lua 5         *","*                                                                       *","* Permission is hereby granted, free of charge, to any person obtaining *","* a copy of this software and associated documentation files (the       *","* \"Software\"), to deal in the Software without restriction, including   *","* without limitation the rights to use, copy, modify, merge, publish,   *","* distribute, sublicense, and/or sell copies of the Software, and to    *","* permit persons to whom the Software is furnished to do so, subject to *","* the following conditions:                                             *","*                                                                       *","* The above copyright notice and this permission notice shall be        *","* included in all copies or substantial portions of the Software.       *","*                                                                       *","* THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND,       *","* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF    *","* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.*","* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY  *","* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,  *","* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE     *","* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                *","************************************************************************/","","#include \u003cstdlib.h\u003e","#include \u003cstring.h\u003e","#include \u003cassert.h\u003e","","#define LUA_LIB","#include \"lua.h\"","#include \"lauxlib.h\"","","#if LUA_VERSION_NUM \u003e 501","/*","** Lua 5.2","*/","#ifndef lua_strlen","#define lua_strlen lua_rawlen","#endif","/* luaL_typerror always used with arg at ndx == NULL */","#define luaL_typerror(L,ndx,str) luaL_error(L,\"bad argument %d (%s expected, got nil)\",ndx,str)","/* luaL_register used once, so below expansion is OK for this case */","#define luaL_register(L,name,reg) lua_newtable(L);luaL_setfuncs(L,reg,0)","/* luaL_openlib always used with name == NULL */","#define luaL_openlib(L,name,reg,nup) luaL_setfuncs(L,reg,nup)","","#if LUA_VERSION_NUM \u003e 502","/*","** Lua 5.3","*/","#define luaL_checkint(L,n)  ((int)luaL_checkinteger(L, (n)))","#endif","#endif","","#include \"sqlite3.h\"","","/* compile time features */","#if !defined(SQLITE_OMIT_PROGRESS_CALLBACK)","    #define SQLITE_OMIT_PROGRESS_CALLBACK 0","#endif","#if !defined(LSQLITE_OMIT_UPDATE_HOOK)","    #define LSQLITE_OMIT_UPDATE_HOOK 0","#endif","#if defined(LSQLITE_OMIT_OPEN_V2)","    #define SQLITE3_OPEN(L,filename,flags) sqlite3_open(L,filename)","#else","    #define SQLITE3_OPEN(L,filename,flags) sqlite3_open_v2(L,filename,flags,NULL)","#endif","","typedef struct sdb sdb;","typedef struct sdb_vm sdb_vm;","typedef struct sdb_bu sdb_bu;","typedef struct sdb_func sdb_func;","","/* to use as C user data so i know what function sqlite is calling */","struct sdb_func {","    /* references to associated lua values */","    int fn_step;","    int fn_finalize;","    int udata;","","    sdb *db;","    char aggregate;","","    sdb_func *next;","};","","/* information about database */","struct sdb {","    /* associated lua state */","    lua_State *L;","    /* sqlite database handle */","    sqlite3 *db;","","    /* sql functions stack usage */","    sdb_func *func;         /* top SQL function being called */","","    /* references */","    int busy_cb;        /* busy callback */","    int busy_udata;","","    int progress_cb;    /* progress handler */","    int progress_udata;","","    int trace_cb;       /* trace callback */","    int trace_udata;","","#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK","","    int update_hook_cb; /* update_hook callback */","    int update_hook_udata;","","    int commit_hook_cb; /* commit_hook callback */","    int commit_hook_udata;","","    int rollback_hook_cb; /* rollback_hook callback */","    int rollback_hook_udata;","","#endif","};","","static const char *sqlite_meta      = \":sqlite3\";","static const char *sqlite_vm_meta   = \":sqlite3:vm\";","static const char *sqlite_bu_meta   = \":sqlite3:bu\";","static const char *sqlite_ctx_meta  = \":sqlite3:ctx\";","static int sqlite_ctx_meta_ref;","","/* Lua 5.3 introduced an integer type, but depending on the implementation, it could be 32 ","** or 64 bits (or something else?). This helper macro tries to do \"the right thing.\"","*/","","#if LUA_VERSION_NUM \u003e 502","#define PUSH_INT64(L,i64in,fallback) \\","    do { \\","        sqlite_int64 i64 = i64in; \\","        lua_Integer i = (lua_Integer )i64; \\","        if (i == i64) lua_pushinteger(L, i);\\","        else { \\","            lua_Number n = (lua_Number)i64; \\","            if (n == i64) lua_pushnumber(L, n); \\","            else fallback; \\","        } \\","    } while (0)","#else","#define PUSH_INT64(L,i64in,fallback) \\","    do { \\","        sqlite_int64 i64 = i64in; \\","        lua_Number n = (lua_Number)i64; \\","        if (n == i64) lua_pushnumber(L, n); \\","        else fallback; \\","    } while (0)","#endif","","/*","** =======================================================","** Database Virtual Machine Operations","** =======================================================","*/","","static void vm_push_column(lua_State *L, sqlite3_stmt *vm, int idx) {","    switch (sqlite3_column_type(vm, idx)) {","        case SQLITE_INTEGER:","            PUSH_INT64(L, sqlite3_column_int64(vm, idx)","                     , lua_pushlstring(L, (const char*)sqlite3_column_text(vm, idx)","                                        , sqlite3_column_bytes(vm, idx)));","            break;","        case SQLITE_FLOAT:","            lua_pushnumber(L, sqlite3_column_double(vm, idx));","            break;","        case SQLITE_TEXT:","            lua_pushlstring(L, (const char*)sqlite3_column_text(vm, idx), sqlite3_column_bytes(vm, idx));","            break;","        case SQLITE_BLOB:","            lua_pushlstring(L, sqlite3_column_blob(vm, idx), sqlite3_column_bytes(vm, idx));","            break;","        case SQLITE_NULL:","            lua_pushnil(L);","            break;","        default:","            lua_pushnil(L);","            break;","    }","}","","/* virtual machine information */","struct sdb_vm {","    sdb *db;                /* associated database handle */","    sqlite3_stmt *vm;       /* virtual machine */","","    /* sqlite3_step info */","    int columns;            /* number of columns in result */","    char has_values;        /* true when step succeeds */","","    char temp;              /* temporary vm used in db:rows */","};","","/* called with db,sql text on the lua stack */","static sdb_vm *newvm(lua_State *L, sdb *db) {","    sdb_vm *svm = (sdb_vm*)lua_newuserdata(L, sizeof(sdb_vm)); /* db sql svm_ud -- */","","    luaL_getmetatable(L, sqlite_vm_meta);","    lua_setmetatable(L, -2);        /* set metatable */","","    svm-\u003edb = db;","    svm-\u003ecolumns = 0;","    svm-\u003ehas_values = 0;","    svm-\u003evm = NULL;","    svm-\u003etemp = 0;","","    /* add an entry on the database table: svm -\u003e db to keep db live while svm is live */","    lua_pushlightuserdata(L, db);     /* db sql svm_ud db_lud -- */","    lua_rawget(L, LUA_REGISTRYINDEX); /* db sql svm_ud reg[db_lud] -- */","    lua_pushlightuserdata(L, svm);    /* db sql svm_ud reg[db_lud] svm_lud -- */","    lua_pushvalue(L, -5);             /* db sql svm_ud reg[db_lud] svm_lud db -- */","    lua_rawset(L, -3);                /* (reg[db_lud])[svm_lud] = db ; set the db for this vm */","    lua_pop(L, 1);                    /* db sql svm_ud -- */","","    return svm;","}","","static int cleanupvm(lua_State *L, sdb_vm *svm) {","","    /* remove entry in database table - no harm if not present in the table */","    lua_pushlightuserdata(L, svm-\u003edb);","    lua_rawget(L, LUA_REGISTRYINDEX);","    lua_pushlightuserdata(L, svm);","    lua_pushnil(L);","    lua_rawset(L, -3);","    lua_pop(L, 1);","","    svm-\u003ecolumns = 0;","    svm-\u003ehas_values = 0;","","    if (!svm-\u003evm) return 0;","","    lua_pushinteger(L, sqlite3_finalize(svm-\u003evm));","    svm-\u003evm = NULL;","    return 1;","}","","static int stepvm(lua_State *L, sdb_vm *svm) {","\t(void)L;","    return sqlite3_step(svm-\u003evm);","}","","static sdb_vm *lsqlite_getvm(lua_State *L, int index) {","    sdb_vm *svm = (sdb_vm*)luaL_checkudata(L, index, sqlite_vm_meta);","    if (svm == NULL) luaL_argerror(L, index, \"bad sqlite virtual machine\");","    return svm;","}","","static sdb_vm *lsqlite_checkvm(lua_State *L, int index) {","    sdb_vm *svm = lsqlite_getvm(L, index);","    if (svm-\u003evm == NULL) luaL_argerror(L, index, \"attempt to use closed sqlite virtual machine\");","    return svm;","}","","static int dbvm_isopen(lua_State *L) {","    sdb_vm *svm = lsqlite_getvm(L, 1);","    lua_pushboolean(L, svm-\u003evm != NULL ? 1 : 0);","    return 1;","}","","static int dbvm_tostring(lua_State *L) {","    char buff[39];","    sdb_vm *svm = lsqlite_getvm(L, 1);","    if (svm-\u003evm == NULL)","        strcpy(buff, \"closed\");","    else","        sprintf(buff, \"%p\", svm);","    lua_pushfstring(L, \"sqlite virtual machine (%s)\", buff);","    return 1;","}","","static int dbvm_gc(lua_State *L) {","    sdb_vm *svm = lsqlite_getvm(L, 1);","    if (svm-\u003evm != NULL)  /* ignore closed vms */","        cleanupvm(L, svm);","    return 0;","}","","static int dbvm_step(lua_State *L) {","    int result;","    sdb_vm *svm = lsqlite_checkvm(L, 1);","","    result = stepvm(L, svm);","    svm-\u003ehas_values = result == SQLITE_ROW ? 1 : 0;","    svm-\u003ecolumns = sqlite3_data_count(svm-\u003evm);","","    lua_pushinteger(L, result);","    return 1;","}","","static int dbvm_finalize(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    return cleanupvm(L, svm);","}","","static int dbvm_reset(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_reset(svm-\u003evm);","    lua_pushinteger(L, sqlite3_errcode(svm-\u003edb-\u003edb));","    return 1;","}","","static void dbvm_check_contents(lua_State *L, sdb_vm *svm) {","    if (!svm-\u003ehas_values) {","        luaL_error(L, \"misuse of function\");","    }","}","","static void dbvm_check_index(lua_State *L, sdb_vm *svm, int index) {","    if (index \u003c 0 || index \u003e= svm-\u003ecolumns) {","        luaL_error(L, \"index out of range [0..%d]\", svm-\u003ecolumns - 1);","    }","}","","static void dbvm_check_bind_index(lua_State *L, sdb_vm *svm, int index) {","    if (index \u003c 1 || index \u003e sqlite3_bind_parameter_count(svm-\u003evm)) {","        luaL_error(L, \"bind index out of range [1..%d]\", sqlite3_bind_parameter_count(svm-\u003evm));","    }","}","","static int dbvm_last_insert_rowid(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    /* conversion warning: int64 -\u003e luaNumber */","    sqlite_int64 rowid = sqlite3_last_insert_rowid(svm-\u003edb-\u003edb);","    PUSH_INT64(L, rowid, lua_pushfstring(L, \"%ll\", rowid));","    return 1;","}","","/*","** =======================================================","** Virtual Machine - generic info","** =======================================================","*/","static int dbvm_columns(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    lua_pushinteger(L, sqlite3_column_count(svm-\u003evm));","    return 1;","}","","/*","** =======================================================","** Virtual Machine - getters","** =======================================================","*/","","static int dbvm_get_value(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    int index = luaL_checkint(L, 2);","    dbvm_check_contents(L, svm);","    dbvm_check_index(L, svm, index);","    vm_push_column(L, svm-\u003evm, index);","    return 1;","}","","static int dbvm_get_name(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    int index = luaL_checknumber(L, 2);","    dbvm_check_index(L, svm, index);","    lua_pushstring(L, sqlite3_column_name(svm-\u003evm, index));","    return 1;","}","","static int dbvm_get_type(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    int index = luaL_checknumber(L, 2);","    dbvm_check_index(L, svm, index);","    lua_pushstring(L, sqlite3_column_decltype(svm-\u003evm, index));","    return 1;","}","","static int dbvm_get_values(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int columns = svm-\u003ecolumns;","    int n;","    dbvm_check_contents(L, svm);","","    lua_createtable(L, columns, 0);","    for (n = 0; n \u003c columns;) {","        vm_push_column(L, vm, n++);","        lua_rawseti(L, -2, n);","    }","    return 1;","}","","static int dbvm_get_names(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int columns = sqlite3_column_count(vm); /* valid as soon as statement prepared */","    int n;","","    lua_createtable(L, columns, 0);","    for (n = 0; n \u003c columns;) {","        lua_pushstring(L, sqlite3_column_name(vm, n++));","        lua_rawseti(L, -2, n);","    }","    return 1;","}","","static int dbvm_get_types(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int columns = sqlite3_column_count(vm); /* valid as soon as statement prepared */","    int n;","","    lua_createtable(L, columns, 0);","    for (n = 0; n \u003c columns;) {","        lua_pushstring(L, sqlite3_column_decltype(vm, n++));","        lua_rawseti(L, -2, n);","    }","    return 1;","}","","static int dbvm_get_uvalues(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int columns = svm-\u003ecolumns;","    int n;","    dbvm_check_contents(L, svm);","","    lua_checkstack(L, columns);","    for (n = 0; n \u003c columns; ++n)","        vm_push_column(L, vm, n);","    return columns;","}","","static int dbvm_get_unames(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int columns = sqlite3_column_count(vm); /* valid as soon as statement prepared */","    int n;","","    lua_checkstack(L, columns);","    for (n = 0; n \u003c columns; ++n)","        lua_pushstring(L, sqlite3_column_name(vm, n));","    return columns;","}","","static int dbvm_get_utypes(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int columns = sqlite3_column_count(vm); /* valid as soon as statement prepared */","    int n;","","    lua_checkstack(L, columns);","    for (n = 0; n \u003c columns; ++n)","        lua_pushstring(L, sqlite3_column_decltype(vm, n));","    return columns;","}","","static int dbvm_get_named_values(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int columns = svm-\u003ecolumns;","    int n;","    dbvm_check_contents(L, svm);","","    lua_createtable(L, 0, columns);","    for (n = 0; n \u003c columns; ++n) {","        lua_pushstring(L, sqlite3_column_name(vm, n));","        vm_push_column(L, vm, n);","        lua_rawset(L, -3);","    }","    return 1;","}","","static int dbvm_get_named_types(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int columns = sqlite3_column_count(vm);","    int n;","","    lua_createtable(L, 0, columns);","    for (n = 0; n \u003c columns; ++n) {","        lua_pushstring(L, sqlite3_column_name(vm, n));","        lua_pushstring(L, sqlite3_column_decltype(vm, n));","        lua_rawset(L, -3);","    }","    return 1;","}","","/*","** =======================================================","** Virtual Machine - Bind","** =======================================================","*/","","static int dbvm_bind_index(lua_State *L, sqlite3_stmt *vm, int index, int lindex) {","    switch (lua_type(L, lindex)) {","        case LUA_TSTRING:","            return sqlite3_bind_text(vm, index, lua_tostring(L, lindex), lua_strlen(L, lindex), SQLITE_TRANSIENT);","        case LUA_TNUMBER:","#if LUA_VERSION_NUM \u003e 502","            if (lua_isinteger(L, lindex))","                return sqlite3_bind_int64(vm, index, lua_tointeger(L, lindex));","#endif","            return sqlite3_bind_double(vm, index, lua_tonumber(L, lindex));","        case LUA_TBOOLEAN:","            return sqlite3_bind_int(vm, index, lua_toboolean(L, lindex) ? 1 : 0);","        case LUA_TNONE:","        case LUA_TNIL:","            return sqlite3_bind_null(vm, index);","        default:","            luaL_error(L, \"index (%d) - invalid data type for bind (%s)\", index, lua_typename(L, lua_type(L, lindex)));","            return SQLITE_MISUSE; /*!*/","    }","}","","","static int dbvm_bind_parameter_count(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    lua_pushinteger(L, sqlite3_bind_parameter_count(svm-\u003evm));","    return 1;","}","","static int dbvm_bind_parameter_name(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    int index = luaL_checknumber(L, 2);","    dbvm_check_bind_index(L, svm, index);","    lua_pushstring(L, sqlite3_bind_parameter_name(svm-\u003evm, index));","    return 1;","}","","static int dbvm_bind(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int index = luaL_checkint(L, 2);","    int result;","","    dbvm_check_bind_index(L, svm, index);","    result = dbvm_bind_index(L, vm, index, 3);","","    lua_pushinteger(L, result);","    return 1;","}","","static int dbvm_bind_blob(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    int index = luaL_checkint(L, 2);","    const char *value = luaL_checkstring(L, 3);","    int len = lua_strlen(L, 3);","","    lua_pushinteger(L, sqlite3_bind_blob(svm-\u003evm, index, value, len, SQLITE_TRANSIENT));","    return 1;","}","","static int dbvm_bind_values(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int top = lua_gettop(L);","    int result, n;","","    if (top - 1 != sqlite3_bind_parameter_count(vm))","        luaL_error(L,","            \"incorrect number of parameters to bind (%d given, %d to bind)\",","            top - 1,","            sqlite3_bind_parameter_count(vm)","        );","","    for (n = 2; n \u003c= top; ++n) {","        if ((result = dbvm_bind_index(L, vm, n - 1, n)) != SQLITE_OK) {","            lua_pushinteger(L, result);","            return 1;","        }","    }","","    lua_pushinteger(L, SQLITE_OK);","    return 1;","}","","static int dbvm_bind_table_fields (lua_State *L, int idx, int n, sqlite3_stmt *vm) {","    const char *name;","    int result, i;","","    for ( i = 1; i \u003c= n; ++i ) {","        name = sqlite3_bind_parameter_name(vm, i );","        if (name \u0026\u0026 (name[0] == ':' || name[0] == '$')) {","            lua_pushstring(L, ++name);","            lua_gettable(L, idx);","            result = dbvm_bind_index(L, vm, i, -1);","            lua_pop(L, 1);","        }","        else {","            lua_pushinteger(L, i );","            lua_gettable(L, idx);","            result = dbvm_bind_index(L, vm, i, -1);","            lua_pop(L, 1);","        }","","        if (result != SQLITE_OK) {","            return result;","        }","    }","    return SQLITE_OK;","}","","static int dbvm_bind_names(lua_State *L) {","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm = svm-\u003evm;","    int count = sqlite3_bind_parameter_count(vm);","    int result;","    luaL_checktype(L, 2, LUA_TTABLE);","","    result = dbvm_bind_table_fields (L, 2, count, vm);","    lua_pushinteger(L, result);","    return 1;","}","","/*","** =======================================================","** Database (internal management)","** =======================================================","*/","","/*","** When creating database handles, always creates a `closed' database handle","** before opening the actual database; so, if there is a memory error, the","** database is not left opened.","**","** Creates a new 'table' and leaves it in the stack","*/","static sdb *newdb (lua_State *L) {","    sdb *db = (sdb*)lua_newuserdata(L, sizeof(sdb));","    db-\u003eL = L;","    db-\u003edb = NULL;  /* database handle is currently `closed' */","    db-\u003efunc = NULL;","","    db-\u003ebusy_cb =","    db-\u003ebusy_udata =","    db-\u003eprogress_cb =","    db-\u003eprogress_udata =","    db-\u003etrace_cb =","    db-\u003etrace_udata = ","#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK","    db-\u003eupdate_hook_cb =","    db-\u003eupdate_hook_udata =","    db-\u003ecommit_hook_cb =","    db-\u003ecommit_hook_udata =","    db-\u003erollback_hook_cb =","    db-\u003erollback_hook_udata =","#endif","     LUA_NOREF;","","    luaL_getmetatable(L, sqlite_meta);","    lua_setmetatable(L, -2);        /* set metatable */","","    /* to keep track of 'open' virtual machines */","    lua_pushlightuserdata(L, db);","    lua_newtable(L);","    lua_rawset(L, LUA_REGISTRYINDEX);","","    return db;","}","","static int cleanupdb(lua_State *L, sdb *db) {","    sdb_func *func;","    sdb_func *func_next;","    int top;","    int result;","","    /* free associated virtual machines */","    lua_pushlightuserdata(L, db);","    lua_rawget(L, LUA_REGISTRYINDEX);","","    /* close all used handles */","    top = lua_gettop(L);","    lua_pushnil(L);","    while (lua_next(L, -2)) {","        sdb_vm *svm = lua_touserdata(L, -2); /* key: vm; val: sql text */","        cleanupvm(L, svm);","","        lua_settop(L, top);","        lua_pushnil(L);","    }","","    lua_pop(L, 1); /* pop vm table */","","    /* remove entry in lua registry table */","    lua_pushlightuserdata(L, db);","    lua_pushnil(L);","    lua_rawset(L, LUA_REGISTRYINDEX);","","    /* 'free' all references */","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ebusy_cb);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ebusy_udata);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eprogress_cb);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eprogress_udata);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003etrace_cb);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003etrace_udata);","#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eupdate_hook_cb);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eupdate_hook_udata);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ecommit_hook_cb);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ecommit_hook_udata);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003erollback_hook_cb);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003erollback_hook_udata);","#endif","","    /* close database */","    result = sqlite3_close(db-\u003edb);","    db-\u003edb = NULL;","","    /* free associated memory with created functions */","    func = db-\u003efunc;","    while (func) {","        func_next = func-\u003enext;","        luaL_unref(L, LUA_REGISTRYINDEX, func-\u003efn_step);","        luaL_unref(L, LUA_REGISTRYINDEX, func-\u003efn_finalize);","        luaL_unref(L, LUA_REGISTRYINDEX, func-\u003eudata);","        free(func);","        func = func_next;","    }","    db-\u003efunc = NULL;","    return result;","}","","static sdb *lsqlite_getdb(lua_State *L, int index) {","    sdb *db = (sdb*)luaL_checkudata(L, index, sqlite_meta);","    if (db == NULL) luaL_typerror(L, index, \"sqlite database\");","    return db;","}","","static sdb *lsqlite_checkdb(lua_State *L, int index) {","    sdb *db = lsqlite_getdb(L, index);","    if (db-\u003edb == NULL) luaL_argerror(L, index, \"attempt to use closed sqlite database\");","    return db;","}","","","/*","** =======================================================","** User Defined Functions - Context Methods","** =======================================================","*/","typedef struct {","    sqlite3_context *ctx;","    int ud;","} lcontext;","","static lcontext *lsqlite_make_context(lua_State *L) {","    lcontext *ctx = (lcontext*)lua_newuserdata(L, sizeof(lcontext));","    lua_rawgeti(L, LUA_REGISTRYINDEX, sqlite_ctx_meta_ref);","    lua_setmetatable(L, -2);","    ctx-\u003ectx = NULL;","    ctx-\u003eud = LUA_NOREF;","    return ctx;","}","","static lcontext *lsqlite_getcontext(lua_State *L, int index) {","    lcontext *ctx = (lcontext*)luaL_checkudata(L, index, sqlite_ctx_meta);","    if (ctx == NULL) luaL_typerror(L, index, \"sqlite context\");","    return ctx;","}","","static lcontext *lsqlite_checkcontext(lua_State *L, int index) {","    lcontext *ctx = lsqlite_getcontext(L, index);","    if (ctx-\u003ectx == NULL) luaL_argerror(L, index, \"invalid sqlite context\");","    return ctx;","}","","static int lcontext_tostring(lua_State *L) {","    char buff[39];","    lcontext *ctx = lsqlite_getcontext(L, 1);","    if (ctx-\u003ectx == NULL)","        strcpy(buff, \"closed\");","    else","        sprintf(buff, \"%p\", ctx-\u003ectx);","    lua_pushfstring(L, \"sqlite function context (%s)\", buff);","    return 1;","}","","static void lcontext_check_aggregate(lua_State *L, lcontext *ctx) {","    sdb_func *func = (sdb_func*)sqlite3_user_data(ctx-\u003ectx);","    if (!func-\u003eaggregate) {","        luaL_error(L, \"attempt to call aggregate method from scalar function\");","    }","}","","static int lcontext_user_data(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    sdb_func *func = (sdb_func*)sqlite3_user_data(ctx-\u003ectx);","    lua_rawgeti(L, LUA_REGISTRYINDEX, func-\u003eudata);","    return 1;","}","","static int lcontext_get_aggregate_context(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    lcontext_check_aggregate(L, ctx);","    lua_rawgeti(L, LUA_REGISTRYINDEX, ctx-\u003eud);","    return 1;","}","","static int lcontext_set_aggregate_context(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    lcontext_check_aggregate(L, ctx);","    lua_settop(L, 2);","    luaL_unref(L, LUA_REGISTRYINDEX, ctx-\u003eud);","    ctx-\u003eud = luaL_ref(L, LUA_REGISTRYINDEX);","    return 0;","}","","static int lcontext_aggregate_count(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    lcontext_check_aggregate(L, ctx);","    lua_pushinteger(L, sqlite3_aggregate_count(ctx-\u003ectx));","    return 1;","}","","#if 0","void *sqlite3_get_auxdata(sqlite3_context*, int);","void sqlite3_set_auxdata(sqlite3_context*, int, void*, void (*)(void*));","#endif","","static int lcontext_result(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    switch (lua_type(L, 2)) {","        case LUA_TNUMBER:","#if LUA_VERSION_NUM \u003e 502","            if (lua_isinteger(L, 2))","                sqlite3_result_int64(ctx-\u003ectx, luaL_checkinteger(L, 2));","            else","#endif","            sqlite3_result_double(ctx-\u003ectx, luaL_checknumber(L, 2));","            break;","        case LUA_TSTRING:","            sqlite3_result_text(ctx-\u003ectx, luaL_checkstring(L, 2), lua_strlen(L, 2), SQLITE_TRANSIENT);","            break;","        case LUA_TNIL:","        case LUA_TNONE:","            sqlite3_result_null(ctx-\u003ectx);","            break;","        default:","            luaL_error(L, \"invalid result type %s\", lua_typename(L, 2));","            break;","    }","","    return 0;","}","","static int lcontext_result_blob(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    const char *blob = luaL_checkstring(L, 2);","    int size = lua_strlen(L, 2);","    sqlite3_result_blob(ctx-\u003ectx, (const void*)blob, size, SQLITE_TRANSIENT);","    return 0;","}","","static int lcontext_result_double(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    double d = luaL_checknumber(L, 2);","    sqlite3_result_double(ctx-\u003ectx, d);","    return 0;","}","","static int lcontext_result_error(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    const char *err = luaL_checkstring(L, 2);","    int size = lua_strlen(L, 2);","    sqlite3_result_error(ctx-\u003ectx, err, size);","    return 0;","}","","static int lcontext_result_int(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    int i = luaL_checkint(L, 2);","    sqlite3_result_int(ctx-\u003ectx, i);","    return 0;","}","","static int lcontext_result_null(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    sqlite3_result_null(ctx-\u003ectx);","    return 0;","}","","static int lcontext_result_text(lua_State *L) {","    lcontext *ctx = lsqlite_checkcontext(L, 1);","    const char *text = luaL_checkstring(L, 2);","    int size = lua_strlen(L, 2);","    sqlite3_result_text(ctx-\u003ectx, text, size, SQLITE_TRANSIENT);","    return 0;","}","","/*","** =======================================================","** Database Methods","** =======================================================","*/","","static int db_isopen(lua_State *L) {","    sdb *db = lsqlite_getdb(L, 1);","    lua_pushboolean(L, db-\u003edb != NULL ? 1 : 0);","    return 1;","}","","static int db_last_insert_rowid(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    /* conversion warning: int64 -\u003e luaNumber */","    sqlite_int64 rowid = sqlite3_last_insert_rowid(db-\u003edb);","    PUSH_INT64(L, rowid, lua_pushfstring(L, \"%ll\", rowid));","    return 1;","}","","static int db_changes(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    lua_pushinteger(L, sqlite3_changes(db-\u003edb));","    return 1;","}","","static int db_total_changes(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    lua_pushinteger(L, sqlite3_total_changes(db-\u003edb));","    return 1;","}","","static int db_errcode(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    lua_pushinteger(L, sqlite3_errcode(db-\u003edb));","    return 1;","}","","static int db_errmsg(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    lua_pushstring(L, sqlite3_errmsg(db-\u003edb));","    return 1;","}","","static int db_interrupt(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    sqlite3_interrupt(db-\u003edb);","    return 0;","}","","static int db_db_filename(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    const char *db_name = luaL_checkstring(L, 2);","    /* sqlite3_db_filename may return NULL, in that case Lua pushes nil... */","    lua_pushstring(L, sqlite3_db_filename(db-\u003edb, db_name));","    return 1;","}","","/*","** Registering SQL functions:","*/","","static void db_push_value(lua_State *L, sqlite3_value *value) {","    switch (sqlite3_value_type(value)) {","        case SQLITE_TEXT:","            lua_pushlstring(L, (const char*)sqlite3_value_text(value), sqlite3_value_bytes(value));","            break;","","        case SQLITE_INTEGER:","            PUSH_INT64(L, sqlite3_value_int64(value)","                        , lua_pushlstring(L, (const char*)sqlite3_value_text(value)","                                            , sqlite3_value_bytes(value)));","            break;","","        case SQLITE_FLOAT:","            lua_pushnumber(L, sqlite3_value_double(value));","            break;","","        case SQLITE_BLOB:","            lua_pushlstring(L, sqlite3_value_blob(value), sqlite3_value_bytes(value));","            break;","","        case SQLITE_NULL:","            lua_pushnil(L);","            break;","","        default:","            /* things done properly (SQLite + Lua SQLite)","            ** this should never happen */","            lua_pushnil(L);","            break;","    }","}","","/*","** callback functions used when calling registered sql functions","*/","","/* scalar function to be called","** callback params: context, values... */","static void db_sql_normal_function(sqlite3_context *context, int argc, sqlite3_value **argv) {","    sdb_func *func = (sdb_func*)sqlite3_user_data(context);","    lua_State *L = func-\u003edb-\u003eL;","    int n;","    lcontext *ctx;","","    int top = lua_gettop(L);","","    /* ensure there is enough space in the stack */","    lua_checkstack(L, argc + 3);","","    lua_rawgeti(L, LUA_REGISTRYINDEX, func-\u003efn_step);   /* function to call */","","    if (!func-\u003eaggregate) {","        ctx = lsqlite_make_context(L); /* push context - used to set results */","    }","    else {","        /* reuse context userdata value */","        void *p = sqlite3_aggregate_context(context, 1);","        /* i think it is OK to use assume that using a light user data","        ** as an entry on LUA REGISTRY table will be unique */","        lua_pushlightuserdata(L, p);","        lua_rawget(L, LUA_REGISTRYINDEX);       /* context table */","","        if (lua_isnil(L, -1)) { /* not yet created? */","            lua_pop(L, 1);","            ctx = lsqlite_make_context(L);","            lua_pushlightuserdata(L, p);","            lua_pushvalue(L, -2);","            lua_rawset(L, LUA_REGISTRYINDEX);","        }","        else","            ctx = lsqlite_getcontext(L, -1);","    }","","    /* push params */","    for (n = 0; n \u003c argc; ++n) {","        db_push_value(L, argv[n]);","    }","","    /* set context */","    ctx-\u003ectx = context;","","    if (lua_pcall(L, argc + 1, 0, 0)) {","        const char *errmsg = lua_tostring(L, -1);","        int size = lua_strlen(L, -1);","        sqlite3_result_error(context, errmsg, size);","    }","","    /* invalidate context */","    ctx-\u003ectx = NULL;","","    if (!func-\u003eaggregate) {","        luaL_unref(L, LUA_REGISTRYINDEX, ctx-\u003eud);","    }","","    lua_settop(L, top);","}","","static void db_sql_finalize_function(sqlite3_context *context) {","    sdb_func *func = (sdb_func*)sqlite3_user_data(context);","    lua_State *L = func-\u003edb-\u003eL;","    void *p = sqlite3_aggregate_context(context, 1); /* minimal mem usage */","    lcontext *ctx;","    int top = lua_gettop(L);","","    lua_rawgeti(L, LUA_REGISTRYINDEX, func-\u003efn_finalize);   /* function to call */","","    /* i think it is OK to use assume that using a light user data","    ** as an entry on LUA REGISTRY table will be unique */","    lua_pushlightuserdata(L, p);","    lua_rawget(L, LUA_REGISTRYINDEX);       /* context table */","","    if (lua_isnil(L, -1)) { /* not yet created? - shouldn't happen in finalize function */","        lua_pop(L, 1);","        ctx = lsqlite_make_context(L);","        lua_pushlightuserdata(L, p);","        lua_pushvalue(L, -2);","        lua_rawset(L, LUA_REGISTRYINDEX);","    }","    else","        ctx = lsqlite_getcontext(L, -1);","","    /* set context */","    ctx-\u003ectx = context;","","    if (lua_pcall(L, 1, 0, 0)) {","        sqlite3_result_error(context, lua_tostring(L, -1), -1);","    }","","    /* invalidate context */","    ctx-\u003ectx = NULL;","","    /* cleanup context */","    luaL_unref(L, LUA_REGISTRYINDEX, ctx-\u003eud);","    /* remove it from registry */","    lua_pushlightuserdata(L, p);","    lua_pushnil(L);","    lua_rawset(L, LUA_REGISTRYINDEX);","","    lua_settop(L, top);","}","","/*","** Register a normal function","** Params: db, function name, number arguments, [ callback | step, finalize], user data","** Returns: true on sucess","**","** Normal function:","** Params: context, params","**","** Aggregate function:","** Params of step: context, params","** Params of finalize: context","*/","static int db_register_function(lua_State *L, int aggregate) {","    sdb *db = lsqlite_checkdb(L, 1);","    const char *name;","    int args;","    int result;","    sdb_func *func;","","    /* safety measure */","    if (aggregate) aggregate = 1;","","    name = luaL_checkstring(L, 2);","    args = luaL_checkint(L, 3);","    luaL_checktype(L, 4, LUA_TFUNCTION);","    if (aggregate) luaL_checktype(L, 5, LUA_TFUNCTION);","","    /* maybe an alternative way to allocate memory should be used/avoided */","    func = (sdb_func*)malloc(sizeof(sdb_func));","    if (func == NULL) {","        luaL_error(L, \"out of memory\");","    }","","    result = sqlite3_create_function(","        db-\u003edb, name, args, SQLITE_UTF8, func,","        aggregate ? NULL : db_sql_normal_function,","        aggregate ? db_sql_normal_function : NULL,","        aggregate ? db_sql_finalize_function : NULL","    );","","    if (result == SQLITE_OK) {","        /* safety measures for userdata field to be present in the stack */","        lua_settop(L, 5 + aggregate);","","        /* save registered function in db function list */","        func-\u003edb = db;","        func-\u003eaggregate = aggregate;","        func-\u003enext = db-\u003efunc;","        db-\u003efunc = func;","","        /* save the setp/normal function callback */","        lua_pushvalue(L, 4);","        func-\u003efn_step = luaL_ref(L, LUA_REGISTRYINDEX);","        /* save user data */","        lua_pushvalue(L, 5+aggregate);","        func-\u003eudata = luaL_ref(L, LUA_REGISTRYINDEX);","","        if (aggregate) {","            lua_pushvalue(L, 5);","            func-\u003efn_finalize = luaL_ref(L, LUA_REGISTRYINDEX);","        }","        else","            func-\u003efn_finalize = LUA_NOREF;","    }","    else {","        /* free allocated memory */","        free(func);","    }","","    lua_pushboolean(L, result == SQLITE_OK ? 1 : 0);","    return 1;","}","","static int db_create_function(lua_State *L) {","    return db_register_function(L, 0);","}","","static int db_create_aggregate(lua_State *L) {","    return db_register_function(L, 1);","}","","/* create_collation; contributed by Thomas Lauer","*/","","typedef struct {","    lua_State *L;","    int ref;","} scc;","","static int collwrapper(scc *co,int l1,const void *p1,","                        int l2,const void *p2) {","    int res=0;","    lua_State *L=co-\u003eL;","    lua_rawgeti(L,LUA_REGISTRYINDEX,co-\u003eref);","    lua_pushlstring(L,p1,l1);","    lua_pushlstring(L,p2,l2);","    if (lua_pcall(L,2,1,0)==0) res=(int)lua_tonumber(L,-1);","    lua_pop(L,1);","    return res;","}","","static void collfree(scc *co) {","    if (co) {","        luaL_unref(co-\u003eL,LUA_REGISTRYINDEX,co-\u003eref);","        free(co);","    }","}","","static int db_create_collation(lua_State *L) {","    sdb *db=lsqlite_checkdb(L,1);","    const char *collname=luaL_checkstring(L,2);","    scc *co=NULL;","    int (*collfunc)(scc *,int,const void *,int,const void *)=NULL;","    lua_settop(L,3); /* default args to nil, and exclude extras */","    if (lua_isfunction(L,3)) collfunc=collwrapper;","    else if (!lua_isnil(L,3))","        luaL_error(L,\"create_collation: function or nil expected\");","    if (collfunc != NULL) {","        co=(scc *)malloc(sizeof(scc)); /* userdata is a no-no as it","                                          will be garbage-collected */","        if (co) {","            co-\u003eL=L;","            /* lua_settop(L,3) above means we don't need: lua_pushvalue(L,3); */","            co-\u003eref=luaL_ref(L,LUA_REGISTRYINDEX);","        }","        else luaL_error(L,\"create_collation: could not allocate callback\");","    }","    sqlite3_create_collation_v2(db-\u003edb, collname, SQLITE_UTF8,","        (void *)co,","        (int(*)(void*,int,const void*,int,const void*))collfunc,","        (void(*)(void*))collfree);","    return 0;","}","","/* Thanks to Wolfgang Oertl...","*/","static int db_load_extension(lua_State *L) {","    sdb *db=lsqlite_checkdb(L,1);","    const char *extname=luaL_optstring(L,2,NULL);","    const char *entrypoint=luaL_optstring(L,3,NULL);","    int result;","    char *errmsg = NULL;","","    if (extname == NULL) {","        result = sqlite3_enable_load_extension(db-\u003edb,0); /* disable extension loading */","    }","    else {","        sqlite3_enable_load_extension(db-\u003edb,1); /* enable extension loading */","        result = sqlite3_load_extension(db-\u003edb,extname,entrypoint,\u0026errmsg);","    }","","    if (result == SQLITE_OK) {","        lua_pushboolean(L,1);","        return 1;","    }","","    lua_pushboolean(L,0); /* so, assert(load_extension(...)) works */","    lua_pushstring(L,errmsg);","    sqlite3_free(errmsg);","    return 2;","}","","/*","** trace callback:","** Params: database, callback function, userdata","**","** callback function:","** Params: userdata, sql","*/","static void db_trace_callback(void *user, const char *sql) {","    sdb *db = (sdb*)user;","    lua_State *L = db-\u003eL;","    int top = lua_gettop(L);","","    /* setup lua callback call */","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003etrace_cb);    /* get callback */","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003etrace_udata); /* get callback user data */","    lua_pushstring(L, sql); /* traced sql statement */","","    /* call lua function */","    lua_pcall(L, 2, 0, 0);","    /* ignore any error generated by this function */","","    lua_settop(L, top);","}","","static int db_trace(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","","    if (lua_gettop(L) \u003c 2 || lua_isnil(L, 2)) {","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003etrace_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003etrace_udata);","","        db-\u003etrace_cb =","        db-\u003etrace_udata = LUA_NOREF;","","        /* clear trace handler */","        sqlite3_trace(db-\u003edb, NULL, NULL);","    }","    else {","        luaL_checktype(L, 2, LUA_TFUNCTION);","","        /* make sure we have an userdata field (even if nil) */","        lua_settop(L, 3);","","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003etrace_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003etrace_udata);","","        db-\u003etrace_udata = luaL_ref(L, LUA_REGISTRYINDEX);","        db-\u003etrace_cb = luaL_ref(L, LUA_REGISTRYINDEX);","","        /* set trace handler */","        sqlite3_trace(db-\u003edb, db_trace_callback, db);","    }","","    return 0;","}","","#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK","","/*","** update_hook callback:","** Params: database, callback function, userdata","**","** callback function:","** Params: userdata, {one of SQLITE_INSERT, SQLITE_DELETE, or SQLITE_UPDATE}, ","**          database name, table name (containing the affected row), rowid of the row","*/","static void db_update_hook_callback(void *user, int op, char const *dbname, char const *tblname, sqlite3_int64 rowid) {","    sdb *db = (sdb*)user;","    lua_State *L = db-\u003eL;","    int top = lua_gettop(L);","","    /* setup lua callback call */","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003eupdate_hook_cb);    /* get callback */","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003eupdate_hook_udata); /* get callback user data */","    lua_pushinteger(L, op);","    lua_pushstring(L, dbname); /* update_hook database name */","    lua_pushstring(L, tblname); /* update_hook database name */","    ","    PUSH_INT64(L, rowid, lua_pushfstring(L, \"%ll\", rowid));","","    /* call lua function */","    lua_pcall(L, 5, 0, 0);","    /* ignore any error generated by this function */","","    lua_settop(L, top);","}","","static int db_update_hook(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","","    if (lua_gettop(L) \u003c 2 || lua_isnil(L, 2)) {","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eupdate_hook_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eupdate_hook_udata);","","        db-\u003eupdate_hook_cb =","        db-\u003eupdate_hook_udata = LUA_NOREF;","","        /* clear update_hook handler */","        sqlite3_update_hook(db-\u003edb, NULL, NULL);","    }","    else {","        luaL_checktype(L, 2, LUA_TFUNCTION);","","        /* make sure we have an userdata field (even if nil) */","        lua_settop(L, 3);","","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eupdate_hook_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eupdate_hook_udata);","","        db-\u003eupdate_hook_udata = luaL_ref(L, LUA_REGISTRYINDEX);","        db-\u003eupdate_hook_cb = luaL_ref(L, LUA_REGISTRYINDEX);","","        /* set update_hook handler */","        sqlite3_update_hook(db-\u003edb, db_update_hook_callback, db);","    }","","    return 0;","}","","/*","** commit_hook callback:","** Params: database, callback function, userdata","**","** callback function:","** Params: userdata","** Returned value: Return false or nil to continue the COMMIT operation normally.","**  return true (non false, non nil), then the COMMIT is converted into a ROLLBACK. ","*/","static int db_commit_hook_callback(void *user) {","    sdb *db = (sdb*)user;","    lua_State *L = db-\u003eL;","    int top = lua_gettop(L);","    int rollback = 0;","","    /* setup lua callback call */","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003ecommit_hook_cb);    /* get callback */","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003ecommit_hook_udata); /* get callback user data */","","    /* call lua function */","    if (!lua_pcall(L, 1, 1, 0))","        rollback = lua_toboolean(L, -1); /* use result if there was no error */","","    lua_settop(L, top);","    return rollback;","}","","static int db_commit_hook(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","","    if (lua_gettop(L) \u003c 2 || lua_isnil(L, 2)) {","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ecommit_hook_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ecommit_hook_udata);","","        db-\u003ecommit_hook_cb =","        db-\u003ecommit_hook_udata = LUA_NOREF;","","        /* clear commit_hook handler */","        sqlite3_commit_hook(db-\u003edb, NULL, NULL);","    }","    else {","        luaL_checktype(L, 2, LUA_TFUNCTION);","","        /* make sure we have an userdata field (even if nil) */","        lua_settop(L, 3);","","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ecommit_hook_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ecommit_hook_udata);","","        db-\u003ecommit_hook_udata = luaL_ref(L, LUA_REGISTRYINDEX);","        db-\u003ecommit_hook_cb = luaL_ref(L, LUA_REGISTRYINDEX);","","        /* set commit_hook handler */","        sqlite3_commit_hook(db-\u003edb, db_commit_hook_callback, db);","    }","","    return 0;","}","","/*","** rollback hook callback:","** Params: database, callback function, userdata","**","** callback function:","** Params: userdata","*/","static void db_rollback_hook_callback(void *user) {","    sdb *db = (sdb*)user;","    lua_State *L = db-\u003eL;","    int top = lua_gettop(L);","","    /* setup lua callback call */","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003erollback_hook_cb);    /* get callback */","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003erollback_hook_udata); /* get callback user data */","","    /* call lua function */","    lua_pcall(L, 1, 0, 0);","    /* ignore any error generated by this function */","","    lua_settop(L, top);","}","","static int db_rollback_hook(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","","    if (lua_gettop(L) \u003c 2 || lua_isnil(L, 2)) {","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003erollback_hook_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003erollback_hook_udata);","","        db-\u003erollback_hook_cb =","        db-\u003erollback_hook_udata = LUA_NOREF;","","        /* clear rollback_hook handler */","        sqlite3_rollback_hook(db-\u003edb, NULL, NULL);","    }","    else {","        luaL_checktype(L, 2, LUA_TFUNCTION);","","        /* make sure we have an userdata field (even if nil) */","        lua_settop(L, 3);","","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003erollback_hook_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003erollback_hook_udata);","","        db-\u003erollback_hook_udata = luaL_ref(L, LUA_REGISTRYINDEX);","        db-\u003erollback_hook_cb = luaL_ref(L, LUA_REGISTRYINDEX);","","        /* set rollback_hook handler */","        sqlite3_rollback_hook(db-\u003edb, db_rollback_hook_callback, db);","    }","","    return 0;","}","","#endif /* #if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK */","","#if !defined(SQLITE_OMIT_PROGRESS_CALLBACK) || !SQLITE_OMIT_PROGRESS_CALLBACK","","/*","** progress handler:","** Params: database, number of opcodes, callback function, userdata","**","** callback function:","** Params: userdata","** returns: 0 to return immediatly and return SQLITE_ABORT, non-zero to continue","*/","static int db_progress_callback(void *user) {","    int result = 1; /* abort by default */","    sdb *db = (sdb*)user;","    lua_State *L = db-\u003eL;","    int top = lua_gettop(L);","","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003eprogress_cb);","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003eprogress_udata);","","    /* call lua function */","    if (!lua_pcall(L, 1, 1, 0))","        result = lua_toboolean(L, -1);","","    lua_settop(L, top);","    return result;","}","","static int db_progress_handler(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","","    if (lua_gettop(L) \u003c 2 || lua_isnil(L, 2)) {","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eprogress_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eprogress_udata);","","        db-\u003eprogress_cb =","        db-\u003eprogress_udata = LUA_NOREF;","","        /* clear busy handler */","        sqlite3_progress_handler(db-\u003edb, 0, NULL, NULL);","    }","    else {","        int nop = luaL_checkint(L, 2);  /* number of opcodes */","        luaL_checktype(L, 3, LUA_TFUNCTION);","","        /* make sure we have an userdata field (even if nil) */","        lua_settop(L, 4);","","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eprogress_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003eprogress_udata);","","        db-\u003eprogress_udata = luaL_ref(L, LUA_REGISTRYINDEX);","        db-\u003eprogress_cb = luaL_ref(L, LUA_REGISTRYINDEX);","","        /* set progress callback */","        sqlite3_progress_handler(db-\u003edb, nop, db_progress_callback, db);","    }","","    return 0;","}","","#else /* #if !defined(SQLITE_OMIT_PROGRESS_CALLBACK) || !SQLITE_OMIT_PROGRESS_CALLBACK */","","static int db_progress_handler(lua_State *L) {","    lua_pushliteral(L, \"progress callback support disabled at compile time\");","    lua_error(L);","    return 0;","}","","#endif /* #if !defined(SQLITE_OMIT_PROGRESS_CALLBACK) || !SQLITE_OMIT_PROGRESS_CALLBACK */","","/* Online Backup API */","#if 0","sqlite3_backup *sqlite3_backup_init(","  sqlite3 *pDest,                        /* Destination database handle */","  const char *zDestName,                 /* Destination database name */","  sqlite3 *pSource,                      /* Source database handle */","  const char *zSourceName                /* Source database name */",");","int sqlite3_backup_step(sqlite3_backup *p, int nPage);","int sqlite3_backup_finish(sqlite3_backup *p);","int sqlite3_backup_remaining(sqlite3_backup *p);","int sqlite3_backup_pagecount(sqlite3_backup *p);","#endif","","struct sdb_bu {","    sqlite3_backup *bu;     /* backup structure */","};","","static int cleanupbu(lua_State *L, sdb_bu *sbu) {","","    if (!sbu-\u003ebu) return 0; /* already finished */","","    /* remove table from registry */","    lua_pushlightuserdata(L, sbu-\u003ebu);","    lua_pushnil(L);","    lua_rawset(L, LUA_REGISTRYINDEX);","","    lua_pushinteger(L, sqlite3_backup_finish(sbu-\u003ebu));","    sbu-\u003ebu = NULL;","","    return 1;","}","","static int lsqlite_backup_init(lua_State *L) {","","    sdb *target_db = lsqlite_checkdb(L, 1);","    const char *target_nm = luaL_checkstring(L, 2);","    sdb *source_db = lsqlite_checkdb(L, 3);","    const char *source_nm = luaL_checkstring(L, 4);","","    sqlite3_backup *bu = sqlite3_backup_init(target_db-\u003edb, target_nm, source_db-\u003edb, source_nm);","","    if (NULL != bu) {","        sdb_bu *sbu = (sdb_bu*)lua_newuserdata(L, sizeof(sdb_bu));","","        luaL_getmetatable(L, sqlite_bu_meta);","        lua_setmetatable(L, -2);        /* set metatable */","        sbu-\u003ebu = bu;","","        /* create table from registry */","        /* to prevent referenced databases from being garbage collected while bu is live */","        lua_pushlightuserdata(L, bu);","        lua_createtable(L, 2, 0);","        /* add source and target dbs to table at indices 1 and 2 */","        lua_pushvalue(L, 1); /* target db */","        lua_rawseti(L, -2, 1);","        lua_pushvalue(L, 3); /* source db */","        lua_rawseti(L, -2, 2);","        /* put table in registry with key lightuserdata bu */","        lua_rawset(L, LUA_REGISTRYINDEX);","","        return 1;","    }","    else {","        return 0;","    }","}","","static sdb_bu *lsqlite_getbu(lua_State *L, int index) {","    sdb_bu *sbu = (sdb_bu*)luaL_checkudata(L, index, sqlite_bu_meta);","    if (sbu == NULL) luaL_typerror(L, index, \"sqlite database backup\");","    return sbu;","}","","static sdb_bu *lsqlite_checkbu(lua_State *L, int index) {","    sdb_bu *sbu = lsqlite_getbu(L, index);","    if (sbu-\u003ebu == NULL) luaL_argerror(L, index, \"attempt to use closed sqlite database backup\");","    return sbu;","}","","static int dbbu_gc(lua_State *L) {","    sdb_bu *sbu = lsqlite_getbu(L, 1);","    if (sbu-\u003ebu != NULL) {","        cleanupbu(L, sbu);","        lua_pop(L, 1);","    }","    /* else ignore if already finished */","    return 0;","}","","static int dbbu_step(lua_State *L) {","    sdb_bu *sbu = lsqlite_checkbu(L, 1);","    int nPage = luaL_checkint(L, 2);","    lua_pushinteger(L, sqlite3_backup_step(sbu-\u003ebu, nPage));","    return 1;","}","","static int dbbu_remaining(lua_State *L) {","    sdb_bu *sbu = lsqlite_checkbu(L, 1);","    lua_pushinteger(L, sqlite3_backup_remaining(sbu-\u003ebu));","    return 1;","}","","static int dbbu_pagecount(lua_State *L) {","    sdb_bu *sbu = lsqlite_checkbu(L, 1);","    lua_pushinteger(L, sqlite3_backup_pagecount(sbu-\u003ebu));","    return 1;","}","","static int dbbu_finish(lua_State *L) {","    sdb_bu *sbu = lsqlite_checkbu(L, 1);","    return cleanupbu(L, sbu);","}","","/* end of Online Backup API */","","/*","** busy handler:","** Params: database, callback function, userdata","**","** callback function:","** Params: userdata, number of tries","** returns: 0 to return immediatly and return SQLITE_BUSY, non-zero to try again","*/","static int db_busy_callback(void *user, int tries) {","    int retry = 0; /* abort by default */","    sdb *db = (sdb*)user;","    lua_State *L = db-\u003eL;","    int top = lua_gettop(L);","","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003ebusy_cb);","    lua_rawgeti(L, LUA_REGISTRYINDEX, db-\u003ebusy_udata);","    lua_pushinteger(L, tries);","","    /* call lua function */","    if (!lua_pcall(L, 2, 1, 0))","        retry = lua_toboolean(L, -1);","","    lua_settop(L, top);","    return retry;","}","","static int db_busy_handler(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","","    if (lua_gettop(L) \u003c 2 || lua_isnil(L, 2)) {","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ebusy_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ebusy_udata);","","        db-\u003ebusy_cb =","        db-\u003ebusy_udata = LUA_NOREF;","","        /* clear busy handler */","        sqlite3_busy_handler(db-\u003edb, NULL, NULL);","    }","    else {","        luaL_checktype(L, 2, LUA_TFUNCTION);","        /* make sure we have an userdata field (even if nil) */","        lua_settop(L, 3);","","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ebusy_cb);","        luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ebusy_udata);","","        db-\u003ebusy_udata = luaL_ref(L, LUA_REGISTRYINDEX);","        db-\u003ebusy_cb = luaL_ref(L, LUA_REGISTRYINDEX);","","        /* set busy handler */","        sqlite3_busy_handler(db-\u003edb, db_busy_callback, db);","    }","","    return 0;","}","","static int db_busy_timeout(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    int timeout = luaL_checkint(L, 2);","    sqlite3_busy_timeout(db-\u003edb, timeout);","","    /* if there was a timeout callback registered, it is now","    ** invalid/useless. free any references we may have */","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ebusy_cb);","    luaL_unref(L, LUA_REGISTRYINDEX, db-\u003ebusy_udata);","    db-\u003ebusy_cb =","    db-\u003ebusy_udata = LUA_NOREF;","","    return 0;","}","","/*","** Params: db, sql, callback, user","** returns: code [, errmsg]","**","** Callback:","** Params: user, number of columns, values, names","** Returns: 0 to continue, other value will cause abort","*/","static int db_exec_callback(void* user, int columns, char **data, char **names) {","    int result = SQLITE_ABORT; /* abort by default */","    lua_State *L = (lua_State*)user;","    int n;","","    int top = lua_gettop(L);","","    lua_pushvalue(L, 3); /* function to call */","    lua_pushvalue(L, 4); /* user data */","    lua_pushinteger(L, columns); /* total number of rows in result */","","    /* column values */","    lua_pushvalue(L, 6);","    for (n = 0; n \u003c columns;) {","        lua_pushstring(L, data[n++]);","        lua_rawseti(L, -2, n);","    }","","    /* columns names */","    lua_pushvalue(L, 5);","    if (lua_isnil(L, -1)) {","        lua_pop(L, 1);","        lua_createtable(L, columns, 0);","        lua_pushvalue(L, -1);","        lua_replace(L, 5);","        for (n = 0; n \u003c columns;) {","            lua_pushstring(L, names[n++]);","            lua_rawseti(L, -2, n);","        }","    }","","    /* call lua function */","    if (!lua_pcall(L, 4, 1, 0)) {","","#if LUA_VERSION_NUM \u003e 502","        if (lua_isinteger(L, -1))","            result = lua_tointeger(L, -1);","        else","#endif","        if (lua_isnumber(L, -1))","            result = lua_tonumber(L, -1);","    }","","    lua_settop(L, top);","    return result;","}","","static int db_exec(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    const char *sql = luaL_checkstring(L, 2);","    int result;","","    if (!lua_isnoneornil(L, 3)) {","        /* stack:","        **  3: callback function","        **  4: userdata","        **  5: column names","        **  6: reusable column values","        */","        luaL_checktype(L, 3, LUA_TFUNCTION);","        lua_settop(L, 4);   /* 'trap' userdata - nil extra parameters */","        lua_pushnil(L);     /* column names not known at this point */","        lua_newtable(L);    /* column values table */","","        result = sqlite3_exec(db-\u003edb, sql, db_exec_callback, L, NULL);","    }","    else {","        /* no callbacks */","        result = sqlite3_exec(db-\u003edb, sql, NULL, NULL, NULL);","    }","","    lua_pushinteger(L, result);","    return 1;","}","","/*","** Params: db, sql","** returns: code, compiled length or error message","*/","static int db_prepare(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    const char *sql = luaL_checkstring(L, 2);","    int sql_len = lua_strlen(L, 2);","    const char *sqltail;","    sdb_vm *svm;","    lua_settop(L,2); /* db,sql is on top of stack for call to newvm */","    svm = newvm(L, db);","","    if (sqlite3_prepare_v2(db-\u003edb, sql, sql_len, \u0026svm-\u003evm, \u0026sqltail) != SQLITE_OK) {","        lua_pushnil(L);","        lua_pushinteger(L, sqlite3_errcode(db-\u003edb));","        if (cleanupvm(L, svm) == 1)","            lua_pop(L, 1); /* this should not happen since sqlite3_prepare_v2 will not set -\u003evm on error */","        return 2;","    }","","    /* vm already in the stack */","    lua_pushstring(L, sqltail);","    return 2;","}","","static int db_do_next_row(lua_State *L, int packed) {","    int result;","    sdb_vm *svm = lsqlite_checkvm(L, 1);","    sqlite3_stmt *vm;","    int columns;","    int i;","","    result = stepvm(L, svm);","    vm = svm-\u003evm; /* stepvm may change svm-\u003evm if re-prepare is needed */","    svm-\u003ehas_values = result == SQLITE_ROW ? 1 : 0;","    svm-\u003ecolumns = columns = sqlite3_data_count(vm);","","    if (result == SQLITE_ROW) {","        if (packed) {","            if (packed == 1) {","                lua_createtable(L, columns, 0);","                for (i = 0; i \u003c columns;) {","                    vm_push_column(L, vm, i);","                    lua_rawseti(L, -2, ++i);","                }","            }","            else {","                lua_createtable(L, 0, columns);","                for (i = 0; i \u003c columns; ++i) {","                    lua_pushstring(L, sqlite3_column_name(vm, i));","                    vm_push_column(L, vm, i);","                    lua_rawset(L, -3);","                }","            }","            return 1;","        }","        else {","            lua_checkstack(L, columns);","            for (i = 0; i \u003c columns; ++i)","                vm_push_column(L, vm, i);","            return svm-\u003ecolumns;","        }","    }","","    if (svm-\u003etemp) {","        /* finalize and check for errors */","        result = sqlite3_finalize(vm);","        svm-\u003evm = NULL;","        cleanupvm(L, svm);","    }","    else if (result == SQLITE_DONE) {","        result = sqlite3_reset(vm);","    }","","    if (result != SQLITE_OK) {","        lua_pushstring(L, sqlite3_errmsg(svm-\u003edb-\u003edb));","        lua_error(L);","    }","    return 0;","}","","static int db_next_row(lua_State *L) {","    return db_do_next_row(L, 0);","}","","static int db_next_packed_row(lua_State *L) {","    return db_do_next_row(L, 1);","}","","static int db_next_named_row(lua_State *L) {","    return db_do_next_row(L, 2);","}","","static int dbvm_do_rows(lua_State *L, int(*f)(lua_State *)) {","    /* sdb_vm *svm =  */","    lsqlite_checkvm(L, 1);","    lua_pushvalue(L,1);","    lua_pushcfunction(L, f);","    lua_insert(L, -2);","    return 2;","}","","static int dbvm_rows(lua_State *L) {","    return dbvm_do_rows(L, db_next_packed_row);","}","","static int dbvm_nrows(lua_State *L) {","    return dbvm_do_rows(L, db_next_named_row);","}","","static int dbvm_urows(lua_State *L) {","    return dbvm_do_rows(L, db_next_row);","}","","static int db_do_rows(lua_State *L, int(*f)(lua_State *)) {","    sdb *db = lsqlite_checkdb(L, 1);","    const char *sql = luaL_checkstring(L, 2);","    sdb_vm *svm;","","    int nargs = lua_gettop(L) - 2;","    if (nargs \u003e 0) {","        lua_pushvalue(L, 1);","        lua_pushvalue(L, 2);    /* copy db,sql on top of the stack for newvm */","    }","","    svm = newvm(L, db);","    svm-\u003etemp = 1;","","    if (sqlite3_prepare_v2(db-\u003edb, sql, -1, \u0026svm-\u003evm, NULL) != SQLITE_OK) {","        lua_pushstring(L, sqlite3_errmsg(svm-\u003edb-\u003edb));","        if (cleanupvm(L, svm) == 1)","            lua_pop(L, 1); /* this should not happen since sqlite3_prepare_v2 will not set -\u003evm on error */","        lua_error(L);","    }","","    if (nargs \u003e 0) {","        lua_replace(L, 1);","        lua_remove(L, 2);  /* stack: vm, args.. */","","        if (nargs == 1 \u0026\u0026 lua_istable(L, 2)) {","            int result;","            if ((result = dbvm_bind_table_fields (L, 2, nargs, svm-\u003evm)) != SQLITE_OK) {","                lua_pushstring(L, sqlite3_errstr(result));","                cleanupvm(L, svm);","                lua_error(L);","            }","        } else if (nargs == sqlite3_bind_parameter_count(svm-\u003evm)) {","            int result, i;","            for (i = 1; i \u003c= nargs; i++) {","                if ((result = dbvm_bind_index(L, svm-\u003evm, i, i + 1)) != SQLITE_OK) {","                    lua_pushstring(L, sqlite3_errstr(result));","                    cleanupvm(L, svm);","                    lua_error(L);","                }","            }","        } else {","            luaL_error(L, \"Required either %d parameters or a single table, got %d.\",","                sqlite3_bind_parameter_count(svm-\u003evm), nargs);","        }","        lua_pop(L, nargs);","        lua_pushvalue(L, 1);","    }","","    lua_pushcfunction(L, f);","    lua_insert(L, -2);","    return 2;","}","","static int db_rows(lua_State *L) {","    return db_do_rows(L, db_next_packed_row);","}","","static int db_nrows(lua_State *L) {","    return db_do_rows(L, db_next_named_row);","}","","/* unpacked version of db:rows */","static int db_urows(lua_State *L) {","    return db_do_rows(L, db_next_row);","}","","static int db_tostring(lua_State *L) {","    char buff[32];","    sdb *db = lsqlite_getdb(L, 1);","    if (db-\u003edb == NULL)","        strcpy(buff, \"closed\");","    else","        sprintf(buff, \"%p\", lua_touserdata(L, 1));","    lua_pushfstring(L, \"sqlite database (%s)\", buff);","    return 1;","}","","static int db_close(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    lua_pushinteger(L, cleanupdb(L, db));","    return 1;","}","","static int db_close_vm(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    /* cleanup temporary only tables? */","    int temp = lua_toboolean(L, 2);","","    /* free associated virtual machines */","    lua_pushlightuserdata(L, db);","    lua_rawget(L, LUA_REGISTRYINDEX);","","    /* close all used handles */","    lua_pushnil(L);","    while (lua_next(L, -2)) {","        sdb_vm *svm = lua_touserdata(L, -2); /* key: vm; val: sql text */","","        if ((!temp || svm-\u003etemp) \u0026\u0026 svm-\u003evm)","        {","            sqlite3_finalize(svm-\u003evm);","            svm-\u003evm = NULL;","        }","","        /* leave key in the stack */","        lua_pop(L, 1);","    }","    return 0;","}","","/* From: Wolfgang Oertl","When using lsqlite3 in a multithreaded environment, each thread has a separate Lua ","environment, but full userdata structures can't be passed from one thread to another.","This is possible with lightuserdata, however. See: lsqlite_open_ptr().","*/","static int db_get_ptr(lua_State *L) {","    sdb *db = lsqlite_checkdb(L, 1);","    lua_pushlightuserdata(L, db-\u003edb);","    return 1;","}","","static int db_gc(lua_State *L) {","    sdb *db = lsqlite_getdb(L, 1);","    if (db-\u003edb != NULL)  /* ignore closed databases */","        cleanupdb(L, db);","    return 0;","}","","/*","** =======================================================","** General library functions","** =======================================================","*/","","static int lsqlite_version(lua_State *L) {","    lua_pushstring(L, sqlite3_libversion());","    return 1;","}","","static int lsqlite_complete(lua_State *L) {","    const char *sql = luaL_checkstring(L, 1);","    lua_pushboolean(L, sqlite3_complete(sql));","    return 1;","}","","#ifndef _WIN32","static int lsqlite_temp_directory(lua_State *L) {","    const char *oldtemp = sqlite3_temp_directory;","","    if (!lua_isnone(L, 1)) {","        const char *temp = luaL_optstring(L, 1, NULL);","        if (sqlite3_temp_directory) {","            sqlite3_free((char*)sqlite3_temp_directory);","        }","        if (temp) {","            sqlite3_temp_directory = sqlite3_mprintf(\"%s\", temp);","        }","        else {","            sqlite3_temp_directory = NULL;","        }","    }","    lua_pushstring(L, oldtemp);","    return 1;","}","#endif","","#if defined(SQLITE_ENABLE_CEROD)","static int lsqlite_activate_cerod(lua_State *L) {","    const char *s = luaL_checkstring(L, 1);","    sqlite3_activate_cerod(s);","    lua_pushnil(L);","    return 0;","}","#endif","","static int lsqlite_do_open(lua_State *L, const char *filename, int flags) {","    sdb *db = newdb(L); /* create and leave in stack */","","    if (SQLITE3_OPEN(filename, \u0026db-\u003edb, flags) == SQLITE_OK) {","        /* database handle already in the stack - return it */","        return 1;","    }","","    /* failed to open database */","    lua_pushnil(L);                             /* push nil */","    lua_pushinteger(L, sqlite3_errcode(db-\u003edb));","    lua_pushstring(L, sqlite3_errmsg(db-\u003edb));  /* push error message */","","    /* clean things up */","    cleanupdb(L, db);","","    /* return */","    return 3;","}","","static int lsqlite_open(lua_State *L) {","    const char *filename = luaL_checkstring(L, 1);","    int flags = luaL_optinteger(L, 2, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);","    return lsqlite_do_open(L, filename, flags);","}","","static int lsqlite_open_memory(lua_State *L) {","    return lsqlite_do_open(L, \":memory:\", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);","}","","/* From: Wolfgang Oertl","When using lsqlite3 in a multithreaded environment, each thread has a separate Lua ","environment, but full userdata structures can't be passed from one thread to another.","This is possible with lightuserdata, however. See: db_get_ptr().","*/","static int lsqlite_open_ptr(lua_State *L) {","    sqlite3 *db_ptr;","    sdb *db;","    int rc;","","    luaL_checktype(L, 1, LUA_TLIGHTUSERDATA);","    db_ptr = lua_touserdata(L, 1);","    /* This is the only API function that runs sqlite3SafetyCheck regardless of","     * SQLITE_ENABLE_API_ARMOR and does almost nothing (without an SQL","     * statement) */","    rc = sqlite3_exec(db_ptr, NULL, NULL, NULL, NULL);","    if (rc != SQLITE_OK)","        luaL_argerror(L, 1, \"not a valid SQLite3 pointer\");","","    db = newdb(L); /* create and leave in stack */","    db-\u003edb = db_ptr;","    return 1;","}","","static int lsqlite_newindex(lua_State *L) {","    lua_pushliteral(L, \"attempt to change readonly table\");","    lua_error(L);","    return 0;","}","","#ifndef LSQLITE_VERSION","/* should be defined in rockspec, but just in case... */","#define LSQLITE_VERSION \"unknown\"","#endif","","/* Version number of this library","*/","static int lsqlite_lversion(lua_State *L) {","    lua_pushstring(L, LSQLITE_VERSION);","    return 1;","}","","/*","** =======================================================","** Register functions","** =======================================================","*/","","#define SC(s)   { #s, SQLITE_ ## s },","#define LSC(s)  { #s, LSQLITE_ ## s },","","static const struct {","    const char* name;","    int value;","} sqlite_constants[] = {","    /* error codes */","    SC(OK)          SC(ERROR)       SC(INTERNAL)    SC(PERM)","    SC(ABORT)       SC(BUSY)        SC(LOCKED)      SC(NOMEM)","    SC(READONLY)    SC(INTERRUPT)   SC(IOERR)       SC(CORRUPT)","    SC(NOTFOUND)    SC(FULL)        SC(CANTOPEN)    SC(PROTOCOL)","    SC(EMPTY)       SC(SCHEMA)      SC(TOOBIG)      SC(CONSTRAINT)","    SC(MISMATCH)    SC(MISUSE)      SC(NOLFS)","    SC(FORMAT)      SC(NOTADB)","","    /* sqlite_step specific return values */","    SC(RANGE)       SC(ROW)         SC(DONE)","","    /* column types */","    SC(INTEGER)     SC(FLOAT)       SC(TEXT)        SC(BLOB)","    SC(NULL)","","    /* Authorizer Action Codes */","    SC(CREATE_INDEX       )","    SC(CREATE_TABLE       )","    SC(CREATE_TEMP_INDEX  )","    SC(CREATE_TEMP_TABLE  )","    SC(CREATE_TEMP_TRIGGER)","    SC(CREATE_TEMP_VIEW   )","    SC(CREATE_TRIGGER     )","    SC(CREATE_VIEW        )","    SC(DELETE             )","    SC(DROP_INDEX         )","    SC(DROP_TABLE         )","    SC(DROP_TEMP_INDEX    )","    SC(DROP_TEMP_TABLE    )","    SC(DROP_TEMP_TRIGGER  )","    SC(DROP_TEMP_VIEW     )","    SC(DROP_TRIGGER       )","    SC(DROP_VIEW          )","    SC(INSERT             )","    SC(PRAGMA             )","    SC(READ               )","    SC(SELECT             )","    SC(TRANSACTION        )","    SC(UPDATE             )","    SC(ATTACH             )","    SC(DETACH             )","    SC(ALTER_TABLE        )","    SC(REINDEX            )","    SC(ANALYZE            )","    SC(CREATE_VTABLE      )","    SC(DROP_VTABLE        )","    SC(FUNCTION           )","    SC(SAVEPOINT          )","","    /* file open flags */","    SC(OPEN_READONLY)","    SC(OPEN_READWRITE)","    SC(OPEN_CREATE)","    SC(OPEN_URI)","    SC(OPEN_MEMORY)","    SC(OPEN_NOMUTEX)","    SC(OPEN_FULLMUTEX)","    SC(OPEN_SHAREDCACHE)","    SC(OPEN_PRIVATECACHE)","    ","    /* terminator */","    { NULL, 0 }","};","","/* ======================================================= */","","static const luaL_Reg dblib[] = {","    {\"isopen\",              db_isopen               },","    {\"last_insert_rowid\",   db_last_insert_rowid    },","    {\"changes\",             db_changes              },","    {\"total_changes\",       db_total_changes        },","    {\"errcode\",             db_errcode              },","    {\"error_code\",          db_errcode              },","    {\"errmsg\",              db_errmsg               },","    {\"error_message\",       db_errmsg               },","    {\"interrupt\",           db_interrupt            },","    {\"db_filename\",         db_db_filename          },","","    {\"create_function\",     db_create_function      },","    {\"create_aggregate\",    db_create_aggregate     },","    {\"create_collation\",    db_create_collation     },","    {\"load_extension\",      db_load_extension       },","","    {\"trace\",               db_trace                },","    {\"progress_handler\",    db_progress_handler     },","    {\"busy_timeout\",        db_busy_timeout         },","    {\"busy_handler\",        db_busy_handler         },","#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK","    {\"update_hook\",         db_update_hook          },","    {\"commit_hook\",         db_commit_hook          },","    {\"rollback_hook\",       db_rollback_hook        },","#endif","","    {\"prepare\",             db_prepare              },","    {\"rows\",                db_rows                 },","    {\"urows\",               db_urows                },","    {\"nrows\",               db_nrows                },","","    {\"exec\",                db_exec                 },","    {\"execute\",             db_exec                 },","    {\"close\",               db_close                },","    {\"close_vm\",            db_close_vm             },","    {\"get_ptr\",             db_get_ptr              },","","    {\"__tostring\",          db_tostring             },","    {\"__gc\",                db_gc                   },","","    {NULL, NULL}","};","","static const luaL_Reg vmlib[] = {","    {\"isopen\",              dbvm_isopen             },","","    {\"step\",                dbvm_step               },","    {\"reset\",               dbvm_reset              },","    {\"finalize\",            dbvm_finalize           },","","    {\"columns\",             dbvm_columns            },","","    {\"bind\",                dbvm_bind               },","    {\"bind_values\",         dbvm_bind_values        },","    {\"bind_names\",          dbvm_bind_names         },","    {\"bind_blob\",           dbvm_bind_blob          },","    {\"bind_parameter_count\",dbvm_bind_parameter_count},","    {\"bind_parameter_name\", dbvm_bind_parameter_name},","","    {\"get_value\",           dbvm_get_value          },","    {\"get_values\",          dbvm_get_values         },","    {\"get_name\",            dbvm_get_name           },","    {\"get_names\",           dbvm_get_names          },","    {\"get_type\",            dbvm_get_type           },","    {\"get_types\",           dbvm_get_types          },","    {\"get_uvalues\",         dbvm_get_uvalues        },","    {\"get_unames\",          dbvm_get_unames         },","    {\"get_utypes\",          dbvm_get_utypes         },","","    {\"get_named_values\",    dbvm_get_named_values   },","    {\"get_named_types\",     dbvm_get_named_types    },","","    {\"rows\",                dbvm_rows               },","    {\"urows\",               dbvm_urows              },","    {\"nrows\",               dbvm_nrows              },","","    {\"last_insert_rowid\",   dbvm_last_insert_rowid  },","","    /* compatibility names (added by request) */","    {\"idata\",               dbvm_get_values         },","    {\"inames\",              dbvm_get_names          },","    {\"itypes\",              dbvm_get_types          },","    {\"data\",                dbvm_get_named_values   },","    {\"type\",                dbvm_get_named_types    },","","    {\"__tostring\",          dbvm_tostring           },","    {\"__gc\",                dbvm_gc                 },","","    { NULL, NULL }","};","","static const luaL_Reg ctxlib[] = {","    {\"user_data\",               lcontext_user_data              },","","    {\"get_aggregate_data\",      lcontext_get_aggregate_context  },","    {\"set_aggregate_data\",      lcontext_set_aggregate_context  },","    {\"aggregate_count\",         lcontext_aggregate_count        },","","    {\"result\",                  lcontext_result                 },","    {\"result_null\",             lcontext_result_null            },","    {\"result_number\",           lcontext_result_double          },","    {\"result_double\",           lcontext_result_double          },","    {\"result_int\",              lcontext_result_int             },","    {\"result_text\",             lcontext_result_text            },","    {\"result_blob\",             lcontext_result_blob            },","    {\"result_error\",            lcontext_result_error           },","","    {\"__tostring\",              lcontext_tostring               },","    {NULL, NULL}","};","","static const luaL_Reg dbbulib[] = {","","    {\"step\",        dbbu_step       },","    {\"remaining\",   dbbu_remaining  },","    {\"pagecount\",   dbbu_pagecount  },","    {\"finish\",      dbbu_finish     },","","/*  {\"__tostring\",  dbbu_tostring   },   */","    {\"__gc\",        dbbu_gc         },","    {NULL, NULL}","};","","static const luaL_Reg sqlitelib[] = {","    {\"lversion\",        lsqlite_lversion        },","    {\"version\",         lsqlite_version         },","    {\"complete\",        lsqlite_complete        },","#ifndef _WIN32","    {\"temp_directory\",  lsqlite_temp_directory  },","#endif","#if defined(SQLITE_ENABLE_CEROD)","    {\"activate_cerod\",  lsqlite_activate_cerod  },","#endif","    {\"open\",            lsqlite_open            },","    {\"open_memory\",     lsqlite_open_memory     },","    {\"open_ptr\",        lsqlite_open_ptr        },","","    {\"backup_init\",     lsqlite_backup_init     },","","    {\"__newindex\",      lsqlite_newindex        },","    {NULL, NULL}","};","","static void create_meta(lua_State *L, const char *name, const luaL_Reg *lib) {","    luaL_newmetatable(L, name);","    lua_pushstring(L, \"__index\");","    lua_pushvalue(L, -2);               /* push metatable */","    lua_rawset(L, -3);                  /* metatable.__index = metatable */","","    /* register metatable functions */","    luaL_openlib(L, NULL, lib, 0);","","    /* remove metatable from stack */","    lua_pop(L, 1);","}","","LUALIB_API int luaopen_lsqlite3(lua_State *L) {","    create_meta(L, sqlite_meta, dblib);","    create_meta(L, sqlite_vm_meta, vmlib);","    create_meta(L, sqlite_bu_meta, dbbulib);","    create_meta(L, sqlite_ctx_meta, ctxlib);","","    luaL_getmetatable(L, sqlite_ctx_meta);","    sqlite_ctx_meta_ref = luaL_ref(L, LUA_REGISTRYINDEX);","","    /* register (local) sqlite metatable */","    luaL_register(L, \"sqlite3\", sqlitelib);","","    {","        int i = 0;","        /* add constants to global table */","        while (sqlite_constants[i].name) {","            lua_pushstring(L, sqlite_constants[i].name);","            lua_pushinteger(L, sqlite_constants[i].value);","            lua_rawset(L, -3);","            ++i;","        }","    }","","    /* set sqlite's metatable to itself - set as readonly (__newindex) */","    lua_pushvalue(L, -1);","    lua_setmetatable(L, -2);","","    return 1;","}"],"stylingDirectives":[[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[{"start":0,"end":73,"cssClass":"pl-c"}],[],[{"start":0,"end":8,"cssClass":"pl-k"},{"start":9,"end":19,"cssClass":"pl-s"}],[{"start":0,"end":8,"cssClass":"pl-k"},{"start":9,"end":19,"cssClass":"pl-s"}],[{"start":0,"end":8,"cssClass":"pl-k"},{"start":9,"end":19,"cssClass":"pl-s"}],[],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":15,"cssClass":"pl-c1"}],[{"start":0,"end":8,"cssClass":"pl-k"},{"start":9,"end":16,"cssClass":"pl-s"}],[{"start":0,"end":8,"cssClass":"pl-k"},{"start":9,"end":20,"cssClass":"pl-s"}],[],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":4,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-c1"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":10,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-s1"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-s1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":0,"end":55,"cssClass":"pl-c"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":27,"cssClass":"pl-s1"},{"start":28,"end":31,"cssClass":"pl-s1"}],[{"start":0,"end":69,"cssClass":"pl-c"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":28,"cssClass":"pl-s1"},{"start":29,"end":32,"cssClass":"pl-s1"}],[{"start":0,"end":48,"cssClass":"pl-c"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":27,"cssClass":"pl-s1"},{"start":28,"end":31,"cssClass":"pl-s1"},{"start":32,"end":35,"cssClass":"pl-s1"}],[],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":4,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-c1"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":10,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-s1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":0,"end":8,"cssClass":"pl-k"},{"start":9,"end":20,"cssClass":"pl-s"}],[],[{"start":0,"end":27,"cssClass":"pl-c"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":13,"end":42,"cssClass":"pl-c1"}],[{"start":4,"end":11,"cssClass":"pl-k"},{"start":12,"end":41,"cssClass":"pl-c1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":13,"end":37,"cssClass":"pl-c1"}],[{"start":4,"end":11,"cssClass":"pl-k"},{"start":12,"end":36,"cssClass":"pl-c1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":12,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":11,"cssClass":"pl-k"},{"start":12,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":27,"end":35,"cssClass":"pl-s1"},{"start":36,"end":41,"cssClass":"pl-s1"}],[{"start":0,"end":5,"cssClass":"pl-k"}],[{"start":4,"end":11,"cssClass":"pl-k"},{"start":12,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":27,"end":35,"cssClass":"pl-s1"},{"start":36,"end":41,"cssClass":"pl-s1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-k"},{"start":15,"end":18,"cssClass":"pl-smi"},{"start":19,"end":22,"cssClass":"pl-smi"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-k"},{"start":15,"end":21,"cssClass":"pl-smi"},{"start":22,"end":28,"cssClass":"pl-smi"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-k"},{"start":15,"end":21,"cssClass":"pl-smi"},{"start":22,"end":28,"cssClass":"pl-smi"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-k"},{"start":15,"end":23,"cssClass":"pl-smi"},{"start":24,"end":32,"cssClass":"pl-smi"}],[],[{"start":0,"end":69,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":15,"cssClass":"pl-smi"}],[{"start":4,"end":45,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":19,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-c1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-c1"}],[{"start":4,"end":8,"cssClass":"pl-smi"},{"start":9,"end":18,"cssClass":"pl-c1"}],[],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":32,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"}],[{"start":4,"end":30,"cssClass":"pl-c"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"}],[{"start":4,"end":32,"cssClass":"pl-c"}],[{"start":4,"end":11,"cssClass":"pl-smi"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":13,"end":15,"cssClass":"pl-c1"}],[],[{"start":4,"end":35,"cssClass":"pl-c"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-c1"},{"start":28,"end":63,"cssClass":"pl-c"}],[],[{"start":4,"end":20,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-c1"},{"start":24,"end":43,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":18,"cssClass":"pl-c1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":19,"cssClass":"pl-c1"},{"start":24,"end":46,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":22,"cssClass":"pl-c1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":16,"cssClass":"pl-c1"},{"start":24,"end":44,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":19,"cssClass":"pl-c1"}],[],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":13,"end":37,"cssClass":"pl-c1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":43,"end":67,"cssClass":"pl-c1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":22,"cssClass":"pl-c1"},{"start":24,"end":50,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":25,"cssClass":"pl-c1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":22,"cssClass":"pl-c1"},{"start":24,"end":50,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":25,"cssClass":"pl-c1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":24,"cssClass":"pl-c1"},{"start":26,"end":54,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":27,"cssClass":"pl-c1"}],[],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":17,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":19,"end":30,"cssClass":"pl-s1"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":38,"end":48,"cssClass":"pl-s"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":17,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":19,"end":33,"cssClass":"pl-s1"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":38,"end":51,"cssClass":"pl-s"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":17,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":19,"end":33,"cssClass":"pl-s1"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":38,"end":51,"cssClass":"pl-s"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":17,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":19,"end":34,"cssClass":"pl-s1"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":38,"end":52,"cssClass":"pl-s"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":30,"cssClass":"pl-s1"}],[],[{"start":0,"end":91,"cssClass":"pl-c"}],[{"start":0,"end":84,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":4,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-c1"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":26,"cssClass":"pl-s1"},{"start":27,"end":35,"cssClass":"pl-s1"}],[],[],[],[],[],[],[],[],[],[],[{"start":0,"end":5,"cssClass":"pl-k"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":26,"cssClass":"pl-s1"},{"start":27,"end":35,"cssClass":"pl-s1"}],[],[],[],[],[],[],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":38,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":41,"end":53,"cssClass":"pl-smi"},{"start":54,"end":55,"cssClass":"pl-c1"},{"start":55,"end":57,"cssClass":"pl-s1"},{"start":59,"end":62,"cssClass":"pl-smi"},{"start":63,"end":66,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":12,"end":31,"cssClass":"pl-en"},{"start":32,"end":34,"cssClass":"pl-s1"},{"start":36,"end":39,"cssClass":"pl-s1"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":27,"cssClass":"pl-c1"}],[{"start":12,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":46,"cssClass":"pl-en"},{"start":47,"end":49,"cssClass":"pl-s1"},{"start":51,"end":54,"cssClass":"pl-s1"}],[{"start":23,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":43,"end":48,"cssClass":"pl-k"},{"start":49,"end":53,"cssClass":"pl-smi"},{"start":53,"end":54,"cssClass":"pl-c1"},{"start":55,"end":74,"cssClass":"pl-en"},{"start":75,"end":77,"cssClass":"pl-s1"},{"start":79,"end":82,"cssClass":"pl-s1"}],[{"start":42,"end":62,"cssClass":"pl-en"},{"start":63,"end":65,"cssClass":"pl-s1"},{"start":67,"end":70,"cssClass":"pl-s1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":25,"cssClass":"pl-c1"}],[{"start":12,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":51,"cssClass":"pl-en"},{"start":52,"end":54,"cssClass":"pl-s1"},{"start":56,"end":59,"cssClass":"pl-s1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":32,"end":37,"cssClass":"pl-k"},{"start":38,"end":42,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":44,"end":63,"cssClass":"pl-en"},{"start":64,"end":66,"cssClass":"pl-s1"},{"start":68,"end":71,"cssClass":"pl-s1"},{"start":74,"end":94,"cssClass":"pl-en"},{"start":95,"end":97,"cssClass":"pl-s1"},{"start":99,"end":102,"cssClass":"pl-s1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":50,"cssClass":"pl-en"},{"start":51,"end":53,"cssClass":"pl-s1"},{"start":55,"end":58,"cssClass":"pl-s1"},{"start":61,"end":81,"cssClass":"pl-en"},{"start":82,"end":84,"cssClass":"pl-s1"},{"start":86,"end":89,"cssClass":"pl-s1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":12,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[{"start":8,"end":15,"cssClass":"pl-k"}],[{"start":12,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[],[],[],[{"start":0,"end":33,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":13,"cssClass":"pl-smi"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-c1"},{"start":28,"end":60,"cssClass":"pl-c"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-c1"},{"start":28,"end":49,"cssClass":"pl-c"}],[],[{"start":4,"end":27,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-c1"},{"start":28,"end":61,"cssClass":"pl-c"}],[{"start":4,"end":8,"cssClass":"pl-smi"},{"start":9,"end":19,"cssClass":"pl-c1"},{"start":28,"end":57,"cssClass":"pl-c"}],[],[{"start":4,"end":8,"cssClass":"pl-smi"},{"start":9,"end":13,"cssClass":"pl-c1"},{"start":28,"end":62,"cssClass":"pl-c"}],[],[],[{"start":0,"end":46,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":42,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":25,"cssClass":"pl-smi"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":27,"end":42,"cssClass":"pl-en"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":46,"end":52,"cssClass":"pl-k"},{"start":53,"end":59,"cssClass":"pl-s1"},{"start":63,"end":85,"cssClass":"pl-c"}],[],[{"start":4,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":39,"cssClass":"pl-s1"}],[{"start":4,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":26,"cssClass":"pl-c1"},{"start":36,"end":55,"cssClass":"pl-c"}],[],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-c1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":16,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-c1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":13,"cssClass":"pl-c1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"}],[],[{"start":4,"end":89,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-s1"},{"start":38,"end":67,"cssClass":"pl-c"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":38,"end":72,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-s1"},{"start":38,"end":80,"cssClass":"pl-c"}],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":38,"end":83,"cssClass":"pl-c"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-c1"},{"start":38,"end":96,"cssClass":"pl-c"}],[{"start":4,"end":11,"cssClass":"pl-en"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":38,"end":60,"cssClass":"pl-c"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":14,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":46,"cssClass":"pl-s1"}],[],[{"start":4,"end":78,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-s1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-s1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-c1"}],[{"start":4,"end":11,"cssClass":"pl-en"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"}],[],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":12,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":16,"cssClass":"pl-c1"},{"start":18,"end":24,"cssClass":"pl-k"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":39,"cssClass":"pl-en"},{"start":40,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":47,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-c1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":17,"cssClass":"pl-en"},{"start":18,"end":27,"cssClass":"pl-smi"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":32,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":43,"cssClass":"pl-s1"}],[{"start":2,"end":6,"cssClass":"pl-smi"},{"start":7,"end":8,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":23,"cssClass":"pl-en"},{"start":24,"end":27,"cssClass":"pl-s1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":28,"cssClass":"pl-en"},{"start":29,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":43,"end":46,"cssClass":"pl-smi"},{"start":47,"end":52,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":25,"cssClass":"pl-smi"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":27,"end":42,"cssClass":"pl-en"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":46,"end":51,"cssClass":"pl-s1"},{"start":53,"end":67,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":15,"end":19,"cssClass":"pl-c1"},{"start":21,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":43,"cssClass":"pl-s1"},{"start":45,"end":73,"cssClass":"pl-s"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":14,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":30,"cssClass":"pl-en"},{"start":31,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":45,"end":48,"cssClass":"pl-smi"},{"start":49,"end":54,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":40,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":16,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-c1"},{"start":25,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":47,"cssClass":"pl-s1"},{"start":49,"end":95,"cssClass":"pl-s"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":14,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":22,"cssClass":"pl-en"},{"start":23,"end":32,"cssClass":"pl-smi"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":34,"end":35,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"},{"start":31,"end":33,"cssClass":"pl-c1"},{"start":34,"end":38,"cssClass":"pl-c1"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":24,"cssClass":"pl-en"},{"start":25,"end":34,"cssClass":"pl-smi"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":36,"end":37,"cssClass":"pl-c1"}],[{"start":4,"end":8,"cssClass":"pl-smi"},{"start":9,"end":13,"cssClass":"pl-s1"},{"start":14,"end":16,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":16,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-c1"}],[{"start":8,"end":14,"cssClass":"pl-en"},{"start":15,"end":19,"cssClass":"pl-s1"},{"start":21,"end":29,"cssClass":"pl-s"}],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":15,"cssClass":"pl-en"},{"start":16,"end":20,"cssClass":"pl-s1"},{"start":22,"end":26,"cssClass":"pl-s"},{"start":28,"end":31,"cssClass":"pl-s1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":52,"cssClass":"pl-s"},{"start":54,"end":58,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":18,"cssClass":"pl-en"},{"start":19,"end":28,"cssClass":"pl-smi"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":16,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-c1"},{"start":26,"end":49,"cssClass":"pl-c"}],[{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":24,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":28,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":32,"end":42,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":49,"end":50,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":37,"cssClass":"pl-en"},{"start":38,"end":41,"cssClass":"pl-s1"},{"start":41,"end":43,"cssClass":"pl-c1"},{"start":43,"end":45,"cssClass":"pl-c1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":24,"cssClass":"pl-en"},{"start":25,"end":34,"cssClass":"pl-smi"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":36,"end":37,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":27,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":31,"cssClass":"pl-smi"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":38,"cssClass":"pl-en"},{"start":39,"end":42,"cssClass":"pl-s1"},{"start":42,"end":44,"cssClass":"pl-c1"},{"start":44,"end":46,"cssClass":"pl-c1"},{"start":46,"end":48,"cssClass":"pl-c1"},{"start":48,"end":50,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":31,"cssClass":"pl-en"},{"start":32,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":46,"end":52,"cssClass":"pl-smi"},{"start":53,"end":54,"cssClass":"pl-c1"},{"start":54,"end":57,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":12,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":42,"cssClass":"pl-s"}],[],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":28,"cssClass":"pl-en"},{"start":29,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":43,"end":49,"cssClass":"pl-smi"},{"start":50,"end":51,"cssClass":"pl-c1"},{"start":51,"end":54,"cssClass":"pl-s1"},{"start":56,"end":59,"cssClass":"pl-smi"},{"start":60,"end":65,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-c1"},{"start":21,"end":26,"cssClass":"pl-s1"},{"start":30,"end":33,"cssClass":"pl-s1"},{"start":33,"end":35,"cssClass":"pl-c1"},{"start":35,"end":42,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":50,"cssClass":"pl-s"},{"start":52,"end":55,"cssClass":"pl-s1"},{"start":55,"end":57,"cssClass":"pl-c1"},{"start":57,"end":64,"cssClass":"pl-c1"},{"start":65,"end":66,"cssClass":"pl-c1"},{"start":67,"end":68,"cssClass":"pl-c1"}],[],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":33,"cssClass":"pl-en"},{"start":34,"end":43,"cssClass":"pl-smi"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":48,"end":54,"cssClass":"pl-smi"},{"start":55,"end":56,"cssClass":"pl-c1"},{"start":56,"end":59,"cssClass":"pl-s1"},{"start":61,"end":64,"cssClass":"pl-smi"},{"start":65,"end":70,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-c1"},{"start":21,"end":26,"cssClass":"pl-s1"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":29,"end":57,"cssClass":"pl-en"},{"start":58,"end":61,"cssClass":"pl-s1"},{"start":61,"end":63,"cssClass":"pl-c1"},{"start":63,"end":65,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":55,"cssClass":"pl-s"},{"start":57,"end":85,"cssClass":"pl-en"},{"start":86,"end":89,"cssClass":"pl-s1"},{"start":89,"end":91,"cssClass":"pl-c1"},{"start":91,"end":93,"cssClass":"pl-c1"}],[],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":33,"cssClass":"pl-en"},{"start":34,"end":43,"cssClass":"pl-smi"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":48,"cssClass":"pl-c"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":22,"cssClass":"pl-s1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":25,"end":50,"cssClass":"pl-en"},{"start":51,"end":54,"cssClass":"pl-s1"},{"start":54,"end":56,"cssClass":"pl-c1"},{"start":56,"end":58,"cssClass":"pl-c1"},{"start":58,"end":60,"cssClass":"pl-c1"},{"start":60,"end":62,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":23,"cssClass":"pl-s1"},{"start":25,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":49,"cssClass":"pl-s"},{"start":51,"end":56,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":33,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":23,"cssClass":"pl-en"},{"start":24,"end":33,"cssClass":"pl-smi"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":43,"cssClass":"pl-en"},{"start":44,"end":47,"cssClass":"pl-s1"},{"start":47,"end":49,"cssClass":"pl-c1"},{"start":49,"end":51,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":28,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":30,"cssClass":"pl-s1"}],[{"start":4,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":27,"cssClass":"pl-s1"},{"start":29,"end":34,"cssClass":"pl-s1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-s1"},{"start":25,"end":27,"cssClass":"pl-c1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":31,"end":36,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":24,"cssClass":"pl-en"},{"start":25,"end":34,"cssClass":"pl-smi"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":36,"end":37,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":32,"cssClass":"pl-en"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":36,"end":37,"cssClass":"pl-c1"}],[{"start":4,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":27,"cssClass":"pl-s1"},{"start":29,"end":34,"cssClass":"pl-s1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":41,"cssClass":"pl-en"},{"start":42,"end":45,"cssClass":"pl-s1"},{"start":45,"end":47,"cssClass":"pl-c1"},{"start":47,"end":49,"cssClass":"pl-c1"},{"start":51,"end":56,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":24,"cssClass":"pl-en"},{"start":25,"end":34,"cssClass":"pl-smi"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":36,"end":37,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":32,"cssClass":"pl-en"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":36,"end":37,"cssClass":"pl-c1"}],[{"start":4,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":27,"cssClass":"pl-s1"},{"start":29,"end":34,"cssClass":"pl-s1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":45,"cssClass":"pl-en"},{"start":46,"end":49,"cssClass":"pl-s1"},{"start":49,"end":51,"cssClass":"pl-c1"},{"start":51,"end":53,"cssClass":"pl-c1"},{"start":55,"end":60,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[{"start":4,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":30,"cssClass":"pl-s1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":30,"cssClass":"pl-s1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":27,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-s1"},{"start":30,"end":31,"cssClass":"pl-s1"},{"start":31,"end":33,"cssClass":"pl-c1"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-s1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":38,"cssClass":"pl-en"},{"start":39,"end":41,"cssClass":"pl-s1"},{"start":44,"end":85,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":30,"cssClass":"pl-s1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":27,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":45,"cssClass":"pl-en"},{"start":46,"end":48,"cssClass":"pl-s1"},{"start":50,"end":51,"cssClass":"pl-s1"},{"start":51,"end":53,"cssClass":"pl-c1"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-s1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":38,"cssClass":"pl-en"},{"start":39,"end":41,"cssClass":"pl-s1"},{"start":44,"end":85,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":30,"cssClass":"pl-s1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":27,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":49,"cssClass":"pl-en"},{"start":50,"end":52,"cssClass":"pl-s1"},{"start":54,"end":55,"cssClass":"pl-s1"},{"start":55,"end":57,"cssClass":"pl-c1"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-s1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":37,"cssClass":"pl-smi"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[{"start":4,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":30,"cssClass":"pl-s1"}],[],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":27,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-s1"},{"start":30,"end":31,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":18,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":38,"cssClass":"pl-en"},{"start":39,"end":41,"cssClass":"pl-s1"},{"start":44,"end":85,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":27,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":45,"cssClass":"pl-en"},{"start":46,"end":48,"cssClass":"pl-s1"},{"start":50,"end":51,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":18,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":38,"cssClass":"pl-en"},{"start":39,"end":41,"cssClass":"pl-s1"},{"start":44,"end":85,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":27,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":49,"cssClass":"pl-en"},{"start":50,"end":52,"cssClass":"pl-s1"},{"start":54,"end":55,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":18,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":32,"cssClass":"pl-en"},{"start":33,"end":42,"cssClass":"pl-smi"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[{"start":4,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":30,"cssClass":"pl-s1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":33,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":27,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":45,"cssClass":"pl-en"},{"start":46,"end":48,"cssClass":"pl-s1"},{"start":50,"end":51,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-s1"},{"start":30,"end":31,"cssClass":"pl-s1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":24,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":31,"cssClass":"pl-en"},{"start":32,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":38,"cssClass":"pl-en"},{"start":39,"end":41,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":33,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":27,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":45,"cssClass":"pl-en"},{"start":46,"end":48,"cssClass":"pl-s1"},{"start":50,"end":51,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":49,"cssClass":"pl-en"},{"start":50,"end":52,"cssClass":"pl-s1"},{"start":54,"end":55,"cssClass":"pl-s1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":24,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":25,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":41,"end":53,"cssClass":"pl-smi"},{"start":54,"end":55,"cssClass":"pl-c1"},{"start":55,"end":57,"cssClass":"pl-s1"},{"start":59,"end":62,"cssClass":"pl-smi"},{"start":63,"end":68,"cssClass":"pl-s1"},{"start":70,"end":73,"cssClass":"pl-smi"},{"start":74,"end":80,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":12,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":30,"cssClass":"pl-s1"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":12,"end":18,"cssClass":"pl-k"},{"start":19,"end":36,"cssClass":"pl-en"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":41,"end":46,"cssClass":"pl-s1"},{"start":48,"end":60,"cssClass":"pl-en"},{"start":61,"end":62,"cssClass":"pl-c1"},{"start":64,"end":70,"cssClass":"pl-s1"},{"start":73,"end":83,"cssClass":"pl-en"},{"start":84,"end":85,"cssClass":"pl-c1"},{"start":87,"end":93,"cssClass":"pl-s1"},{"start":96,"end":112,"cssClass":"pl-c1"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":4,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-c1"}],[{"start":12,"end":14,"cssClass":"pl-k"},{"start":16,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":39,"cssClass":"pl-s1"}],[{"start":16,"end":22,"cssClass":"pl-k"},{"start":23,"end":41,"cssClass":"pl-en"},{"start":42,"end":44,"cssClass":"pl-s1"},{"start":46,"end":51,"cssClass":"pl-s1"},{"start":53,"end":66,"cssClass":"pl-en"},{"start":67,"end":68,"cssClass":"pl-c1"},{"start":70,"end":76,"cssClass":"pl-s1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":12,"end":18,"cssClass":"pl-k"},{"start":19,"end":38,"cssClass":"pl-en"},{"start":39,"end":41,"cssClass":"pl-s1"},{"start":43,"end":48,"cssClass":"pl-s1"},{"start":50,"end":62,"cssClass":"pl-en"},{"start":63,"end":64,"cssClass":"pl-c1"},{"start":66,"end":72,"cssClass":"pl-s1"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":25,"cssClass":"pl-c1"}],[{"start":12,"end":18,"cssClass":"pl-k"},{"start":19,"end":35,"cssClass":"pl-en"},{"start":36,"end":38,"cssClass":"pl-s1"},{"start":40,"end":45,"cssClass":"pl-s1"},{"start":47,"end":60,"cssClass":"pl-en"},{"start":61,"end":62,"cssClass":"pl-c1"},{"start":64,"end":70,"cssClass":"pl-s1"},{"start":74,"end":75,"cssClass":"pl-c1"},{"start":78,"end":79,"cssClass":"pl-c1"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":22,"cssClass":"pl-c1"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":21,"cssClass":"pl-c1"}],[{"start":12,"end":18,"cssClass":"pl-k"},{"start":19,"end":36,"cssClass":"pl-en"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":41,"end":46,"cssClass":"pl-s1"}],[{"start":8,"end":15,"cssClass":"pl-k"}],[{"start":12,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":72,"cssClass":"pl-s"},{"start":74,"end":79,"cssClass":"pl-s1"},{"start":81,"end":93,"cssClass":"pl-en"},{"start":94,"end":95,"cssClass":"pl-c1"},{"start":97,"end":105,"cssClass":"pl-en"},{"start":106,"end":107,"cssClass":"pl-c1"},{"start":109,"end":115,"cssClass":"pl-s1"}],[{"start":12,"end":18,"cssClass":"pl-k"},{"start":19,"end":32,"cssClass":"pl-c1"},{"start":34,"end":39,"cssClass":"pl-c"}],[],[],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":36,"cssClass":"pl-en"},{"start":37,"end":46,"cssClass":"pl-smi"},{"start":47,"end":48,"cssClass":"pl-c1"},{"start":48,"end":49,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":51,"cssClass":"pl-en"},{"start":52,"end":55,"cssClass":"pl-s1"},{"start":55,"end":57,"cssClass":"pl-c1"},{"start":57,"end":59,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":35,"cssClass":"pl-en"},{"start":36,"end":45,"cssClass":"pl-smi"},{"start":46,"end":47,"cssClass":"pl-c1"},{"start":47,"end":48,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":32,"cssClass":"pl-en"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":36,"end":37,"cssClass":"pl-c1"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-s1"},{"start":34,"end":39,"cssClass":"pl-s1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":49,"cssClass":"pl-en"},{"start":50,"end":53,"cssClass":"pl-s1"},{"start":53,"end":55,"cssClass":"pl-c1"},{"start":55,"end":57,"cssClass":"pl-c1"},{"start":59,"end":64,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"}],[],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-s1"},{"start":34,"end":39,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":28,"cssClass":"pl-en"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":32,"end":34,"cssClass":"pl-s1"},{"start":36,"end":41,"cssClass":"pl-s1"},{"start":43,"end":44,"cssClass":"pl-c1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":21,"cssClass":"pl-s1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":40,"cssClass":"pl-en"},{"start":41,"end":44,"cssClass":"pl-s1"},{"start":44,"end":46,"cssClass":"pl-c1"},{"start":46,"end":48,"cssClass":"pl-c1"},{"start":50,"end":55,"cssClass":"pl-s1"},{"start":57,"end":62,"cssClass":"pl-s1"},{"start":64,"end":67,"cssClass":"pl-s1"},{"start":69,"end":85,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":37,"cssClass":"pl-smi"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":18,"cssClass":"pl-c1"},{"start":19,"end":47,"cssClass":"pl-en"},{"start":48,"end":50,"cssClass":"pl-s1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"}],[{"start":12,"end":75,"cssClass":"pl-s"}],[{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":19,"cssClass":"pl-c1"}],[{"start":12,"end":40,"cssClass":"pl-en"},{"start":41,"end":43,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":21,"end":24,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-s1"}],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":13,"end":19,"cssClass":"pl-s1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":37,"cssClass":"pl-en"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":45,"end":46,"cssClass":"pl-s1"},{"start":47,"end":48,"cssClass":"pl-c1"},{"start":49,"end":50,"cssClass":"pl-c1"},{"start":52,"end":53,"cssClass":"pl-s1"},{"start":56,"end":58,"cssClass":"pl-c1"},{"start":59,"end":68,"cssClass":"pl-c1"}],[{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":37,"cssClass":"pl-s1"}],[{"start":12,"end":18,"cssClass":"pl-k"},{"start":19,"end":20,"cssClass":"pl-c1"}],[],[],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":33,"cssClass":"pl-en"},{"start":35,"end":44,"cssClass":"pl-smi"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":46,"end":47,"cssClass":"pl-c1"},{"start":49,"end":52,"cssClass":"pl-smi"},{"start":53,"end":56,"cssClass":"pl-s1"},{"start":58,"end":61,"cssClass":"pl-smi"},{"start":62,"end":63,"cssClass":"pl-s1"},{"start":65,"end":77,"cssClass":"pl-smi"},{"start":78,"end":79,"cssClass":"pl-c1"},{"start":79,"end":81,"cssClass":"pl-s1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":20,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-s1"}],[],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":10,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-s1"},{"start":22,"end":23,"cssClass":"pl-s1"},{"start":25,"end":27,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-s1"}],[{"start":8,"end":12,"cssClass":"pl-s1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":42,"cssClass":"pl-en"},{"start":43,"end":45,"cssClass":"pl-s1"},{"start":47,"end":48,"cssClass":"pl-s1"}],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":16,"cssClass":"pl-s1"},{"start":17,"end":19,"cssClass":"pl-c1"},{"start":21,"end":25,"cssClass":"pl-s1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":32,"end":35,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-c1"},{"start":39,"end":43,"cssClass":"pl-s1"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":47,"end":49,"cssClass":"pl-c1"},{"start":50,"end":53,"cssClass":"pl-c1"}],[{"start":12,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":32,"cssClass":"pl-c1"},{"start":32,"end":36,"cssClass":"pl-s1"}],[{"start":12,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":31,"cssClass":"pl-s1"}],[{"start":12,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":36,"cssClass":"pl-en"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":42,"cssClass":"pl-s1"},{"start":44,"end":45,"cssClass":"pl-s1"},{"start":47,"end":49,"cssClass":"pl-c1"}],[{"start":12,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[],[{"start":8,"end":12,"cssClass":"pl-k"}],[{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-s1"}],[{"start":12,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":31,"cssClass":"pl-s1"}],[{"start":12,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":36,"cssClass":"pl-en"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":42,"cssClass":"pl-s1"},{"start":44,"end":45,"cssClass":"pl-s1"},{"start":47,"end":49,"cssClass":"pl-c1"}],[{"start":12,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[],[],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":18,"cssClass":"pl-s1"},{"start":19,"end":21,"cssClass":"pl-c1"},{"start":22,"end":31,"cssClass":"pl-c1"}],[{"start":12,"end":18,"cssClass":"pl-k"},{"start":19,"end":25,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":20,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":44,"cssClass":"pl-en"},{"start":45,"end":47,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":35,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":35,"cssClass":"pl-en"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":43,"end":48,"cssClass":"pl-s1"},{"start":50,"end":52,"cssClass":"pl-s1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":33,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":76,"cssClass":"pl-c"}],[{"start":0,"end":74,"cssClass":"pl-c"}],[{"start":0,"end":31,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":51,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":17,"cssClass":"pl-en"},{"start":19,"end":28,"cssClass":"pl-smi"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":18,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":35,"cssClass":"pl-en"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":39,"end":45,"cssClass":"pl-k"},{"start":46,"end":49,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":10,"end":11,"cssClass":"pl-c1"},{"start":12,"end":13,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":10,"cssClass":"pl-c1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":17,"cssClass":"pl-c1"},{"start":20,"end":63,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":19,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":18,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":22,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":5,"end":12,"cssClass":"pl-en"},{"start":13,"end":37,"cssClass":"pl-c1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":43,"end":67,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":22,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":25,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":22,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":25,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":24,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":27,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":5,"end":14,"cssClass":"pl-c1"}],[],[{"start":4,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":36,"cssClass":"pl-s1"}],[{"start":4,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":26,"cssClass":"pl-c1"},{"start":36,"end":55,"cssClass":"pl-c"}],[],[{"start":4,"end":50,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-s1"}],[{"start":4,"end":16,"cssClass":"pl-en"},{"start":17,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":13,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":42,"cssClass":"pl-s1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-s1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":23,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"}],[],[{"start":4,"end":42,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-s1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"}],[],[{"start":4,"end":32,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":10,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":11,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"}],[{"start":8,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":19,"cssClass":"pl-s1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":36,"cssClass":"pl-en"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":45,"end":73,"cssClass":"pl-c"}],[{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":24,"cssClass":"pl-s1"}],[],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-s1"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":11,"cssClass":"pl-en"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":19,"end":37,"cssClass":"pl-c"}],[],[{"start":4,"end":44,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-s1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"}],[],[{"start":4,"end":31,"cssClass":"pl-c"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":48,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":51,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":52,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":55,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":49,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":52,"cssClass":"pl-c1"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":13,"end":37,"cssClass":"pl-c1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":43,"end":67,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":55,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":58,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":55,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":58,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":57,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":60,"cssClass":"pl-c1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":4,"end":24,"cssClass":"pl-c"}],[{"start":4,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":26,"cssClass":"pl-en"},{"start":27,"end":29,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":31,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":10,"cssClass":"pl-c1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":17,"cssClass":"pl-c1"}],[],[{"start":4,"end":55,"cssClass":"pl-c"}],[{"start":4,"end":8,"cssClass":"pl-s1"},{"start":9,"end":10,"cssClass":"pl-c1"},{"start":11,"end":13,"cssClass":"pl-s1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":15,"end":19,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":11,"end":15,"cssClass":"pl-s1"}],[{"start":8,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-s1"},{"start":24,"end":26,"cssClass":"pl-c1"},{"start":26,"end":30,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":45,"cssClass":"pl-s1"},{"start":45,"end":47,"cssClass":"pl-c1"},{"start":47,"end":54,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":45,"cssClass":"pl-s1"},{"start":45,"end":47,"cssClass":"pl-c1"},{"start":47,"end":58,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":45,"cssClass":"pl-s1"},{"start":45,"end":47,"cssClass":"pl-c1"},{"start":47,"end":52,"cssClass":"pl-c1"}],[{"start":8,"end":12,"cssClass":"pl-en"},{"start":13,"end":17,"cssClass":"pl-s1"}],[{"start":8,"end":12,"cssClass":"pl-s1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":24,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":19,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":17,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":43,"cssClass":"pl-smi"},{"start":44,"end":49,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":18,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":35,"cssClass":"pl-en"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":39,"end":44,"cssClass":"pl-s1"},{"start":46,"end":57,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":10,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-c1"},{"start":20,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":42,"cssClass":"pl-s1"},{"start":44,"end":61,"cssClass":"pl-s"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":13,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":37,"cssClass":"pl-smi"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":45,"cssClass":"pl-smi"},{"start":46,"end":51,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":36,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":15,"end":17,"cssClass":"pl-c1"},{"start":18,"end":22,"cssClass":"pl-c1"},{"start":24,"end":37,"cssClass":"pl-en"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":41,"end":46,"cssClass":"pl-s1"},{"start":48,"end":87,"cssClass":"pl-s"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":13,"cssClass":"pl-s1"}],[],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":43,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-k"}],[{"start":4,"end":19,"cssClass":"pl-smi"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":21,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":10,"cssClass":"pl-c1"}],[{"start":2,"end":10,"cssClass":"pl-smi"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":15,"cssClass":"pl-smi"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":17,"end":37,"cssClass":"pl-en"},{"start":38,"end":47,"cssClass":"pl-smi"},{"start":48,"end":49,"cssClass":"pl-c1"},{"start":49,"end":50,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":29,"cssClass":"pl-smi"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":31,"end":46,"cssClass":"pl-en"},{"start":47,"end":48,"cssClass":"pl-c1"},{"start":50,"end":56,"cssClass":"pl-k"},{"start":57,"end":65,"cssClass":"pl-s1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":57,"cssClass":"pl-s1"}],[{"start":4,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":26,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":19,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-c1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":23,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":14,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":15,"cssClass":"pl-smi"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":17,"end":35,"cssClass":"pl-en"},{"start":36,"end":45,"cssClass":"pl-smi"},{"start":46,"end":47,"cssClass":"pl-c1"},{"start":47,"end":48,"cssClass":"pl-c1"},{"start":50,"end":53,"cssClass":"pl-smi"},{"start":54,"end":59,"cssClass":"pl-s1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":29,"cssClass":"pl-smi"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":31,"end":46,"cssClass":"pl-en"},{"start":47,"end":48,"cssClass":"pl-c1"},{"start":50,"end":55,"cssClass":"pl-s1"},{"start":57,"end":72,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":15,"end":19,"cssClass":"pl-c1"},{"start":21,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":43,"cssClass":"pl-s1"},{"start":45,"end":61,"cssClass":"pl-s"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":14,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":15,"cssClass":"pl-smi"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":17,"end":37,"cssClass":"pl-en"},{"start":38,"end":47,"cssClass":"pl-smi"},{"start":48,"end":49,"cssClass":"pl-c1"},{"start":49,"end":50,"cssClass":"pl-c1"},{"start":52,"end":55,"cssClass":"pl-smi"},{"start":56,"end":61,"cssClass":"pl-s1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":47,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":16,"cssClass":"pl-c1"},{"start":17,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-c1"},{"start":26,"end":39,"cssClass":"pl-en"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":43,"end":48,"cssClass":"pl-s1"},{"start":50,"end":74,"cssClass":"pl-s"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":14,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":28,"cssClass":"pl-en"},{"start":29,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"}],[{"start":4,"end":8,"cssClass":"pl-smi"},{"start":9,"end":13,"cssClass":"pl-s1"},{"start":14,"end":16,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":16,"cssClass":"pl-c1"},{"start":17,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-c1"}],[{"start":8,"end":14,"cssClass":"pl-en"},{"start":15,"end":19,"cssClass":"pl-s1"},{"start":21,"end":29,"cssClass":"pl-s"}],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":15,"cssClass":"pl-en"},{"start":16,"end":20,"cssClass":"pl-s1"},{"start":22,"end":26,"cssClass":"pl-s"},{"start":28,"end":31,"cssClass":"pl-s1"},{"start":31,"end":33,"cssClass":"pl-c1"},{"start":33,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":53,"cssClass":"pl-s"},{"start":55,"end":59,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":36,"cssClass":"pl-en"},{"start":37,"end":46,"cssClass":"pl-smi"},{"start":47,"end":48,"cssClass":"pl-c1"},{"start":48,"end":49,"cssClass":"pl-c1"},{"start":51,"end":59,"cssClass":"pl-smi"},{"start":60,"end":61,"cssClass":"pl-c1"},{"start":61,"end":64,"cssClass":"pl-s1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":30,"cssClass":"pl-smi"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":49,"cssClass":"pl-en"},{"start":50,"end":53,"cssClass":"pl-s1"},{"start":53,"end":55,"cssClass":"pl-c1"},{"start":55,"end":58,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":13,"cssClass":"pl-s1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":15,"end":24,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":77,"cssClass":"pl-s"}],[],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":29,"cssClass":"pl-en"},{"start":30,"end":39,"cssClass":"pl-smi"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":41,"end":42,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":30,"cssClass":"pl-smi"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":49,"cssClass":"pl-en"},{"start":50,"end":53,"cssClass":"pl-s1"},{"start":53,"end":55,"cssClass":"pl-c1"},{"start":55,"end":58,"cssClass":"pl-c1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":42,"cssClass":"pl-s1"},{"start":42,"end":44,"cssClass":"pl-c1"},{"start":44,"end":49,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":41,"cssClass":"pl-en"},{"start":42,"end":51,"cssClass":"pl-smi"},{"start":52,"end":53,"cssClass":"pl-c1"},{"start":53,"end":54,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":28,"cssClass":"pl-en"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":32,"end":35,"cssClass":"pl-s1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":41,"cssClass":"pl-s1"},{"start":41,"end":43,"cssClass":"pl-c1"},{"start":43,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":41,"cssClass":"pl-en"},{"start":42,"end":51,"cssClass":"pl-smi"},{"start":52,"end":53,"cssClass":"pl-c1"},{"start":53,"end":54,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":28,"cssClass":"pl-en"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":32,"end":35,"cssClass":"pl-s1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":19,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-c1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":35,"cssClass":"pl-en"},{"start":36,"end":45,"cssClass":"pl-smi"},{"start":46,"end":47,"cssClass":"pl-c1"},{"start":47,"end":48,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":28,"cssClass":"pl-en"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":32,"end":35,"cssClass":"pl-s1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":46,"cssClass":"pl-en"},{"start":47,"end":50,"cssClass":"pl-s1"},{"start":50,"end":52,"cssClass":"pl-c1"},{"start":52,"end":55,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":4,"end":5,"cssClass":"pl-c1"}],[{"start":0,"end":4,"cssClass":"pl-smi"},{"start":5,"end":6,"cssClass":"pl-c1"},{"start":6,"end":25,"cssClass":"pl-en"},{"start":26,"end":41,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":47,"cssClass":"pl-smi"}],[{"start":0,"end":4,"cssClass":"pl-smi"},{"start":5,"end":24,"cssClass":"pl-en"},{"start":25,"end":40,"cssClass":"pl-smi"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":43,"end":46,"cssClass":"pl-smi"},{"start":48,"end":52,"cssClass":"pl-smi"},{"start":52,"end":53,"cssClass":"pl-c1"},{"start":55,"end":59,"cssClass":"pl-smi"},{"start":61,"end":62,"cssClass":"pl-c1"},{"start":64,"end":68,"cssClass":"pl-smi"},{"start":68,"end":69,"cssClass":"pl-c1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":12,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":4,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-c1"}],[{"start":12,"end":14,"cssClass":"pl-k"},{"start":16,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":16,"end":36,"cssClass":"pl-en"},{"start":37,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":45,"cssClass":"pl-c1"},{"start":47,"end":64,"cssClass":"pl-en"},{"start":65,"end":66,"cssClass":"pl-c1"},{"start":68,"end":69,"cssClass":"pl-c1"}],[{"start":12,"end":16,"cssClass":"pl-k"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":12,"end":33,"cssClass":"pl-en"},{"start":34,"end":37,"cssClass":"pl-s1"},{"start":37,"end":39,"cssClass":"pl-c1"},{"start":39,"end":42,"cssClass":"pl-c1"},{"start":44,"end":60,"cssClass":"pl-en"},{"start":61,"end":62,"cssClass":"pl-c1"},{"start":64,"end":65,"cssClass":"pl-c1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":12,"end":31,"cssClass":"pl-en"},{"start":32,"end":35,"cssClass":"pl-s1"},{"start":35,"end":37,"cssClass":"pl-c1"},{"start":37,"end":40,"cssClass":"pl-c1"},{"start":42,"end":58,"cssClass":"pl-en"},{"start":59,"end":60,"cssClass":"pl-c1"},{"start":62,"end":63,"cssClass":"pl-c1"},{"start":66,"end":76,"cssClass":"pl-en"},{"start":77,"end":78,"cssClass":"pl-c1"},{"start":80,"end":81,"cssClass":"pl-c1"},{"start":84,"end":100,"cssClass":"pl-c1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":21,"cssClass":"pl-c1"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":22,"cssClass":"pl-c1"}],[{"start":12,"end":31,"cssClass":"pl-en"},{"start":32,"end":35,"cssClass":"pl-s1"},{"start":35,"end":37,"cssClass":"pl-c1"},{"start":37,"end":40,"cssClass":"pl-c1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[{"start":8,"end":15,"cssClass":"pl-k"}],[{"start":12,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":50,"cssClass":"pl-s"},{"start":52,"end":64,"cssClass":"pl-en"},{"start":65,"end":66,"cssClass":"pl-c1"},{"start":68,"end":69,"cssClass":"pl-c1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":31,"cssClass":"pl-en"},{"start":32,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":39,"cssClass":"pl-en"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":12,"cssClass":"pl-s1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":23,"cssClass":"pl-en"},{"start":24,"end":27,"cssClass":"pl-s1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-c1"},{"start":35,"end":40,"cssClass":"pl-k"},{"start":41,"end":45,"cssClass":"pl-smi"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":47,"end":51,"cssClass":"pl-s1"},{"start":53,"end":57,"cssClass":"pl-s1"},{"start":59,"end":75,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":33,"cssClass":"pl-en"},{"start":34,"end":43,"cssClass":"pl-smi"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-s1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":29,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":31,"end":34,"cssClass":"pl-c1"},{"start":36,"end":37,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":32,"cssClass":"pl-en"},{"start":33,"end":42,"cssClass":"pl-smi"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":19,"cssClass":"pl-s1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":12,"cssClass":"pl-s1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":24,"cssClass":"pl-en"},{"start":25,"end":28,"cssClass":"pl-s1"},{"start":28,"end":30,"cssClass":"pl-c1"},{"start":30,"end":33,"cssClass":"pl-c1"},{"start":35,"end":38,"cssClass":"pl-s1"},{"start":40,"end":44,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":30,"cssClass":"pl-en"},{"start":31,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"},{"start":10,"end":11,"cssClass":"pl-c1"},{"start":12,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":22,"cssClass":"pl-en"},{"start":23,"end":26,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":31,"cssClass":"pl-en"},{"start":32,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":23,"cssClass":"pl-en"},{"start":24,"end":27,"cssClass":"pl-s1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":31,"cssClass":"pl-en"},{"start":32,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":20,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":39,"cssClass":"pl-en"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":12,"cssClass":"pl-s1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":23,"cssClass":"pl-en"},{"start":24,"end":27,"cssClass":"pl-s1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-c1"},{"start":34,"end":38,"cssClass":"pl-s1"},{"start":40,"end":44,"cssClass":"pl-s1"},{"start":46,"end":62,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":19,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-s1"},{"start":25,"end":27,"cssClass":"pl-c1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":30,"end":32,"cssClass":"pl-c1"},{"start":33,"end":37,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":31,"cssClass":"pl-en"},{"start":32,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":48,"cssClass":"pl-c"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":22,"cssClass":"pl-s1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":25,"end":50,"cssClass":"pl-en"},{"start":51,"end":53,"cssClass":"pl-s1"},{"start":53,"end":55,"cssClass":"pl-c1"},{"start":55,"end":57,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":23,"cssClass":"pl-s1"},{"start":25,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":49,"cssClass":"pl-s"},{"start":51,"end":56,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":31,"cssClass":"pl-smi"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":38,"cssClass":"pl-en"},{"start":39,"end":41,"cssClass":"pl-s1"},{"start":41,"end":43,"cssClass":"pl-c1"},{"start":43,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":37,"cssClass":"pl-smi"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":44,"cssClass":"pl-en"},{"start":45,"end":47,"cssClass":"pl-s1"},{"start":47,"end":49,"cssClass":"pl-c1"},{"start":49,"end":51,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":31,"cssClass":"pl-smi"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":38,"cssClass":"pl-en"},{"start":39,"end":41,"cssClass":"pl-s1"},{"start":41,"end":43,"cssClass":"pl-c1"},{"start":43,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":36,"cssClass":"pl-en"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":23,"cssClass":"pl-en"},{"start":24,"end":33,"cssClass":"pl-smi"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":21,"cssClass":"pl-en"},{"start":22,"end":24,"cssClass":"pl-s1"},{"start":24,"end":26,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":23,"cssClass":"pl-s1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":42,"cssClass":"pl-en"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":46,"end":47,"cssClass":"pl-c1"}],[{"start":4,"end":77,"cssClass":"pl-c"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":41,"cssClass":"pl-en"},{"start":42,"end":44,"cssClass":"pl-s1"},{"start":44,"end":46,"cssClass":"pl-c1"},{"start":46,"end":48,"cssClass":"pl-c1"},{"start":50,"end":57,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":29,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":53,"cssClass":"pl-smi"},{"start":54,"end":55,"cssClass":"pl-c1"},{"start":55,"end":60,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":12,"end":30,"cssClass":"pl-en"},{"start":31,"end":36,"cssClass":"pl-s1"}],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":32,"end":37,"cssClass":"pl-k"},{"start":38,"end":42,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":44,"end":62,"cssClass":"pl-en"},{"start":63,"end":68,"cssClass":"pl-s1"},{"start":71,"end":90,"cssClass":"pl-en"},{"start":91,"end":96,"cssClass":"pl-s1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":27,"cssClass":"pl-c1"}],[{"start":12,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":45,"cssClass":"pl-en"},{"start":46,"end":51,"cssClass":"pl-s1"}],[{"start":26,"end":41,"cssClass":"pl-en"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":46,"end":51,"cssClass":"pl-k"},{"start":52,"end":56,"cssClass":"pl-smi"},{"start":56,"end":57,"cssClass":"pl-c1"},{"start":58,"end":76,"cssClass":"pl-en"},{"start":77,"end":82,"cssClass":"pl-s1"}],[{"start":46,"end":65,"cssClass":"pl-en"},{"start":66,"end":71,"cssClass":"pl-s1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":25,"cssClass":"pl-c1"}],[{"start":12,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":50,"cssClass":"pl-en"},{"start":51,"end":56,"cssClass":"pl-s1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":49,"cssClass":"pl-en"},{"start":50,"end":55,"cssClass":"pl-s1"},{"start":58,"end":77,"cssClass":"pl-en"},{"start":78,"end":83,"cssClass":"pl-s1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":24,"cssClass":"pl-c1"}],[{"start":12,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[],[{"start":8,"end":15,"cssClass":"pl-k"}],[{"start":12,"end":57,"cssClass":"pl-c"}],[{"start":0,"end":42,"cssClass":"pl-c"}],[{"start":12,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"}],[{"start":12,"end":17,"cssClass":"pl-k"}],[],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":64,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":31,"cssClass":"pl-c"}],[{"start":0,"end":41,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":34,"cssClass":"pl-en"},{"start":35,"end":50,"cssClass":"pl-smi"},{"start":51,"end":52,"cssClass":"pl-c1"},{"start":52,"end":59,"cssClass":"pl-s1"},{"start":61,"end":64,"cssClass":"pl-smi"},{"start":65,"end":69,"cssClass":"pl-s1"},{"start":71,"end":84,"cssClass":"pl-smi"},{"start":85,"end":86,"cssClass":"pl-c1"},{"start":86,"end":87,"cssClass":"pl-c1"},{"start":87,"end":91,"cssClass":"pl-s1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":30,"cssClass":"pl-smi"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":49,"cssClass":"pl-en"},{"start":50,"end":57,"cssClass":"pl-s1"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-s1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":25,"end":27,"cssClass":"pl-c1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":51,"cssClass":"pl-c"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":26,"cssClass":"pl-s1"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":42,"cssClass":"pl-s1"},{"start":42,"end":44,"cssClass":"pl-c1"},{"start":44,"end":51,"cssClass":"pl-c1"},{"start":56,"end":78,"cssClass":"pl-c"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":13,"cssClass":"pl-s1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":15,"end":24,"cssClass":"pl-c1"}],[{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":39,"end":79,"cssClass":"pl-c"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":42,"cssClass":"pl-c"}],[{"start":8,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":43,"cssClass":"pl-en"},{"start":44,"end":51,"cssClass":"pl-s1"},{"start":53,"end":54,"cssClass":"pl-c1"}],[{"start":8,"end":70,"cssClass":"pl-c"}],[{"start":0,"end":62,"cssClass":"pl-c"}],[{"start":8,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-s1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":48,"end":67,"cssClass":"pl-c"}],[],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":27,"cssClass":"pl-c1"},{"start":32,"end":54,"cssClass":"pl-c"}],[{"start":12,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"}],[{"start":12,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-s1"}],[{"start":12,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-c1"}],[{"start":12,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":43,"cssClass":"pl-c1"}],[],[{"start":8,"end":12,"cssClass":"pl-k"}],[{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":36,"cssClass":"pl-en"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":42,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":21,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-s1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-s1"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":29,"cssClass":"pl-s1"},{"start":30,"end":31,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":21,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":22,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":25,"cssClass":"pl-s1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":34,"end":35,"cssClass":"pl-c1"}],[{"start":8,"end":13,"cssClass":"pl-k"},{"start":14,"end":18,"cssClass":"pl-smi"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":20,"end":26,"cssClass":"pl-s1"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":29,"end":41,"cssClass":"pl-en"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":45,"end":47,"cssClass":"pl-c1"}],[{"start":8,"end":11,"cssClass":"pl-smi"},{"start":12,"end":16,"cssClass":"pl-s1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":35,"cssClass":"pl-c1"}],[{"start":8,"end":28,"cssClass":"pl-en"},{"start":29,"end":36,"cssClass":"pl-s1"},{"start":38,"end":44,"cssClass":"pl-s1"},{"start":46,"end":50,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":28,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":19,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":13,"cssClass":"pl-s1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":15,"end":24,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":44,"cssClass":"pl-s1"},{"start":44,"end":46,"cssClass":"pl-c1"},{"start":46,"end":48,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":36,"cssClass":"pl-en"},{"start":37,"end":52,"cssClass":"pl-smi"},{"start":53,"end":54,"cssClass":"pl-c1"},{"start":54,"end":61,"cssClass":"pl-s1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":30,"cssClass":"pl-smi"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":49,"cssClass":"pl-en"},{"start":50,"end":57,"cssClass":"pl-s1"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-s1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":25,"end":27,"cssClass":"pl-c1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[{"start":4,"end":8,"cssClass":"pl-smi"},{"start":9,"end":10,"cssClass":"pl-c1"},{"start":10,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":39,"cssClass":"pl-en"},{"start":40,"end":47,"cssClass":"pl-s1"},{"start":49,"end":50,"cssClass":"pl-c1"},{"start":53,"end":76,"cssClass":"pl-c"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":17,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":42,"cssClass":"pl-s1"},{"start":42,"end":44,"cssClass":"pl-c1"},{"start":44,"end":55,"cssClass":"pl-c1"},{"start":60,"end":82,"cssClass":"pl-c"}],[],[{"start":4,"end":66,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-s1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":44,"end":63,"cssClass":"pl-c"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":28,"end":90,"cssClass":"pl-c"}],[{"start":8,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"}],[{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":8,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-s1"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":27,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":32,"cssClass":"pl-en"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-c1"}],[],[{"start":4,"end":21,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":22,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"}],[{"start":8,"end":28,"cssClass":"pl-en"},{"start":29,"end":36,"cssClass":"pl-s1"},{"start":38,"end":50,"cssClass":"pl-en"},{"start":51,"end":52,"cssClass":"pl-c1"},{"start":54,"end":56,"cssClass":"pl-c1"},{"start":59,"end":61,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":28,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":19,"cssClass":"pl-c1"}],[],[{"start":4,"end":25,"cssClass":"pl-c"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":33,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-s1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"}],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":29,"cssClass":"pl-c"}],[{"start":0,"end":87,"cssClass":"pl-c"}],[{"start":0,"end":26,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":19,"cssClass":"pl-c"}],[{"start":0,"end":26,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":22,"cssClass":"pl-c"}],[{"start":0,"end":34,"cssClass":"pl-c"}],[{"start":0,"end":30,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":31,"cssClass":"pl-en"},{"start":32,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":46,"end":49,"cssClass":"pl-smi"},{"start":50,"end":59,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":20,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":12,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"}],[{"start":4,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-s1"}],[],[{"start":4,"end":24,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":17,"cssClass":"pl-s1"},{"start":19,"end":28,"cssClass":"pl-s1"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-s1"},{"start":9,"end":10,"cssClass":"pl-c1"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":8,"cssClass":"pl-s1"},{"start":9,"end":10,"cssClass":"pl-c1"},{"start":11,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":17,"cssClass":"pl-s1"},{"start":19,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":53,"cssClass":"pl-c1"}],[],[{"start":4,"end":76,"cssClass":"pl-c"}],[{"start":4,"end":8,"cssClass":"pl-s1"},{"start":9,"end":10,"cssClass":"pl-c1"},{"start":12,"end":20,"cssClass":"pl-smi"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":28,"cssClass":"pl-en"},{"start":29,"end":35,"cssClass":"pl-k"},{"start":36,"end":44,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":12,"cssClass":"pl-s1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":16,"end":20,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":37,"cssClass":"pl-s"}],[],[],[{"start":4,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":36,"cssClass":"pl-en"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":16,"end":20,"cssClass":"pl-s1"},{"start":22,"end":26,"cssClass":"pl-s1"},{"start":28,"end":39,"cssClass":"pl-c1"},{"start":41,"end":45,"cssClass":"pl-s1"}],[{"start":8,"end":17,"cssClass":"pl-s1"},{"start":20,"end":24,"cssClass":"pl-c1"},{"start":27,"end":49,"cssClass":"pl-s1"}],[{"start":8,"end":17,"cssClass":"pl-s1"},{"start":20,"end":42,"cssClass":"pl-s1"},{"start":45,"end":49,"cssClass":"pl-c1"}],[{"start":8,"end":17,"cssClass":"pl-s1"},{"start":20,"end":44,"cssClass":"pl-s1"},{"start":47,"end":51,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":17,"cssClass":"pl-c1"},{"start":18,"end":27,"cssClass":"pl-c1"}],[{"start":8,"end":75,"cssClass":"pl-c"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":35,"cssClass":"pl-s1"}],[],[{"start":8,"end":58,"cssClass":"pl-c"}],[{"start":8,"end":12,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":21,"cssClass":"pl-s1"}],[{"start":8,"end":12,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":35,"cssClass":"pl-s1"}],[{"start":8,"end":12,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":23,"cssClass":"pl-s1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":25,"end":29,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-s1"}],[],[{"start":8,"end":52,"cssClass":"pl-c"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"}],[{"start":8,"end":12,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":21,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":32,"cssClass":"pl-en"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":36,"end":53,"cssClass":"pl-c1"}],[{"start":8,"end":28,"cssClass":"pl-c"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":27,"end":36,"cssClass":"pl-s1"}],[{"start":8,"end":12,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":30,"cssClass":"pl-en"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":34,"end":51,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":21,"cssClass":"pl-s1"}],[{"start":12,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[{"start":12,"end":16,"cssClass":"pl-s1"},{"start":16,"end":18,"cssClass":"pl-c1"},{"start":18,"end":29,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":61,"cssClass":"pl-c1"}],[],[{"start":8,"end":12,"cssClass":"pl-k"}],[{"start":12,"end":16,"cssClass":"pl-s1"},{"start":16,"end":18,"cssClass":"pl-c1"},{"start":18,"end":29,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":41,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":35,"cssClass":"pl-c"}],[{"start":8,"end":12,"cssClass":"pl-en"},{"start":13,"end":17,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":29,"cssClass":"pl-s1"},{"start":30,"end":32,"cssClass":"pl-c1"},{"start":33,"end":42,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":49,"end":50,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":29,"cssClass":"pl-en"},{"start":30,"end":39,"cssClass":"pl-smi"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":41,"end":42,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":30,"cssClass":"pl-en"},{"start":31,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":48,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-k"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-c1"}],[{"start":2,"end":5,"cssClass":"pl-smi"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":22,"cssClass":"pl-en"},{"start":23,"end":26,"cssClass":"pl-smi"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-s1"},{"start":31,"end":34,"cssClass":"pl-smi"},{"start":35,"end":37,"cssClass":"pl-s1"},{"start":38,"end":43,"cssClass":"pl-k"},{"start":44,"end":48,"cssClass":"pl-smi"},{"start":49,"end":50,"cssClass":"pl-c1"},{"start":50,"end":52,"cssClass":"pl-s1"}],[{"start":24,"end":27,"cssClass":"pl-smi"},{"start":28,"end":30,"cssClass":"pl-s1"},{"start":31,"end":36,"cssClass":"pl-k"},{"start":37,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":45,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":13,"cssClass":"pl-c1"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":17,"end":19,"cssClass":"pl-s1"},{"start":19,"end":21,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-s1"},{"start":38,"end":40,"cssClass":"pl-c1"},{"start":40,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":24,"cssClass":"pl-s1"},{"start":25,"end":27,"cssClass":"pl-s1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":24,"cssClass":"pl-s1"},{"start":25,"end":27,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":34,"cssClass":"pl-s1"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":36,"end":39,"cssClass":"pl-smi"},{"start":40,"end":52,"cssClass":"pl-en"},{"start":53,"end":54,"cssClass":"pl-c1"},{"start":55,"end":57,"cssClass":"pl-c1"}],[{"start":4,"end":11,"cssClass":"pl-en"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":15,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":14,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":20,"cssClass":"pl-en"},{"start":21,"end":24,"cssClass":"pl-smi"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":10,"cssClass":"pl-s1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":25,"end":42,"cssClass":"pl-c1"},{"start":43,"end":45,"cssClass":"pl-s1"},{"start":45,"end":47,"cssClass":"pl-c1"},{"start":47,"end":50,"cssClass":"pl-c1"}],[{"start":8,"end":12,"cssClass":"pl-en"},{"start":13,"end":15,"cssClass":"pl-s1"}],[],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":30,"cssClass":"pl-en"},{"start":31,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":24,"cssClass":"pl-s1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":25,"end":41,"cssClass":"pl-en"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":16,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":9,"end":10,"cssClass":"pl-c1"},{"start":10,"end":18,"cssClass":"pl-s1"},{"start":20,"end":23,"cssClass":"pl-smi"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":29,"cssClass":"pl-smi"},{"start":30,"end":35,"cssClass":"pl-k"},{"start":36,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":43,"end":46,"cssClass":"pl-smi"},{"start":47,"end":52,"cssClass":"pl-k"},{"start":53,"end":57,"cssClass":"pl-smi"},{"start":58,"end":59,"cssClass":"pl-c1"},{"start":60,"end":61,"cssClass":"pl-c1"},{"start":61,"end":65,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":21,"end":66,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":29,"end":37,"cssClass":"pl-s1"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":49,"cssClass":"pl-s1"}],[{"start":4,"end":8,"cssClass":"pl-k"},{"start":9,"end":11,"cssClass":"pl-k"},{"start":14,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":65,"cssClass":"pl-s"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":16,"cssClass":"pl-s1"},{"start":17,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":11,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-smi"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":24,"cssClass":"pl-en"},{"start":25,"end":31,"cssClass":"pl-k"},{"start":32,"end":35,"cssClass":"pl-s1"},{"start":39,"end":67,"cssClass":"pl-c"}],[{"start":0,"end":70,"cssClass":"pl-c"}],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":14,"cssClass":"pl-s1"}],[{"start":12,"end":14,"cssClass":"pl-s1"},{"start":14,"end":16,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":19,"cssClass":"pl-c1"}],[{"start":12,"end":80,"cssClass":"pl-c"}],[{"start":12,"end":14,"cssClass":"pl-s1"},{"start":14,"end":16,"cssClass":"pl-c1"},{"start":16,"end":19,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":20,"end":28,"cssClass":"pl-en"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":31,"end":48,"cssClass":"pl-c1"}],[],[{"start":8,"end":12,"cssClass":"pl-k"},{"start":13,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":73,"cssClass":"pl-s"}],[],[{"start":4,"end":31,"cssClass":"pl-en"},{"start":32,"end":34,"cssClass":"pl-s1"},{"start":34,"end":36,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-c1"},{"start":40,"end":48,"cssClass":"pl-s1"},{"start":50,"end":61,"cssClass":"pl-c1"}],[{"start":9,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":18,"cssClass":"pl-s1"}],[{"start":9,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":20,"cssClass":"pl-smi"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-smi"},{"start":26,"end":31,"cssClass":"pl-k"},{"start":32,"end":36,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":38,"end":41,"cssClass":"pl-smi"},{"start":42,"end":47,"cssClass":"pl-k"},{"start":48,"end":52,"cssClass":"pl-smi"},{"start":52,"end":53,"cssClass":"pl-c1"},{"start":55,"end":63,"cssClass":"pl-s1"}],[{"start":9,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":17,"end":21,"cssClass":"pl-smi"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":32,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":30,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":28,"cssClass":"pl-en"},{"start":29,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":23,"cssClass":"pl-s1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":24,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":43,"end":47,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":26,"cssClass":"pl-s1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":27,"end":41,"cssClass":"pl-en"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":46,"end":50,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"}],[{"start":4,"end":8,"cssClass":"pl-smi"},{"start":9,"end":10,"cssClass":"pl-c1"},{"start":10,"end":16,"cssClass":"pl-s1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-c1"}],[{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":46,"cssClass":"pl-en"},{"start":47,"end":49,"cssClass":"pl-s1"},{"start":49,"end":51,"cssClass":"pl-c1"},{"start":51,"end":53,"cssClass":"pl-c1"},{"start":54,"end":55,"cssClass":"pl-c1"},{"start":58,"end":89,"cssClass":"pl-c"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":37,"cssClass":"pl-en"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":44,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":49,"end":79,"cssClass":"pl-c"}],[{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":39,"cssClass":"pl-en"},{"start":40,"end":42,"cssClass":"pl-s1"},{"start":42,"end":44,"cssClass":"pl-c1"},{"start":44,"end":46,"cssClass":"pl-c1"},{"start":47,"end":54,"cssClass":"pl-s1"},{"start":55,"end":65,"cssClass":"pl-s1"},{"start":66,"end":67,"cssClass":"pl-c1"},{"start":67,"end":73,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":17,"cssClass":"pl-c1"},{"start":18,"end":27,"cssClass":"pl-c1"}],[{"start":8,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"}],[{"start":8,"end":14,"cssClass":"pl-k"},{"start":15,"end":16,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":26,"end":69,"cssClass":"pl-c"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":27,"cssClass":"pl-s1"}],[{"start":4,"end":16,"cssClass":"pl-en"},{"start":17,"end":23,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":18,"cssClass":"pl-c"}],[{"start":0,"end":48,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":21,"cssClass":"pl-c"}],[{"start":0,"end":24,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":29,"cssClass":"pl-en"},{"start":30,"end":34,"cssClass":"pl-smi"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":36,"end":40,"cssClass":"pl-s1"},{"start":42,"end":47,"cssClass":"pl-k"},{"start":48,"end":52,"cssClass":"pl-smi"},{"start":53,"end":54,"cssClass":"pl-c1"},{"start":54,"end":57,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":18,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-s1"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":33,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":50,"cssClass":"pl-c1"},{"start":56,"end":74,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":53,"cssClass":"pl-c1"},{"start":56,"end":84,"cssClass":"pl-c"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-s1"},{"start":28,"end":54,"cssClass":"pl-c"}],[],[{"start":4,"end":27,"cssClass":"pl-c"}],[{"start":4,"end":13,"cssClass":"pl-en"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":53,"cssClass":"pl-c"}],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":19,"cssClass":"pl-en"},{"start":20,"end":29,"cssClass":"pl-smi"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":29,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":53,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":56,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":20,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":35,"cssClass":"pl-c1"}],[],[{"start":8,"end":33,"cssClass":"pl-c"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":24,"cssClass":"pl-s1"},{"start":24,"end":26,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":30,"end":34,"cssClass":"pl-c1"},{"start":36,"end":40,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":42,"cssClass":"pl-c1"}],[],[{"start":8,"end":63,"cssClass":"pl-c"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"}],[],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":53,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":56,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":55,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":20,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":52,"cssClass":"pl-c1"}],[],[{"start":8,"end":31,"cssClass":"pl-c"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":24,"cssClass":"pl-s1"},{"start":24,"end":26,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":30,"end":47,"cssClass":"pl-s1"},{"start":49,"end":51,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":13,"end":37,"cssClass":"pl-c1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":43,"end":67,"cssClass":"pl-c1"}],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":24,"cssClass":"pl-c"}],[{"start":0,"end":48,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":21,"cssClass":"pl-c"}],[{"start":0,"end":78,"cssClass":"pl-c"}],[{"start":0,"end":85,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":35,"cssClass":"pl-en"},{"start":36,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":46,"cssClass":"pl-s1"},{"start":48,"end":51,"cssClass":"pl-smi"},{"start":52,"end":54,"cssClass":"pl-s1"},{"start":56,"end":60,"cssClass":"pl-smi"},{"start":61,"end":66,"cssClass":"pl-k"},{"start":67,"end":68,"cssClass":"pl-c1"},{"start":68,"end":74,"cssClass":"pl-s1"},{"start":76,"end":80,"cssClass":"pl-smi"},{"start":81,"end":86,"cssClass":"pl-k"},{"start":87,"end":88,"cssClass":"pl-c1"},{"start":88,"end":95,"cssClass":"pl-s1"},{"start":97,"end":110,"cssClass":"pl-smi"},{"start":111,"end":116,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":18,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-s1"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":33,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":56,"cssClass":"pl-c1"},{"start":62,"end":80,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":59,"cssClass":"pl-c1"},{"start":62,"end":90,"cssClass":"pl-c"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-s1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":28,"cssClass":"pl-s1"},{"start":31,"end":62,"cssClass":"pl-c"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":29,"cssClass":"pl-s1"},{"start":32,"end":63,"cssClass":"pl-c"}],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":23,"cssClass":"pl-s1"},{"start":25,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":49,"cssClass":"pl-s"},{"start":51,"end":56,"cssClass":"pl-s1"}],[],[{"start":4,"end":27,"cssClass":"pl-c"}],[{"start":4,"end":13,"cssClass":"pl-en"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":53,"cssClass":"pl-c"}],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":29,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":59,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":62,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":26,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":29,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":41,"cssClass":"pl-c1"}],[],[{"start":8,"end":39,"cssClass":"pl-c"}],[{"start":8,"end":27,"cssClass":"pl-en"},{"start":28,"end":30,"cssClass":"pl-s1"},{"start":30,"end":32,"cssClass":"pl-c1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":36,"end":40,"cssClass":"pl-c1"},{"start":42,"end":46,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":42,"cssClass":"pl-c1"}],[],[{"start":8,"end":63,"cssClass":"pl-c"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"}],[],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":59,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":62,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":29,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":61,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":26,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":29,"end":37,"cssClass":"pl-en"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":41,"end":58,"cssClass":"pl-c1"}],[],[{"start":8,"end":37,"cssClass":"pl-c"}],[{"start":8,"end":27,"cssClass":"pl-en"},{"start":28,"end":30,"cssClass":"pl-s1"},{"start":30,"end":32,"cssClass":"pl-c1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":36,"end":59,"cssClass":"pl-s1"},{"start":61,"end":63,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":24,"cssClass":"pl-c"}],[{"start":0,"end":48,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":21,"cssClass":"pl-c"}],[{"start":0,"end":19,"cssClass":"pl-c"}],[{"start":0,"end":81,"cssClass":"pl-c"}],[{"start":0,"end":84,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":34,"cssClass":"pl-en"},{"start":35,"end":39,"cssClass":"pl-smi"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":41,"end":45,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":18,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-s1"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":16,"cssClass":"pl-s1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"}],[],[{"start":4,"end":33,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":56,"cssClass":"pl-c1"},{"start":62,"end":80,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":59,"cssClass":"pl-c1"},{"start":62,"end":90,"cssClass":"pl-c"}],[],[{"start":4,"end":27,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"}],[{"start":8,"end":16,"cssClass":"pl-s1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":32,"cssClass":"pl-en"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-c1"},{"start":41,"end":79,"cssClass":"pl-c"}],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":19,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":29,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":59,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":62,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":26,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":29,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":41,"cssClass":"pl-c1"}],[],[{"start":8,"end":39,"cssClass":"pl-c"}],[{"start":8,"end":27,"cssClass":"pl-en"},{"start":28,"end":30,"cssClass":"pl-s1"},{"start":30,"end":32,"cssClass":"pl-c1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":36,"end":40,"cssClass":"pl-c1"},{"start":42,"end":46,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":42,"cssClass":"pl-c1"}],[],[{"start":8,"end":63,"cssClass":"pl-c"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"}],[],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":59,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":62,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":29,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":40,"cssClass":"pl-en"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":61,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":26,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":29,"end":37,"cssClass":"pl-en"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":41,"end":58,"cssClass":"pl-c1"}],[],[{"start":8,"end":37,"cssClass":"pl-c"}],[{"start":8,"end":27,"cssClass":"pl-en"},{"start":28,"end":30,"cssClass":"pl-s1"},{"start":30,"end":32,"cssClass":"pl-c1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":36,"end":59,"cssClass":"pl-s1"},{"start":61,"end":63,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":26,"cssClass":"pl-c"}],[{"start":0,"end":48,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":21,"cssClass":"pl-c"}],[{"start":0,"end":19,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":37,"cssClass":"pl-en"},{"start":38,"end":42,"cssClass":"pl-smi"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":44,"end":48,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":18,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-s1"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":33,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":58,"cssClass":"pl-c1"},{"start":64,"end":82,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":61,"cssClass":"pl-c1"},{"start":64,"end":92,"cssClass":"pl-c"}],[],[{"start":4,"end":27,"cssClass":"pl-c"}],[{"start":4,"end":13,"cssClass":"pl-en"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":53,"cssClass":"pl-c"}],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":37,"cssClass":"pl-smi"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":29,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":61,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":64,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":28,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":31,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":34,"end":43,"cssClass":"pl-c1"}],[],[{"start":8,"end":41,"cssClass":"pl-c"}],[{"start":8,"end":29,"cssClass":"pl-en"},{"start":30,"end":32,"cssClass":"pl-s1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-c1"},{"start":38,"end":42,"cssClass":"pl-c1"},{"start":44,"end":48,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":42,"cssClass":"pl-c1"}],[],[{"start":8,"end":63,"cssClass":"pl-c"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"}],[],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":61,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":64,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":31,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":34,"end":42,"cssClass":"pl-en"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":46,"end":63,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":28,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":31,"end":39,"cssClass":"pl-en"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":43,"end":60,"cssClass":"pl-c1"}],[],[{"start":8,"end":39,"cssClass":"pl-c"}],[{"start":8,"end":29,"cssClass":"pl-en"},{"start":30,"end":32,"cssClass":"pl-s1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-c1"},{"start":38,"end":63,"cssClass":"pl-s1"},{"start":65,"end":67,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":80,"cssClass":"pl-c"}],[],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":13,"end":42,"cssClass":"pl-c1"},{"start":44,"end":46,"cssClass":"pl-c1"},{"start":48,"end":77,"cssClass":"pl-c1"}],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":20,"cssClass":"pl-c"}],[{"start":0,"end":67,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":21,"cssClass":"pl-c"}],[{"start":0,"end":19,"cssClass":"pl-c"}],[{"start":0,"end":80,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":31,"cssClass":"pl-en"},{"start":32,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":42,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":20,"end":42,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":18,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-s1"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":53,"cssClass":"pl-c1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":56,"cssClass":"pl-c1"}],[],[{"start":4,"end":27,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"}],[{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":30,"cssClass":"pl-en"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-c1"}],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":17,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":30,"cssClass":"pl-en"},{"start":31,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":29,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":56,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":59,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":26,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":29,"end":38,"cssClass":"pl-c1"}],[],[{"start":8,"end":32,"cssClass":"pl-c"}],[{"start":8,"end":32,"cssClass":"pl-en"},{"start":33,"end":35,"cssClass":"pl-s1"},{"start":35,"end":37,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-c1"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":44,"end":48,"cssClass":"pl-c1"},{"start":50,"end":54,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":11,"cssClass":"pl-smi"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":40,"end":63,"cssClass":"pl-c"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":42,"cssClass":"pl-c1"}],[],[{"start":8,"end":63,"cssClass":"pl-c"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"}],[],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":56,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":59,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":26,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":29,"end":37,"cssClass":"pl-en"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":41,"end":58,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":55,"cssClass":"pl-c1"}],[],[{"start":8,"end":35,"cssClass":"pl-c"}],[{"start":8,"end":32,"cssClass":"pl-en"},{"start":33,"end":35,"cssClass":"pl-s1"},{"start":35,"end":37,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-c1"},{"start":41,"end":44,"cssClass":"pl-s1"},{"start":46,"end":66,"cssClass":"pl-s1"},{"start":68,"end":70,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":5,"cssClass":"pl-k"},{"start":6,"end":89,"cssClass":"pl-c"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":30,"cssClass":"pl-en"},{"start":31,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":75,"cssClass":"pl-s"}],[{"start":4,"end":13,"cssClass":"pl-en"},{"start":14,"end":15,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":90,"cssClass":"pl-c"}],[],[{"start":0,"end":23,"cssClass":"pl-c"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":4,"end":5,"cssClass":"pl-c1"}],[{"start":0,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":35,"cssClass":"pl-en"}],[{"start":2,"end":9,"cssClass":"pl-smi"},{"start":10,"end":11,"cssClass":"pl-c1"},{"start":11,"end":16,"cssClass":"pl-s1"},{"start":41,"end":74,"cssClass":"pl-c"}],[{"start":2,"end":7,"cssClass":"pl-k"},{"start":8,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":23,"cssClass":"pl-s1"},{"start":41,"end":72,"cssClass":"pl-c"}],[{"start":2,"end":9,"cssClass":"pl-smi"},{"start":10,"end":11,"cssClass":"pl-c1"},{"start":11,"end":18,"cssClass":"pl-s1"},{"start":41,"end":69,"cssClass":"pl-c"}],[{"start":2,"end":7,"cssClass":"pl-k"},{"start":8,"end":12,"cssClass":"pl-smi"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":14,"end":25,"cssClass":"pl-s1"},{"start":41,"end":67,"cssClass":"pl-c"}],[],[{"start":0,"end":3,"cssClass":"pl-smi"},{"start":4,"end":23,"cssClass":"pl-en"},{"start":24,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-s1"},{"start":43,"end":46,"cssClass":"pl-smi"},{"start":47,"end":52,"cssClass":"pl-s1"}],[{"start":0,"end":3,"cssClass":"pl-smi"},{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-s1"}],[{"start":0,"end":3,"cssClass":"pl-smi"},{"start":4,"end":28,"cssClass":"pl-en"},{"start":29,"end":43,"cssClass":"pl-smi"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-s1"}],[{"start":0,"end":3,"cssClass":"pl-smi"},{"start":4,"end":28,"cssClass":"pl-en"},{"start":29,"end":43,"cssClass":"pl-smi"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-s1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":13,"cssClass":"pl-smi"}],[{"start":4,"end":18,"cssClass":"pl-smi"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-c1"},{"start":28,"end":50,"cssClass":"pl-c"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":46,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":12,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":16,"cssClass":"pl-c1"},{"start":18,"end":24,"cssClass":"pl-k"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":50,"cssClass":"pl-c"}],[],[{"start":4,"end":36,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-s1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"}],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":44,"cssClass":"pl-en"},{"start":45,"end":48,"cssClass":"pl-s1"},{"start":48,"end":50,"cssClass":"pl-c1"},{"start":50,"end":52,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-c1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":18,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":30,"cssClass":"pl-en"},{"start":31,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":36,"cssClass":"pl-en"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":25,"cssClass":"pl-s1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":28,"end":44,"cssClass":"pl-en"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":48,"end":49,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":36,"cssClass":"pl-en"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":25,"cssClass":"pl-s1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":28,"end":44,"cssClass":"pl-en"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":48,"end":49,"cssClass":"pl-c1"}],[],[{"start":4,"end":18,"cssClass":"pl-smi"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-s1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":25,"end":44,"cssClass":"pl-en"},{"start":45,"end":54,"cssClass":"pl-s1"},{"start":54,"end":56,"cssClass":"pl-c1"},{"start":56,"end":58,"cssClass":"pl-c1"},{"start":60,"end":69,"cssClass":"pl-s1"},{"start":71,"end":80,"cssClass":"pl-s1"},{"start":80,"end":82,"cssClass":"pl-c1"},{"start":82,"end":84,"cssClass":"pl-c1"},{"start":86,"end":95,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":12,"cssClass":"pl-c1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":16,"end":18,"cssClass":"pl-s1"}],[{"start":8,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":19,"cssClass":"pl-s1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":29,"cssClass":"pl-smi"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":31,"end":46,"cssClass":"pl-en"},{"start":47,"end":48,"cssClass":"pl-c1"},{"start":50,"end":56,"cssClass":"pl-k"},{"start":57,"end":63,"cssClass":"pl-s1"}],[],[{"start":8,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":43,"cssClass":"pl-s1"}],[{"start":8,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"},{"start":40,"end":59,"cssClass":"pl-c"}],[{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"}],[],[{"start":8,"end":40,"cssClass":"pl-c"}],[{"start":8,"end":91,"cssClass":"pl-c"}],[{"start":8,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":35,"cssClass":"pl-s1"}],[{"start":8,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":8,"end":67,"cssClass":"pl-c"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":29,"end":44,"cssClass":"pl-c"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":29,"end":44,"cssClass":"pl-c"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-c1"}],[{"start":8,"end":61,"cssClass":"pl-c"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"}],[],[{"start":8,"end":14,"cssClass":"pl-k"},{"start":15,"end":16,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":14,"cssClass":"pl-k"},{"start":15,"end":16,"cssClass":"pl-c1"}],[],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":28,"cssClass":"pl-en"},{"start":29,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":43,"end":46,"cssClass":"pl-smi"},{"start":47,"end":52,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":25,"cssClass":"pl-smi"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":27,"end":42,"cssClass":"pl-en"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":46,"end":51,"cssClass":"pl-s1"},{"start":53,"end":67,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":15,"end":19,"cssClass":"pl-c1"},{"start":21,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":43,"cssClass":"pl-s1"},{"start":45,"end":69,"cssClass":"pl-s"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":14,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":30,"cssClass":"pl-en"},{"start":31,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":45,"end":48,"cssClass":"pl-smi"},{"start":49,"end":54,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":40,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":16,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-c1"},{"start":25,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":47,"cssClass":"pl-s1"},{"start":49,"end":95,"cssClass":"pl-s"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":14,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":18,"cssClass":"pl-en"},{"start":19,"end":28,"cssClass":"pl-smi"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":16,"end":18,"cssClass":"pl-c1"},{"start":19,"end":23,"cssClass":"pl-c1"}],[{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":24,"cssClass":"pl-s1"}],[{"start":8,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"}],[],[{"start":4,"end":41,"cssClass":"pl-c"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":42,"cssClass":"pl-en"},{"start":43,"end":46,"cssClass":"pl-s1"},{"start":46,"end":48,"cssClass":"pl-c1"},{"start":48,"end":50,"cssClass":"pl-c1"},{"start":52,"end":57,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":47,"cssClass":"pl-en"},{"start":48,"end":51,"cssClass":"pl-s1"},{"start":51,"end":53,"cssClass":"pl-c1"},{"start":53,"end":55,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":47,"cssClass":"pl-en"},{"start":48,"end":51,"cssClass":"pl-s1"},{"start":51,"end":53,"cssClass":"pl-c1"},{"start":53,"end":55,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":22,"cssClass":"pl-en"},{"start":23,"end":32,"cssClass":"pl-smi"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":34,"end":35,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":27,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":30,"cssClass":"pl-c"}],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":16,"cssClass":"pl-c"}],[{"start":0,"end":48,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":21,"cssClass":"pl-c"}],[{"start":0,"end":36,"cssClass":"pl-c"}],[{"start":0,"end":80,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":32,"cssClass":"pl-smi"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":34,"end":38,"cssClass":"pl-s1"},{"start":40,"end":43,"cssClass":"pl-smi"},{"start":44,"end":49,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":41,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":18,"cssClass":"pl-smi"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-s1"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":21,"cssClass":"pl-s1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":49,"cssClass":"pl-c1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":42,"end":52,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":28,"cssClass":"pl-s1"}],[],[{"start":4,"end":27,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"}],[{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":35,"cssClass":"pl-c1"}],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":16,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"},{"start":29,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":52,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":55,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":22,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":25,"end":34,"cssClass":"pl-c1"}],[],[{"start":8,"end":32,"cssClass":"pl-c"}],[{"start":8,"end":28,"cssClass":"pl-en"},{"start":29,"end":31,"cssClass":"pl-s1"},{"start":31,"end":33,"cssClass":"pl-c1"},{"start":33,"end":35,"cssClass":"pl-c1"},{"start":37,"end":41,"cssClass":"pl-c1"},{"start":43,"end":47,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":42,"cssClass":"pl-c1"}],[{"start":8,"end":63,"cssClass":"pl-c"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"}],[],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":52,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":39,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-s1"},{"start":43,"end":45,"cssClass":"pl-c1"},{"start":45,"end":55,"cssClass":"pl-c1"}],[],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":22,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":25,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":54,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":30,"cssClass":"pl-en"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":34,"end":51,"cssClass":"pl-c1"}],[],[{"start":8,"end":30,"cssClass":"pl-c"}],[{"start":8,"end":28,"cssClass":"pl-en"},{"start":29,"end":31,"cssClass":"pl-s1"},{"start":31,"end":33,"cssClass":"pl-c1"},{"start":33,"end":35,"cssClass":"pl-c1"},{"start":37,"end":53,"cssClass":"pl-s1"},{"start":55,"end":57,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":24,"cssClass":"pl-en"},{"start":25,"end":27,"cssClass":"pl-s1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":33,"end":40,"cssClass":"pl-s1"}],[],[{"start":4,"end":60,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":48,"cssClass":"pl-c1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":51,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":18,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":30,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":34,"cssClass":"pl-c"}],[{"start":0,"end":27,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":12,"cssClass":"pl-c"}],[{"start":0,"end":49,"cssClass":"pl-c"}],[{"start":0,"end":55,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":32,"cssClass":"pl-smi"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":34,"end":38,"cssClass":"pl-s1"},{"start":40,"end":43,"cssClass":"pl-smi"},{"start":44,"end":51,"cssClass":"pl-s1"},{"start":53,"end":57,"cssClass":"pl-smi"},{"start":58,"end":59,"cssClass":"pl-c1"},{"start":59,"end":60,"cssClass":"pl-c1"},{"start":60,"end":64,"cssClass":"pl-s1"},{"start":66,"end":70,"cssClass":"pl-smi"},{"start":71,"end":72,"cssClass":"pl-c1"},{"start":72,"end":73,"cssClass":"pl-c1"},{"start":73,"end":78,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":29,"cssClass":"pl-c1"},{"start":31,"end":53,"cssClass":"pl-c"}],[{"start":4,"end":13,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":20,"end":29,"cssClass":"pl-smi"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":31,"end":35,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":25,"end":47,"cssClass":"pl-c"}],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":25,"end":40,"cssClass":"pl-c"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":30,"cssClass":"pl-s1"},{"start":33,"end":69,"cssClass":"pl-c"}],[],[{"start":4,"end":23,"cssClass":"pl-c"}],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-k"},{"start":9,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":27,"cssClass":"pl-s1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":30,"cssClass":"pl-s1"},{"start":31,"end":32,"cssClass":"pl-s1"},{"start":32,"end":34,"cssClass":"pl-c1"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":27,"end":28,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":23,"cssClass":"pl-c"}],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":23,"cssClass":"pl-c1"}],[{"start":8,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"}],[{"start":8,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":34,"cssClass":"pl-s1"},{"start":36,"end":37,"cssClass":"pl-c1"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":27,"cssClass":"pl-c1"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":8,"end":11,"cssClass":"pl-k"},{"start":13,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-s1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":24,"end":31,"cssClass":"pl-s1"}],[{"start":12,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":35,"cssClass":"pl-s1"},{"start":36,"end":37,"cssClass":"pl-s1"},{"start":37,"end":39,"cssClass":"pl-c1"}],[{"start":12,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":29,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-s1"}],[],[],[],[{"start":4,"end":27,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"}],[],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":4,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-c1"}],[{"start":12,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-c1"}],[{"start":8,"end":12,"cssClass":"pl-k"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":30,"cssClass":"pl-c1"}],[{"start":12,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":39,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":21,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":17,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":18,"cssClass":"pl-en"},{"start":19,"end":28,"cssClass":"pl-smi"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":19,"cssClass":"pl-s1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":24,"cssClass":"pl-en"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"}],[{"start":8,"end":17,"cssClass":"pl-c"}],[{"start":0,"end":32,"cssClass":"pl-c"}],[{"start":0,"end":23,"cssClass":"pl-c"}],[{"start":0,"end":27,"cssClass":"pl-c"}],[{"start":0,"end":37,"cssClass":"pl-c"}],[{"start":0,"end":10,"cssClass":"pl-c"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":42,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":28,"end":72,"cssClass":"pl-c"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":28,"end":70,"cssClass":"pl-c"}],[{"start":8,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":28,"end":53,"cssClass":"pl-c"}],[],[{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":29,"cssClass":"pl-en"},{"start":30,"end":32,"cssClass":"pl-s1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-c1"},{"start":38,"end":41,"cssClass":"pl-s1"},{"start":43,"end":59,"cssClass":"pl-s1"},{"start":61,"end":62,"cssClass":"pl-c1"},{"start":64,"end":68,"cssClass":"pl-c1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":26,"cssClass":"pl-c"}],[{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":29,"cssClass":"pl-en"},{"start":30,"end":32,"cssClass":"pl-s1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-c1"},{"start":38,"end":41,"cssClass":"pl-s1"},{"start":43,"end":47,"cssClass":"pl-c1"},{"start":49,"end":53,"cssClass":"pl-c1"},{"start":55,"end":59,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":18,"cssClass":"pl-c"}],[{"start":0,"end":50,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":31,"cssClass":"pl-smi"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":19,"cssClass":"pl-s1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":28,"cssClass":"pl-en"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":23,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":21,"end":70,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":10,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":21,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":26,"cssClass":"pl-en"},{"start":27,"end":29,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":31,"end":33,"cssClass":"pl-c1"},{"start":35,"end":38,"cssClass":"pl-s1"},{"start":40,"end":47,"cssClass":"pl-s1"},{"start":49,"end":50,"cssClass":"pl-c1"},{"start":50,"end":53,"cssClass":"pl-s1"},{"start":53,"end":55,"cssClass":"pl-c1"},{"start":55,"end":57,"cssClass":"pl-c1"},{"start":59,"end":60,"cssClass":"pl-c1"},{"start":60,"end":67,"cssClass":"pl-s1"},{"start":69,"end":71,"cssClass":"pl-c1"},{"start":72,"end":81,"cssClass":"pl-c1"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"}],[{"start":8,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":42,"cssClass":"pl-en"},{"start":43,"end":45,"cssClass":"pl-s1"},{"start":45,"end":47,"cssClass":"pl-c1"},{"start":47,"end":49,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":28,"cssClass":"pl-s1"},{"start":30,"end":32,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":12,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":27,"end":107,"cssClass":"pl-c"}],[{"start":8,"end":14,"cssClass":"pl-k"},{"start":15,"end":16,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":33,"cssClass":"pl-c"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":35,"cssClass":"pl-smi"},{"start":36,"end":37,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":43,"cssClass":"pl-smi"},{"start":44,"end":50,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":14,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":33,"cssClass":"pl-en"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":37,"end":38,"cssClass":"pl-c1"}],[{"start":4,"end":16,"cssClass":"pl-smi"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":15,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-s1"}],[],[{"start":4,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":26,"cssClass":"pl-s1"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":7,"end":8,"cssClass":"pl-c1"},{"start":9,"end":12,"cssClass":"pl-s1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":16,"cssClass":"pl-c1"},{"start":18,"end":73,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":28,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":32,"end":42,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":49,"end":50,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":16,"cssClass":"pl-c1"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":19,"end":26,"cssClass":"pl-s1"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":29,"end":47,"cssClass":"pl-en"},{"start":48,"end":50,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":17,"cssClass":"pl-c1"},{"start":18,"end":28,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":18,"cssClass":"pl-s1"}],[{"start":12,"end":14,"cssClass":"pl-k"},{"start":16,"end":22,"cssClass":"pl-s1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":26,"end":27,"cssClass":"pl-c1"}],[{"start":16,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":42,"cssClass":"pl-s1"},{"start":44,"end":45,"cssClass":"pl-c1"}],[{"start":16,"end":19,"cssClass":"pl-k"},{"start":21,"end":22,"cssClass":"pl-s1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-s1"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":39,"cssClass":"pl-s1"}],[{"start":20,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":42,"end":43,"cssClass":"pl-s1"}],[{"start":20,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":37,"cssClass":"pl-c1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":42,"cssClass":"pl-s1"}],[],[],[{"start":12,"end":16,"cssClass":"pl-k"}],[{"start":16,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":45,"cssClass":"pl-s1"}],[{"start":16,"end":19,"cssClass":"pl-k"},{"start":21,"end":22,"cssClass":"pl-s1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-s1"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":39,"cssClass":"pl-s1"},{"start":41,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-s1"}],[{"start":20,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":57,"cssClass":"pl-en"},{"start":58,"end":60,"cssClass":"pl-s1"},{"start":62,"end":63,"cssClass":"pl-s1"}],[{"start":20,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":40,"cssClass":"pl-s1"},{"start":42,"end":43,"cssClass":"pl-s1"}],[{"start":20,"end":30,"cssClass":"pl-en"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-c1"}],[],[],[{"start":12,"end":18,"cssClass":"pl-k"},{"start":19,"end":20,"cssClass":"pl-c1"}],[],[{"start":8,"end":12,"cssClass":"pl-k"}],[{"start":12,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":37,"cssClass":"pl-s1"}],[{"start":12,"end":15,"cssClass":"pl-k"},{"start":17,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-s1"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":28,"end":35,"cssClass":"pl-s1"},{"start":37,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-s1"}],[{"start":16,"end":30,"cssClass":"pl-en"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-s1"},{"start":38,"end":39,"cssClass":"pl-s1"}],[{"start":12,"end":18,"cssClass":"pl-k"},{"start":19,"end":22,"cssClass":"pl-s1"},{"start":22,"end":24,"cssClass":"pl-c1"},{"start":24,"end":31,"cssClass":"pl-c1"}],[],[],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":17,"cssClass":"pl-c1"}],[{"start":8,"end":43,"cssClass":"pl-c"}],[{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":33,"cssClass":"pl-en"},{"start":34,"end":36,"cssClass":"pl-s1"}],[{"start":8,"end":11,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":13,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":18,"end":22,"cssClass":"pl-c1"}],[{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":24,"cssClass":"pl-s1"}],[],[{"start":4,"end":8,"cssClass":"pl-k"},{"start":9,"end":11,"cssClass":"pl-k"},{"start":13,"end":19,"cssClass":"pl-s1"},{"start":20,"end":22,"cssClass":"pl-c1"},{"start":23,"end":34,"cssClass":"pl-c1"}],[{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":17,"end":30,"cssClass":"pl-en"},{"start":31,"end":33,"cssClass":"pl-s1"}],[],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-s1"},{"start":15,"end":17,"cssClass":"pl-c1"},{"start":18,"end":27,"cssClass":"pl-c1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":40,"cssClass":"pl-en"},{"start":41,"end":44,"cssClass":"pl-s1"},{"start":44,"end":46,"cssClass":"pl-c1"},{"start":46,"end":48,"cssClass":"pl-c1"},{"start":48,"end":50,"cssClass":"pl-c1"},{"start":50,"end":52,"cssClass":"pl-c1"}],[{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":22,"cssClass":"pl-en"},{"start":23,"end":32,"cssClass":"pl-smi"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":34,"end":35,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":29,"cssClass":"pl-en"},{"start":30,"end":39,"cssClass":"pl-smi"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":41,"end":42,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":28,"cssClass":"pl-en"},{"start":29,"end":38,"cssClass":"pl-smi"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":30,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":23,"cssClass":"pl-en"},{"start":24,"end":33,"cssClass":"pl-smi"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-s1"},{"start":46,"end":55,"cssClass":"pl-smi"},{"start":56,"end":57,"cssClass":"pl-c1"}],[{"start":4,"end":24,"cssClass":"pl-c"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"}],[{"start":4,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-s1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":20,"cssClass":"pl-en"},{"start":21,"end":30,"cssClass":"pl-smi"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":45,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":31,"cssClass":"pl-smi"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":44,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":31,"cssClass":"pl-smi"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":23,"cssClass":"pl-en"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":27,"end":38,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":31,"cssClass":"pl-smi"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":36,"end":39,"cssClass":"pl-smi"},{"start":40,"end":41,"cssClass":"pl-c1"},{"start":41,"end":42,"cssClass":"pl-s1"},{"start":44,"end":53,"cssClass":"pl-smi"},{"start":54,"end":55,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":19,"cssClass":"pl-s1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-smi"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":12,"end":15,"cssClass":"pl-s1"}],[],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":32,"end":79,"cssClass":"pl-c"}],[],[],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":10,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":21,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-s1"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":9,"end":13,"cssClass":"pl-c1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":26,"cssClass":"pl-en"},{"start":27,"end":29,"cssClass":"pl-s1"},{"start":29,"end":31,"cssClass":"pl-c1"},{"start":31,"end":33,"cssClass":"pl-c1"},{"start":35,"end":38,"cssClass":"pl-s1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":45,"end":48,"cssClass":"pl-s1"},{"start":48,"end":50,"cssClass":"pl-c1"},{"start":50,"end":52,"cssClass":"pl-c1"},{"start":54,"end":58,"cssClass":"pl-c1"},{"start":60,"end":62,"cssClass":"pl-c1"},{"start":63,"end":72,"cssClass":"pl-c1"}],[{"start":8,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":40,"cssClass":"pl-en"},{"start":41,"end":44,"cssClass":"pl-s1"},{"start":44,"end":46,"cssClass":"pl-c1"},{"start":46,"end":48,"cssClass":"pl-c1"},{"start":48,"end":50,"cssClass":"pl-c1"},{"start":50,"end":52,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":28,"cssClass":"pl-s1"},{"start":30,"end":32,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":12,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":27,"end":107,"cssClass":"pl-c"}],[{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":8,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":8,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":27,"end":50,"cssClass":"pl-c"}],[],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":17,"cssClass":"pl-s1"},{"start":18,"end":20,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"},{"start":26,"end":37,"cssClass":"pl-en"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":41,"end":42,"cssClass":"pl-c1"}],[{"start":12,"end":15,"cssClass":"pl-smi"},{"start":16,"end":22,"cssClass":"pl-s1"}],[{"start":12,"end":14,"cssClass":"pl-k"},{"start":17,"end":23,"cssClass":"pl-s1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":48,"cssClass":"pl-en"},{"start":50,"end":51,"cssClass":"pl-c1"},{"start":53,"end":54,"cssClass":"pl-c1"},{"start":56,"end":61,"cssClass":"pl-s1"},{"start":63,"end":66,"cssClass":"pl-s1"},{"start":66,"end":68,"cssClass":"pl-c1"},{"start":68,"end":70,"cssClass":"pl-c1"},{"start":73,"end":75,"cssClass":"pl-c1"},{"start":76,"end":85,"cssClass":"pl-c1"}],[{"start":16,"end":30,"cssClass":"pl-en"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":34,"end":48,"cssClass":"pl-en"},{"start":49,"end":55,"cssClass":"pl-s1"}],[{"start":16,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":32,"cssClass":"pl-s1"}],[{"start":16,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"}],[],[{"start":10,"end":14,"cssClass":"pl-k"},{"start":15,"end":17,"cssClass":"pl-k"},{"start":19,"end":24,"cssClass":"pl-s1"},{"start":25,"end":27,"cssClass":"pl-c1"},{"start":28,"end":56,"cssClass":"pl-en"},{"start":57,"end":60,"cssClass":"pl-s1"},{"start":60,"end":62,"cssClass":"pl-c1"},{"start":62,"end":64,"cssClass":"pl-c1"}],[{"start":12,"end":15,"cssClass":"pl-smi"},{"start":16,"end":22,"cssClass":"pl-s1"},{"start":24,"end":25,"cssClass":"pl-s1"}],[{"start":12,"end":15,"cssClass":"pl-k"},{"start":17,"end":18,"cssClass":"pl-s1"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":25,"cssClass":"pl-s1"},{"start":29,"end":34,"cssClass":"pl-s1"},{"start":36,"end":37,"cssClass":"pl-s1"},{"start":37,"end":39,"cssClass":"pl-c1"}],[{"start":16,"end":18,"cssClass":"pl-k"},{"start":21,"end":27,"cssClass":"pl-s1"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":30,"end":45,"cssClass":"pl-en"},{"start":46,"end":47,"cssClass":"pl-c1"},{"start":49,"end":52,"cssClass":"pl-s1"},{"start":52,"end":54,"cssClass":"pl-c1"},{"start":54,"end":56,"cssClass":"pl-c1"},{"start":58,"end":59,"cssClass":"pl-s1"},{"start":61,"end":62,"cssClass":"pl-s1"},{"start":63,"end":64,"cssClass":"pl-c1"},{"start":65,"end":66,"cssClass":"pl-c1"},{"start":69,"end":71,"cssClass":"pl-c1"},{"start":72,"end":81,"cssClass":"pl-c1"}],[{"start":20,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":52,"cssClass":"pl-en"},{"start":53,"end":59,"cssClass":"pl-s1"}],[{"start":20,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":36,"cssClass":"pl-s1"}],[{"start":20,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"}],[],[],[{"start":10,"end":14,"cssClass":"pl-k"}],[{"start":12,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":84,"cssClass":"pl-s"}],[{"start":16,"end":44,"cssClass":"pl-en"},{"start":45,"end":48,"cssClass":"pl-s1"},{"start":48,"end":50,"cssClass":"pl-c1"},{"start":50,"end":52,"cssClass":"pl-c1"},{"start":55,"end":60,"cssClass":"pl-s1"}],[],[{"start":8,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":24,"cssClass":"pl-s1"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-s1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":18,"cssClass":"pl-en"},{"start":19,"end":28,"cssClass":"pl-smi"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":43,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":19,"cssClass":"pl-en"},{"start":20,"end":29,"cssClass":"pl-smi"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":42,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":33,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":19,"cssClass":"pl-en"},{"start":20,"end":29,"cssClass":"pl-smi"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":36,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":22,"cssClass":"pl-en"},{"start":23,"end":32,"cssClass":"pl-smi"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":34,"end":35,"cssClass":"pl-c1"}],[{"start":4,"end":8,"cssClass":"pl-smi"},{"start":9,"end":13,"cssClass":"pl-s1"},{"start":14,"end":16,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":15,"end":17,"cssClass":"pl-c1"},{"start":18,"end":22,"cssClass":"pl-c1"}],[{"start":8,"end":14,"cssClass":"pl-en"},{"start":15,"end":19,"cssClass":"pl-s1"},{"start":21,"end":29,"cssClass":"pl-s"}],[{"start":4,"end":8,"cssClass":"pl-k"}],[{"start":8,"end":15,"cssClass":"pl-en"},{"start":16,"end":20,"cssClass":"pl-s1"},{"start":22,"end":26,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-en"},{"start":43,"end":44,"cssClass":"pl-c1"},{"start":46,"end":47,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":45,"cssClass":"pl-s"},{"start":47,"end":51,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":19,"cssClass":"pl-en"},{"start":20,"end":29,"cssClass":"pl-smi"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":32,"cssClass":"pl-en"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":22,"cssClass":"pl-en"},{"start":23,"end":32,"cssClass":"pl-smi"},{"start":33,"end":34,"cssClass":"pl-c1"},{"start":34,"end":35,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":40,"cssClass":"pl-c"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":12,"cssClass":"pl-s1"},{"start":13,"end":14,"cssClass":"pl-c1"},{"start":15,"end":28,"cssClass":"pl-en"},{"start":29,"end":30,"cssClass":"pl-c1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[],[{"start":4,"end":42,"cssClass":"pl-c"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-s1"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":35,"cssClass":"pl-c1"}],[],[{"start":4,"end":32,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":11,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":25,"cssClass":"pl-c1"}],[{"start":8,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":19,"cssClass":"pl-s1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":36,"cssClass":"pl-en"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":42,"cssClass":"pl-c1"},{"start":45,"end":73,"cssClass":"pl-c"}],[],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":14,"end":18,"cssClass":"pl-s1"},{"start":19,"end":21,"cssClass":"pl-c1"},{"start":22,"end":25,"cssClass":"pl-s1"},{"start":25,"end":27,"cssClass":"pl-c1"},{"start":27,"end":31,"cssClass":"pl-c1"},{"start":33,"end":35,"cssClass":"pl-c1"},{"start":36,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-c1"}],[],[{"start":12,"end":28,"cssClass":"pl-en"},{"start":29,"end":32,"cssClass":"pl-s1"},{"start":32,"end":34,"cssClass":"pl-c1"},{"start":34,"end":36,"cssClass":"pl-c1"}],[{"start":12,"end":15,"cssClass":"pl-s1"},{"start":15,"end":17,"cssClass":"pl-c1"},{"start":17,"end":19,"cssClass":"pl-c1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":26,"cssClass":"pl-c1"}],[],[],[{"start":8,"end":36,"cssClass":"pl-c"}],[{"start":8,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":20,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":23,"cssClass":"pl-c"}],[{"start":0,"end":83,"cssClass":"pl-c"}],[{"start":0,"end":85,"cssClass":"pl-c"}],[{"start":0,"end":70,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":21,"cssClass":"pl-en"},{"start":22,"end":31,"cssClass":"pl-smi"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":29,"cssClass":"pl-en"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":33,"end":34,"cssClass":"pl-c1"}],[{"start":4,"end":25,"cssClass":"pl-en"},{"start":26,"end":27,"cssClass":"pl-c1"},{"start":29,"end":31,"cssClass":"pl-s1"},{"start":31,"end":33,"cssClass":"pl-c1"},{"start":33,"end":35,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":16,"cssClass":"pl-en"},{"start":17,"end":26,"cssClass":"pl-smi"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":28,"end":29,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":10,"cssClass":"pl-s1"},{"start":10,"end":12,"cssClass":"pl-c1"},{"start":12,"end":14,"cssClass":"pl-c1"},{"start":15,"end":17,"cssClass":"pl-c1"},{"start":18,"end":22,"cssClass":"pl-c1"},{"start":25,"end":54,"cssClass":"pl-c"}],[{"start":8,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":23,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":28,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":40,"cssClass":"pl-en"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":37,"cssClass":"pl-smi"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":19,"cssClass":"pl-s1"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":22,"end":38,"cssClass":"pl-en"},{"start":39,"end":40,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":39,"cssClass":"pl-en"},{"start":40,"end":43,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-s1"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":33,"cssClass":"pl-en"},{"start":34,"end":43,"cssClass":"pl-smi"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":23,"cssClass":"pl-s1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":48,"cssClass":"pl-s1"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":9,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":24,"cssClass":"pl-c1"}],[{"start":8,"end":13,"cssClass":"pl-k"},{"start":14,"end":18,"cssClass":"pl-smi"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-s1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":27,"end":41,"cssClass":"pl-en"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"},{"start":48,"end":52,"cssClass":"pl-c1"}],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":34,"cssClass":"pl-s1"}],[{"start":12,"end":24,"cssClass":"pl-en"},{"start":26,"end":30,"cssClass":"pl-smi"},{"start":30,"end":31,"cssClass":"pl-c1"},{"start":32,"end":54,"cssClass":"pl-s1"}],[],[{"start":8,"end":10,"cssClass":"pl-k"},{"start":12,"end":16,"cssClass":"pl-s1"}],[{"start":12,"end":34,"cssClass":"pl-s1"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":37,"end":52,"cssClass":"pl-en"},{"start":53,"end":57,"cssClass":"pl-s"},{"start":59,"end":63,"cssClass":"pl-s1"}],[],[{"start":8,"end":12,"cssClass":"pl-k"}],[{"start":12,"end":34,"cssClass":"pl-s1"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":37,"end":41,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":12,"end":31,"cssClass":"pl-c1"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":33,"cssClass":"pl-en"},{"start":34,"end":43,"cssClass":"pl-smi"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":45,"end":46,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-s1"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":20,"end":36,"cssClass":"pl-en"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":40,"end":41,"cssClass":"pl-c1"}],[{"start":4,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-s1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":36,"cssClass":"pl-smi"},{"start":37,"end":38,"cssClass":"pl-c1"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":41,"end":46,"cssClass":"pl-k"},{"start":47,"end":51,"cssClass":"pl-smi"},{"start":52,"end":53,"cssClass":"pl-c1"},{"start":53,"end":61,"cssClass":"pl-s1"},{"start":63,"end":66,"cssClass":"pl-smi"},{"start":67,"end":72,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":14,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":24,"end":55,"cssClass":"pl-c"}],[],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":20,"cssClass":"pl-en"},{"start":21,"end":29,"cssClass":"pl-s1"},{"start":31,"end":32,"cssClass":"pl-c1"},{"start":32,"end":34,"cssClass":"pl-s1"},{"start":34,"end":36,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-c1"},{"start":40,"end":45,"cssClass":"pl-s1"},{"start":47,"end":49,"cssClass":"pl-c1"},{"start":50,"end":59,"cssClass":"pl-c1"}],[{"start":8,"end":62,"cssClass":"pl-c"}],[{"start":8,"end":14,"cssClass":"pl-k"},{"start":15,"end":16,"cssClass":"pl-c1"}],[],[],[{"start":4,"end":33,"cssClass":"pl-c"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":48,"end":62,"cssClass":"pl-c"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":38,"cssClass":"pl-en"},{"start":39,"end":41,"cssClass":"pl-s1"},{"start":41,"end":43,"cssClass":"pl-c1"},{"start":43,"end":45,"cssClass":"pl-c1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":36,"cssClass":"pl-en"},{"start":37,"end":39,"cssClass":"pl-s1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":41,"end":43,"cssClass":"pl-c1"},{"start":48,"end":72,"cssClass":"pl-c"}],[],[{"start":4,"end":25,"cssClass":"pl-c"}],[{"start":4,"end":13,"cssClass":"pl-en"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":17,"end":19,"cssClass":"pl-s1"}],[],[{"start":4,"end":16,"cssClass":"pl-c"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":23,"cssClass":"pl-en"},{"start":24,"end":33,"cssClass":"pl-smi"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":16,"end":24,"cssClass":"pl-s1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":27,"end":43,"cssClass":"pl-en"},{"start":44,"end":45,"cssClass":"pl-c1"},{"start":47,"end":48,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":31,"cssClass":"pl-en"},{"start":32,"end":33,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":59,"cssClass":"pl-c1"},{"start":62,"end":80,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":38,"cssClass":"pl-s1"},{"start":40,"end":45,"cssClass":"pl-s1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":30,"cssClass":"pl-en"},{"start":31,"end":40,"cssClass":"pl-smi"},{"start":41,"end":42,"cssClass":"pl-c1"},{"start":42,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":40,"cssClass":"pl-s"},{"start":42,"end":63,"cssClass":"pl-c1"},{"start":66,"end":84,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":23,"cssClass":"pl-c"}],[{"start":0,"end":83,"cssClass":"pl-c"}],[{"start":0,"end":85,"cssClass":"pl-c"}],[{"start":0,"end":64,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":37,"cssClass":"pl-smi"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-c1"}],[{"start":4,"end":11,"cssClass":"pl-smi"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":13,"end":19,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":9,"cssClass":"pl-c1"},{"start":9,"end":11,"cssClass":"pl-s1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":10,"cssClass":"pl-s1"}],[],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":43,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-s1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":4,"end":79,"cssClass":"pl-c"}],[{"start":0,"end":70,"cssClass":"pl-c"}],[{"start":0,"end":20,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":7,"end":8,"cssClass":"pl-c1"},{"start":9,"end":21,"cssClass":"pl-en"},{"start":22,"end":28,"cssClass":"pl-s1"},{"start":30,"end":34,"cssClass":"pl-c1"},{"start":36,"end":40,"cssClass":"pl-c1"},{"start":42,"end":46,"cssClass":"pl-c1"},{"start":48,"end":52,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-k"},{"start":8,"end":10,"cssClass":"pl-s1"},{"start":11,"end":13,"cssClass":"pl-c1"},{"start":14,"end":23,"cssClass":"pl-c1"}],[{"start":8,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":26,"cssClass":"pl-c1"},{"start":28,"end":57,"cssClass":"pl-s"}],[],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":7,"end":8,"cssClass":"pl-c1"},{"start":9,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":19,"end":50,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-s1"},{"start":6,"end":8,"cssClass":"pl-c1"},{"start":8,"end":10,"cssClass":"pl-c1"},{"start":11,"end":12,"cssClass":"pl-c1"},{"start":13,"end":19,"cssClass":"pl-s1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":37,"cssClass":"pl-smi"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-c1"}],[{"start":4,"end":19,"cssClass":"pl-en"},{"start":20,"end":21,"cssClass":"pl-c1"},{"start":23,"end":57,"cssClass":"pl-s"}],[{"start":4,"end":13,"cssClass":"pl-en"},{"start":14,"end":15,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":23,"cssClass":"pl-c1"}],[{"start":0,"end":56,"cssClass":"pl-c"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":23,"cssClass":"pl-c1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":0,"end":33,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":10,"cssClass":"pl-smi"},{"start":11,"end":27,"cssClass":"pl-en"},{"start":28,"end":37,"cssClass":"pl-smi"},{"start":38,"end":39,"cssClass":"pl-c1"},{"start":39,"end":40,"cssClass":"pl-c1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":37,"cssClass":"pl-c1"}],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":2,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":21,"cssClass":"pl-c"}],[{"start":0,"end":58,"cssClass":"pl-c"}],[{"start":0,"end":2,"cssClass":"pl-c"}],[],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":10,"cssClass":"pl-en"},{"start":11,"end":12,"cssClass":"pl-s1"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":11,"cssClass":"pl-en"},{"start":12,"end":13,"cssClass":"pl-s1"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":19,"cssClass":"pl-k"}],[{"start":4,"end":9,"cssClass":"pl-k"},{"start":10,"end":14,"cssClass":"pl-smi"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":20,"cssClass":"pl-c1"}],[{"start":4,"end":7,"cssClass":"pl-smi"},{"start":8,"end":13,"cssClass":"pl-c1"}],[{"start":2,"end":18,"cssClass":"pl-s1"},{"start":21,"end":22,"cssClass":"pl-c1"}],[{"start":4,"end":21,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":9,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-en"},{"start":23,"end":28,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-en"},{"start":39,"end":47,"cssClass":"pl-c1"},{"start":52,"end":54,"cssClass":"pl-en"},{"start":55,"end":59,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":12,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-en"},{"start":23,"end":27,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-en"},{"start":39,"end":45,"cssClass":"pl-c1"},{"start":52,"end":54,"cssClass":"pl-en"},{"start":55,"end":60,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":15,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-en"},{"start":23,"end":32,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-en"},{"start":39,"end":44,"cssClass":"pl-c1"},{"start":52,"end":54,"cssClass":"pl-en"},{"start":55,"end":62,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":15,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-en"},{"start":23,"end":27,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-en"},{"start":39,"end":47,"cssClass":"pl-c1"},{"start":52,"end":54,"cssClass":"pl-en"},{"start":55,"end":63,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":12,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-en"},{"start":23,"end":29,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-en"},{"start":39,"end":45,"cssClass":"pl-c1"},{"start":52,"end":54,"cssClass":"pl-en"},{"start":55,"end":65,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":15,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-en"},{"start":23,"end":29,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-en"},{"start":39,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":13,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-en"},{"start":23,"end":29,"cssClass":"pl-c1"}],[],[{"start":4,"end":44,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":12,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-en"},{"start":23,"end":26,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-en"},{"start":39,"end":43,"cssClass":"pl-c1"}],[],[{"start":4,"end":22,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":14,"cssClass":"pl-c1"},{"start":20,"end":22,"cssClass":"pl-en"},{"start":23,"end":28,"cssClass":"pl-c1"},{"start":36,"end":38,"cssClass":"pl-en"},{"start":39,"end":43,"cssClass":"pl-c1"},{"start":52,"end":54,"cssClass":"pl-en"},{"start":55,"end":59,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":11,"cssClass":"pl-c1"}],[],[{"start":4,"end":33,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":19,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":19,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":26,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":23,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":21,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":13,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":17,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":22,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":22,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":24,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":21,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":19,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":16,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":13,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":13,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":11,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":13,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":13,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":13,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":13,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":14,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":14,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":20,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":15,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":16,"cssClass":"pl-c1"}],[],[{"start":4,"end":25,"cssClass":"pl-c"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":20,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":21,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":15,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":18,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":19,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":21,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":23,"cssClass":"pl-c1"}],[{"start":4,"end":6,"cssClass":"pl-en"},{"start":7,"end":24,"cssClass":"pl-c1"}],[],[{"start":4,"end":20,"cssClass":"pl-c"}],[{"start":6,"end":10,"cssClass":"pl-c1"},{"start":12,"end":13,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":61,"cssClass":"pl-c"}],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":21,"cssClass":"pl-smi"},{"start":22,"end":27,"cssClass":"pl-s1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":5,"end":13,"cssClass":"pl-s"},{"start":28,"end":37,"cssClass":"pl-s1"}],[{"start":5,"end":24,"cssClass":"pl-s"},{"start":28,"end":48,"cssClass":"pl-s1"}],[{"start":5,"end":14,"cssClass":"pl-s"},{"start":28,"end":38,"cssClass":"pl-s1"}],[{"start":5,"end":20,"cssClass":"pl-s"},{"start":28,"end":44,"cssClass":"pl-s1"}],[{"start":5,"end":14,"cssClass":"pl-s"},{"start":28,"end":38,"cssClass":"pl-s1"}],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":28,"end":38,"cssClass":"pl-s1"}],[{"start":5,"end":13,"cssClass":"pl-s"},{"start":28,"end":37,"cssClass":"pl-s1"}],[{"start":5,"end":20,"cssClass":"pl-s"},{"start":28,"end":37,"cssClass":"pl-s1"}],[{"start":5,"end":16,"cssClass":"pl-s"},{"start":28,"end":40,"cssClass":"pl-s1"}],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-s1"}],[],[{"start":5,"end":22,"cssClass":"pl-s"},{"start":28,"end":46,"cssClass":"pl-s1"}],[{"start":5,"end":23,"cssClass":"pl-s"},{"start":28,"end":47,"cssClass":"pl-s1"}],[{"start":5,"end":23,"cssClass":"pl-s"},{"start":28,"end":47,"cssClass":"pl-s1"}],[{"start":5,"end":21,"cssClass":"pl-s"},{"start":28,"end":45,"cssClass":"pl-s1"}],[],[{"start":5,"end":12,"cssClass":"pl-s"},{"start":28,"end":36,"cssClass":"pl-s1"}],[{"start":5,"end":23,"cssClass":"pl-s"},{"start":28,"end":47,"cssClass":"pl-s1"}],[{"start":5,"end":19,"cssClass":"pl-s"},{"start":28,"end":43,"cssClass":"pl-s1"}],[{"start":5,"end":19,"cssClass":"pl-s"},{"start":28,"end":43,"cssClass":"pl-s1"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":5,"end":12,"cssClass":"pl-en"},{"start":13,"end":37,"cssClass":"pl-c1"},{"start":39,"end":41,"cssClass":"pl-c1"},{"start":43,"end":67,"cssClass":"pl-c1"}],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-s1"}],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-s1"}],[{"start":5,"end":20,"cssClass":"pl-s"},{"start":28,"end":44,"cssClass":"pl-s1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[],[{"start":5,"end":14,"cssClass":"pl-s"},{"start":28,"end":38,"cssClass":"pl-s1"}],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":28,"end":35,"cssClass":"pl-s1"}],[{"start":5,"end":12,"cssClass":"pl-s"},{"start":28,"end":36,"cssClass":"pl-s1"}],[{"start":5,"end":12,"cssClass":"pl-s"},{"start":28,"end":36,"cssClass":"pl-s1"}],[],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":28,"end":35,"cssClass":"pl-s1"}],[{"start":5,"end":14,"cssClass":"pl-s"},{"start":28,"end":35,"cssClass":"pl-s1"}],[{"start":5,"end":12,"cssClass":"pl-s"},{"start":28,"end":36,"cssClass":"pl-s1"}],[{"start":5,"end":15,"cssClass":"pl-s"},{"start":28,"end":39,"cssClass":"pl-s1"}],[{"start":5,"end":14,"cssClass":"pl-s"},{"start":28,"end":38,"cssClass":"pl-s1"}],[],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":28,"end":39,"cssClass":"pl-s1"}],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":28,"end":33,"cssClass":"pl-s1"}],[],[{"start":5,"end":9,"cssClass":"pl-c1"},{"start":11,"end":15,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":21,"cssClass":"pl-smi"},{"start":22,"end":27,"cssClass":"pl-s1"},{"start":30,"end":31,"cssClass":"pl-c1"}],[{"start":5,"end":13,"cssClass":"pl-s"},{"start":28,"end":39,"cssClass":"pl-s1"}],[],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":28,"end":37,"cssClass":"pl-s1"}],[{"start":5,"end":12,"cssClass":"pl-s"},{"start":28,"end":38,"cssClass":"pl-s1"}],[{"start":5,"end":15,"cssClass":"pl-s"},{"start":28,"end":41,"cssClass":"pl-s1"}],[],[{"start":5,"end":14,"cssClass":"pl-s"},{"start":28,"end":40,"cssClass":"pl-s1"}],[],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":28,"end":37,"cssClass":"pl-s1"}],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":28,"end":44,"cssClass":"pl-s1"}],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":28,"end":43,"cssClass":"pl-s1"}],[{"start":5,"end":16,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-s1"}],[{"start":5,"end":27,"cssClass":"pl-s"},{"start":28,"end":53,"cssClass":"pl-s1"}],[{"start":5,"end":26,"cssClass":"pl-s"},{"start":28,"end":52,"cssClass":"pl-s1"}],[],[{"start":5,"end":16,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-s1"}],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":28,"end":43,"cssClass":"pl-s1"}],[{"start":5,"end":15,"cssClass":"pl-s"},{"start":28,"end":41,"cssClass":"pl-s1"}],[{"start":5,"end":16,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-s1"}],[{"start":5,"end":15,"cssClass":"pl-s"},{"start":28,"end":41,"cssClass":"pl-s1"}],[{"start":5,"end":16,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-s1"}],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":28,"end":44,"cssClass":"pl-s1"}],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":28,"end":43,"cssClass":"pl-s1"}],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":28,"end":43,"cssClass":"pl-s1"}],[],[{"start":5,"end":23,"cssClass":"pl-s"},{"start":28,"end":49,"cssClass":"pl-s1"}],[{"start":5,"end":22,"cssClass":"pl-s"},{"start":28,"end":48,"cssClass":"pl-s1"}],[],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":28,"end":37,"cssClass":"pl-s1"}],[{"start":5,"end":12,"cssClass":"pl-s"},{"start":28,"end":38,"cssClass":"pl-s1"}],[{"start":5,"end":12,"cssClass":"pl-s"},{"start":28,"end":38,"cssClass":"pl-s1"}],[],[{"start":5,"end":24,"cssClass":"pl-s"},{"start":28,"end":50,"cssClass":"pl-s1"}],[],[{"start":4,"end":48,"cssClass":"pl-c"}],[{"start":5,"end":12,"cssClass":"pl-s"},{"start":28,"end":43,"cssClass":"pl-s1"}],[{"start":5,"end":13,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-s1"}],[{"start":5,"end":13,"cssClass":"pl-s"},{"start":28,"end":42,"cssClass":"pl-s1"}],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":28,"end":49,"cssClass":"pl-s1"}],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":28,"end":48,"cssClass":"pl-s1"}],[],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":28,"end":41,"cssClass":"pl-s1"}],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":28,"end":35,"cssClass":"pl-s1"}],[],[{"start":6,"end":10,"cssClass":"pl-c1"},{"start":12,"end":16,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":21,"cssClass":"pl-smi"},{"start":22,"end":28,"cssClass":"pl-s1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[{"start":5,"end":16,"cssClass":"pl-s"},{"start":32,"end":50,"cssClass":"pl-s1"}],[],[{"start":5,"end":25,"cssClass":"pl-s"},{"start":32,"end":62,"cssClass":"pl-s1"}],[{"start":5,"end":25,"cssClass":"pl-s"},{"start":32,"end":62,"cssClass":"pl-s1"}],[{"start":5,"end":22,"cssClass":"pl-s"},{"start":32,"end":56,"cssClass":"pl-s1"}],[],[{"start":5,"end":13,"cssClass":"pl-s"},{"start":32,"end":47,"cssClass":"pl-s1"}],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":32,"end":52,"cssClass":"pl-s1"}],[{"start":5,"end":20,"cssClass":"pl-s"},{"start":32,"end":54,"cssClass":"pl-s1"}],[{"start":5,"end":20,"cssClass":"pl-s"},{"start":32,"end":54,"cssClass":"pl-s1"}],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":32,"end":51,"cssClass":"pl-s1"}],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":32,"end":52,"cssClass":"pl-s1"}],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":32,"end":52,"cssClass":"pl-s1"}],[{"start":5,"end":19,"cssClass":"pl-s"},{"start":32,"end":53,"cssClass":"pl-s1"}],[],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":32,"end":49,"cssClass":"pl-s1"}],[{"start":5,"end":9,"cssClass":"pl-c1"},{"start":11,"end":15,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":21,"cssClass":"pl-smi"},{"start":22,"end":29,"cssClass":"pl-s1"},{"start":32,"end":33,"cssClass":"pl-c1"}],[],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":20,"end":29,"cssClass":"pl-s1"}],[{"start":5,"end":16,"cssClass":"pl-s"},{"start":20,"end":34,"cssClass":"pl-s1"}],[{"start":5,"end":16,"cssClass":"pl-s"},{"start":20,"end":34,"cssClass":"pl-s1"}],[{"start":5,"end":13,"cssClass":"pl-s"},{"start":20,"end":31,"cssClass":"pl-s1"}],[],[{"start":0,"end":43,"cssClass":"pl-c"}],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":20,"end":27,"cssClass":"pl-s1"}],[{"start":5,"end":9,"cssClass":"pl-c1"},{"start":11,"end":15,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":12,"cssClass":"pl-k"},{"start":13,"end":21,"cssClass":"pl-smi"},{"start":22,"end":31,"cssClass":"pl-s1"},{"start":34,"end":35,"cssClass":"pl-c1"}],[{"start":5,"end":15,"cssClass":"pl-s"},{"start":24,"end":40,"cssClass":"pl-s1"}],[{"start":5,"end":14,"cssClass":"pl-s"},{"start":24,"end":39,"cssClass":"pl-s1"}],[{"start":5,"end":15,"cssClass":"pl-s"},{"start":24,"end":40,"cssClass":"pl-s1"}],[{"start":0,"end":7,"cssClass":"pl-k"},{"start":8,"end":14,"cssClass":"pl-s1"}],[{"start":5,"end":21,"cssClass":"pl-s"},{"start":24,"end":46,"cssClass":"pl-s1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":0,"end":3,"cssClass":"pl-k"},{"start":12,"end":31,"cssClass":"pl-c1"}],[{"start":5,"end":21,"cssClass":"pl-s"},{"start":24,"end":46,"cssClass":"pl-s1"}],[{"start":0,"end":6,"cssClass":"pl-k"}],[{"start":5,"end":11,"cssClass":"pl-s"},{"start":24,"end":36,"cssClass":"pl-s1"}],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":24,"end":43,"cssClass":"pl-s1"}],[{"start":5,"end":15,"cssClass":"pl-s"},{"start":24,"end":40,"cssClass":"pl-s1"}],[],[{"start":5,"end":18,"cssClass":"pl-s"},{"start":24,"end":43,"cssClass":"pl-s1"}],[],[{"start":5,"end":17,"cssClass":"pl-s"},{"start":24,"end":40,"cssClass":"pl-s1"}],[{"start":5,"end":9,"cssClass":"pl-c1"},{"start":11,"end":15,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":6,"cssClass":"pl-k"},{"start":7,"end":11,"cssClass":"pl-smi"},{"start":12,"end":23,"cssClass":"pl-en"},{"start":24,"end":33,"cssClass":"pl-smi"},{"start":34,"end":35,"cssClass":"pl-c1"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":43,"cssClass":"pl-k"},{"start":44,"end":48,"cssClass":"pl-smi"},{"start":49,"end":50,"cssClass":"pl-c1"},{"start":50,"end":54,"cssClass":"pl-s1"},{"start":56,"end":61,"cssClass":"pl-k"},{"start":62,"end":70,"cssClass":"pl-smi"},{"start":71,"end":72,"cssClass":"pl-c1"},{"start":72,"end":75,"cssClass":"pl-s1"}],[{"start":4,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":29,"cssClass":"pl-s1"}],[{"start":4,"end":18,"cssClass":"pl-en"},{"start":19,"end":20,"cssClass":"pl-c1"},{"start":22,"end":31,"cssClass":"pl-s"}],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":23,"cssClass":"pl-c1"},{"start":40,"end":60,"cssClass":"pl-c"}],[{"start":4,"end":14,"cssClass":"pl-en"},{"start":15,"end":16,"cssClass":"pl-c1"},{"start":18,"end":20,"cssClass":"pl-c1"},{"start":40,"end":75,"cssClass":"pl-c"}],[],[{"start":4,"end":38,"cssClass":"pl-c"}],[{"start":4,"end":16,"cssClass":"pl-en"},{"start":17,"end":18,"cssClass":"pl-c1"},{"start":20,"end":24,"cssClass":"pl-c1"},{"start":26,"end":29,"cssClass":"pl-s1"},{"start":31,"end":32,"cssClass":"pl-c1"}],[],[{"start":4,"end":37,"cssClass":"pl-c"}],[{"start":4,"end":11,"cssClass":"pl-en"},{"start":12,"end":13,"cssClass":"pl-c1"},{"start":15,"end":16,"cssClass":"pl-c1"}],[],[],[{"start":0,"end":10,"cssClass":"pl-smi"},{"start":11,"end":14,"cssClass":"pl-s1"},{"start":15,"end":31,"cssClass":"pl-en"},{"start":32,"end":41,"cssClass":"pl-smi"},{"start":42,"end":43,"cssClass":"pl-c1"},{"start":43,"end":44,"cssClass":"pl-c1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":30,"cssClass":"pl-s1"},{"start":32,"end":37,"cssClass":"pl-s1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":33,"cssClass":"pl-s1"},{"start":35,"end":40,"cssClass":"pl-s1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":33,"cssClass":"pl-s1"},{"start":35,"end":42,"cssClass":"pl-s1"}],[{"start":4,"end":15,"cssClass":"pl-en"},{"start":16,"end":17,"cssClass":"pl-c1"},{"start":19,"end":34,"cssClass":"pl-s1"},{"start":36,"end":42,"cssClass":"pl-s1"}],[],[{"start":4,"end":21,"cssClass":"pl-en"},{"start":22,"end":23,"cssClass":"pl-c1"},{"start":25,"end":40,"cssClass":"pl-s1"}],[{"start":4,"end":23,"cssClass":"pl-s1"},{"start":24,"end":25,"cssClass":"pl-c1"},{"start":26,"end":34,"cssClass":"pl-en"},{"start":35,"end":36,"cssClass":"pl-c1"},{"start":38,"end":55,"cssClass":"pl-c1"}],[],[{"start":4,"end":43,"cssClass":"pl-c"}],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":30,"cssClass":"pl-s"},{"start":32,"end":41,"cssClass":"pl-s1"}],[],[],[{"start":8,"end":11,"cssClass":"pl-smi"},{"start":12,"end":13,"cssClass":"pl-s1"},{"start":14,"end":15,"cssClass":"pl-c1"},{"start":16,"end":17,"cssClass":"pl-c1"}],[{"start":8,"end":43,"cssClass":"pl-c"}],[{"start":8,"end":13,"cssClass":"pl-k"},{"start":15,"end":31,"cssClass":"pl-s1"},{"start":32,"end":33,"cssClass":"pl-s1"},{"start":35,"end":39,"cssClass":"pl-c1"}],[{"start":12,"end":26,"cssClass":"pl-en"},{"start":27,"end":28,"cssClass":"pl-c1"},{"start":30,"end":46,"cssClass":"pl-s1"},{"start":47,"end":48,"cssClass":"pl-s1"},{"start":50,"end":54,"cssClass":"pl-c1"}],[{"start":12,"end":27,"cssClass":"pl-en"},{"start":28,"end":29,"cssClass":"pl-c1"},{"start":31,"end":47,"cssClass":"pl-s1"},{"start":48,"end":49,"cssClass":"pl-s1"},{"start":51,"end":56,"cssClass":"pl-c1"}],[{"start":12,"end":22,"cssClass":"pl-en"},{"start":23,"end":24,"cssClass":"pl-c1"},{"start":26,"end":28,"cssClass":"pl-c1"}],[{"start":12,"end":14,"cssClass":"pl-c1"},{"start":14,"end":15,"cssClass":"pl-s1"}],[],[],[],[{"start":4,"end":73,"cssClass":"pl-c"}],[{"start":4,"end":17,"cssClass":"pl-en"},{"start":18,"end":19,"cssClass":"pl-c1"},{"start":21,"end":23,"cssClass":"pl-c1"}],[{"start":4,"end":20,"cssClass":"pl-en"},{"start":21,"end":22,"cssClass":"pl-c1"},{"start":24,"end":26,"cssClass":"pl-c1"}],[],[{"start":4,"end":10,"cssClass":"pl-k"},{"start":11,"end":12,"cssClass":"pl-c1"}],[]],"colorizedLines":null,"csv":null,"csvError":null,"dependabotInfo":{"showConfigurationBanner":false,"configFilePath":null,"networkDependabotPath":"/elliotsayes/ao/network/updates","dismissConfigurationNoticePath":"/settings/dismiss-notice/dependabot_configuration_notice","configurationNoticeDismissed":null},"displayName":"lsqlite3.c","displayUrl":"https://github.com/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c?raw=true","headerInfo":{"blobSize":"71.6 KB","deleteTooltip":"You must be signed in to make or propose changes","editTooltip":"You must be signed in to make or propose changes","ghDesktopPath":"https://desktop.github.com","isGitLfs":false,"onBranch":true,"shortPath":"e3d0657","siteNavLoginPath":"/login?return_to=https%3A%2F%2Fgithub.com%2Felliotsayes%2Fao%2Fblob%2Fsqlite%2Fdev-cli%2Fcontainer%2Fsrc%2Flsqlite3.c","isCSV":false,"isRichtext":false,"toc":null,"lineInfo":{"truncatedLoc":"2459","truncatedSloc":"2050"},"mode":"file"},"image":false,"isCodeownersFile":null,"isPlain":false,"isValidLegacyIssueTemplate":false,"issueTemplate":null,"discussionTemplate":null,"language":"C","languageID":41,"large":false,"planSupportInfo":{"repoIsFork":null,"repoOwnedByCurrentUser":null,"requestFullPath":"/elliotsayes/ao/blob/sqlite/dev-cli/container/src/lsqlite3.c","showFreeOrgGatedFeatureMessage":null,"showPlanSupportBanner":null,"upgradeDataAttributes":null,"upgradePath":null},"publishBannersInfo":{"dismissActionNoticePath":"/settings/dismiss-notice/publish_action_from_dockerfile","releasePath":"/elliotsayes/ao/releases/new?marketplace=true","showPublishActionBanner":false},"rawBlobUrl":"https://github.com/elliotsayes/ao/raw/sqlite/dev-cli/container/src/lsqlite3.c","renderImageOrRaw":false,"richText":null,"renderedFileInfo":null,"shortPath":null,"symbolsEnabled":true,"tabSize":8,"topBannersInfo":{"overridingGlobalFundingFile":false,"globalPreferredFundingPath":null,"showInvalidCitationWarning":false,"citationHelpUrl":"https://docs.github.com/github/creating-cloning-and-archiving-repositories/creating-a-repository-on-github/about-citation-files","actionsOnboardingTip":null},"truncated":false,"viewable":true,"workflowRedirectUrl":null,"symbols":{"timed_out":true,"not_analyzed":false,"symbols":[{"name":"LUA_LIB","kind":"macro","ident_start":2068,"ident_end":2075,"extent_start":2060,"extent_end":2076,"fully_qualified_name":"LUA_LIB","ident_utf16":{"start":{"line_number":32,"utf16_col":8},"end":{"line_number":32,"utf16_col":15}},"extent_utf16":{"start":{"line_number":32,"utf16_col":0},"end":{"line_number":33,"utf16_col":0}}},{"name":"lua_strlen","kind":"macro","ident_start":2185,"ident_end":2195,"extent_start":2177,"extent_end":2207,"fully_qualified_name":"lua_strlen","ident_utf16":{"start":{"line_number":41,"utf16_col":8},"end":{"line_number":41,"utf16_col":18}},"extent_utf16":{"start":{"line_number":41,"utf16_col":0},"end":{"line_number":42,"utf16_col":0}}},{"name":"SQLITE_OMIT_PROGRESS_CALLBACK","kind":"macro","ident_start":2846,"ident_end":2875,"extent_start":2838,"extent_end":2878,"fully_qualified_name":"SQLITE_OMIT_PROGRESS_CALLBACK","ident_utf16":{"start":{"line_number":62,"utf16_col":12},"end":{"line_number":62,"utf16_col":41}},"extent_utf16":{"start":{"line_number":62,"utf16_col":4},"end":{"line_number":63,"utf16_col":0}}},{"name":"LSQLITE_OMIT_UPDATE_HOOK","kind":"macro","ident_start":2936,"ident_end":2960,"extent_start":2928,"extent_end":2963,"fully_qualified_name":"LSQLITE_OMIT_UPDATE_HOOK","ident_utf16":{"start":{"line_number":65,"utf16_col":12},"end":{"line_number":65,"utf16_col":36}},"extent_utf16":{"start":{"line_number":65,"utf16_col":4},"end":{"line_number":66,"utf16_col":0}}},{"name":"sdb","kind":"type","ident_start":3187,"ident_end":3190,"extent_start":3168,"extent_end":3191,"fully_qualified_name":"sdb","ident_utf16":{"start":{"line_number":73,"utf16_col":19},"end":{"line_number":73,"utf16_col":22}},"extent_utf16":{"start":{"line_number":73,"utf16_col":0},"end":{"line_number":73,"utf16_col":23}}},{"name":"sdb_vm","kind":"type","ident_start":3214,"ident_end":3220,"extent_start":3192,"extent_end":3221,"fully_qualified_name":"sdb_vm","ident_utf16":{"start":{"line_number":74,"utf16_col":22},"end":{"line_number":74,"utf16_col":28}},"extent_utf16":{"start":{"line_number":74,"utf16_col":0},"end":{"line_number":74,"utf16_col":29}}},{"name":"sdb_bu","kind":"type","ident_start":3244,"ident_end":3250,"extent_start":3222,"extent_end":3251,"fully_qualified_name":"sdb_bu","ident_utf16":{"start":{"line_number":75,"utf16_col":22},"end":{"line_number":75,"utf16_col":28}},"extent_utf16":{"start":{"line_number":75,"utf16_col":0},"end":{"line_number":75,"utf16_col":29}}},{"name":"sdb_func","kind":"type","ident_start":3276,"ident_end":3284,"extent_start":3252,"extent_end":3285,"fully_qualified_name":"sdb_func","ident_utf16":{"start":{"line_number":76,"utf16_col":24},"end":{"line_number":76,"utf16_col":32}},"extent_utf16":{"start":{"line_number":76,"utf16_col":0},"end":{"line_number":76,"utf16_col":33}}},{"name":"sdb_func","kind":"class","ident_start":3364,"ident_end":3372,"extent_start":3357,"extent_end":3530,"fully_qualified_name":"sdb_func","ident_utf16":{"start":{"line_number":79,"utf16_col":7},"end":{"line_number":79,"utf16_col":15}},"extent_utf16":{"start":{"line_number":79,"utf16_col":0},"end":{"line_number":89,"utf16_col":1}}},{"name":"sdb","kind":"class","ident_start":3573,"ident_end":3576,"extent_start":3566,"extent_end":4325,"fully_qualified_name":"sdb","ident_utf16":{"start":{"line_number":92,"utf16_col":7},"end":{"line_number":92,"utf16_col":10}},"extent_utf16":{"start":{"line_number":92,"utf16_col":0},"end":{"line_number":123,"utf16_col":1}}},{"name":"vm_push_column","kind":"function","ident_start":5530,"ident_end":5544,"extent_start":5530,"extent_end":5585,"fully_qualified_name":"vm_push_column","ident_utf16":{"start":{"line_number":163,"utf16_col":12},"end":{"line_number":163,"utf16_col":26}},"extent_utf16":{"start":{"line_number":163,"utf16_col":12},"end":{"line_number":163,"utf16_col":67}}},{"name":"sdb_vm","kind":"class","ident_start":6480,"ident_end":6486,"extent_start":6473,"extent_end":6814,"fully_qualified_name":"sdb_vm","ident_utf16":{"start":{"line_number":189,"utf16_col":7},"end":{"line_number":189,"utf16_col":13}},"extent_utf16":{"start":{"line_number":189,"utf16_col":0},"end":{"line_number":198,"utf16_col":1}}},{"name":"newvm","kind":"function","ident_start":6879,"ident_end":6884,"extent_start":6879,"extent_end":6907,"fully_qualified_name":"newvm","ident_utf16":{"start":{"line_number":201,"utf16_col":15},"end":{"line_number":201,"utf16_col":20}},"extent_utf16":{"start":{"line_number":201,"utf16_col":15},"end":{"line_number":201,"utf16_col":43}}},{"name":"cleanupvm","kind":"function","ident_start":7786,"ident_end":7795,"extent_start":7786,"extent_end":7822,"fully_qualified_name":"cleanupvm","ident_utf16":{"start":{"line_number":224,"utf16_col":11},"end":{"line_number":224,"utf16_col":20}},"extent_utf16":{"start":{"line_number":224,"utf16_col":11},"end":{"line_number":224,"utf16_col":47}}},{"name":"stepvm","kind":"function","ident_start":8256,"ident_end":8262,"extent_start":8256,"extent_end":8289,"fully_qualified_name":"stepvm","ident_utf16":{"start":{"line_number":244,"utf16_col":11},"end":{"line_number":244,"utf16_col":17}},"extent_utf16":{"start":{"line_number":244,"utf16_col":11},"end":{"line_number":244,"utf16_col":44}}},{"name":"lsqlite_getvm","kind":"function","ident_start":8354,"ident_end":8367,"extent_start":8354,"extent_end":8392,"fully_qualified_name":"lsqlite_getvm","ident_utf16":{"start":{"line_number":249,"utf16_col":15},"end":{"line_number":249,"utf16_col":28}},"extent_utf16":{"start":{"line_number":249,"utf16_col":15},"end":{"line_number":249,"utf16_col":53}}},{"name":"lsqlite_checkvm","kind":"function","ident_start":8575,"ident_end":8590,"extent_start":8575,"extent_end":8615,"fully_qualified_name":"lsqlite_checkvm","ident_utf16":{"start":{"line_number":255,"utf16_col":15},"end":{"line_number":255,"utf16_col":30}},"extent_utf16":{"start":{"line_number":255,"utf16_col":15},"end":{"line_number":255,"utf16_col":55}}},{"name":"dbvm_isopen","kind":"function","ident_start":8789,"ident_end":8800,"extent_start":8789,"extent_end":8814,"fully_qualified_name":"dbvm_isopen","ident_utf16":{"start":{"line_number":261,"utf16_col":11},"end":{"line_number":261,"utf16_col":22}},"extent_utf16":{"start":{"line_number":261,"utf16_col":11},"end":{"line_number":261,"utf16_col":36}}},{"name":"dbvm_tostring","kind":"function","ident_start":8933,"ident_end":8946,"extent_start":8933,"extent_end":8960,"fully_qualified_name":"dbvm_tostring","ident_utf16":{"start":{"line_number":267,"utf16_col":11},"end":{"line_number":267,"utf16_col":24}},"extent_utf16":{"start":{"line_number":267,"utf16_col":11},"end":{"line_number":267,"utf16_col":38}}},{"name":"dbvm_gc","kind":"function","ident_start":9210,"ident_end":9217,"extent_start":9210,"extent_end":9231,"fully_qualified_name":"dbvm_gc","ident_utf16":{"start":{"line_number":278,"utf16_col":11},"end":{"line_number":278,"utf16_col":18}},"extent_utf16":{"start":{"line_number":278,"utf16_col":11},"end":{"line_number":278,"utf16_col":32}}},{"name":"dbvm_step","kind":"function","ident_start":9378,"ident_end":9387,"extent_start":9378,"extent_end":9401,"fully_qualified_name":"dbvm_step","ident_utf16":{"start":{"line_number":285,"utf16_col":11},"end":{"line_number":285,"utf16_col":20}},"extent_utf16":{"start":{"line_number":285,"utf16_col":11},"end":{"line_number":285,"utf16_col":34}}},{"name":"dbvm_finalize","kind":"function","ident_start":9652,"ident_end":9665,"extent_start":9652,"extent_end":9679,"fully_qualified_name":"dbvm_finalize","ident_utf16":{"start":{"line_number":297,"utf16_col":11},"end":{"line_number":297,"utf16_col":24}},"extent_utf16":{"start":{"line_number":297,"utf16_col":11},"end":{"line_number":297,"utf16_col":38}}},{"name":"dbvm_reset","kind":"function","ident_start":9767,"ident_end":9777,"extent_start":9767,"extent_end":9791,"fully_qualified_name":"dbvm_reset","ident_utf16":{"start":{"line_number":302,"utf16_col":11},"end":{"line_number":302,"utf16_col":21}},"extent_utf16":{"start":{"line_number":302,"utf16_col":11},"end":{"line_number":302,"utf16_col":35}}},{"name":"dbvm_check_contents","kind":"function","ident_start":9946,"ident_end":9965,"extent_start":9946,"extent_end":9992,"fully_qualified_name":"dbvm_check_contents","ident_utf16":{"start":{"line_number":309,"utf16_col":12},"end":{"line_number":309,"utf16_col":31}},"extent_utf16":{"start":{"line_number":309,"utf16_col":12},"end":{"line_number":309,"utf16_col":58}}},{"name":"dbvm_check_index","kind":"function","ident_start":10089,"ident_end":10105,"extent_start":10089,"extent_end":10143,"fully_qualified_name":"dbvm_check_index","ident_utf16":{"start":{"line_number":315,"utf16_col":12},"end":{"line_number":315,"utf16_col":28}},"extent_utf16":{"start":{"line_number":315,"utf16_col":12},"end":{"line_number":315,"utf16_col":66}}},{"name":"dbvm_check_bind_index","kind":"function","ident_start":10284,"ident_end":10305,"extent_start":10284,"extent_end":10343,"fully_qualified_name":"dbvm_check_bind_index","ident_utf16":{"start":{"line_number":321,"utf16_col":12},"end":{"line_number":321,"utf16_col":33}},"extent_utf16":{"start":{"line_number":321,"utf16_col":12},"end":{"line_number":321,"utf16_col":71}}},{"name":"dbvm_last_insert_rowid","kind":"function","ident_start":10533,"ident_end":10555,"extent_start":10533,"extent_end":10569,"fully_qualified_name":"dbvm_last_insert_rowid","ident_utf16":{"start":{"line_number":327,"utf16_col":11},"end":{"line_number":327,"utf16_col":33}},"extent_utf16":{"start":{"line_number":327,"utf16_col":11},"end":{"line_number":327,"utf16_col":47}}},{"name":"dbvm_columns","kind":"function","ident_start":10973,"ident_end":10985,"extent_start":10973,"extent_end":10999,"fully_qualified_name":"dbvm_columns","ident_utf16":{"start":{"line_number":340,"utf16_col":11},"end":{"line_number":340,"utf16_col":23}},"extent_utf16":{"start":{"line_number":340,"utf16_col":11},"end":{"line_number":340,"utf16_col":37}}},{"name":"dbvm_get_value","kind":"function","ident_start":11280,"ident_end":11294,"extent_start":11280,"extent_end":11308,"fully_qualified_name":"dbvm_get_value","ident_utf16":{"start":{"line_number":352,"utf16_col":11},"end":{"line_number":352,"utf16_col":25}},"extent_utf16":{"start":{"line_number":352,"utf16_col":11},"end":{"line_number":352,"utf16_col":39}}},{"name":"dbvm_get_name","kind":"function","ident_start":11526,"ident_end":11539,"extent_start":11526,"extent_end":11553,"fully_qualified_name":"dbvm_get_name","ident_utf16":{"start":{"line_number":361,"utf16_col":11},"end":{"line_number":361,"utf16_col":24}},"extent_utf16":{"start":{"line_number":361,"utf16_col":11},"end":{"line_number":361,"utf16_col":38}}},{"name":"dbvm_get_type","kind":"function","ident_start":11762,"ident_end":11775,"extent_start":11762,"extent_end":11789,"fully_qualified_name":"dbvm_get_type","ident_utf16":{"start":{"line_number":369,"utf16_col":11},"end":{"line_number":369,"utf16_col":24}},"extent_utf16":{"start":{"line_number":369,"utf16_col":11},"end":{"line_number":369,"utf16_col":38}}},{"name":"dbvm_get_values","kind":"function","ident_start":12002,"ident_end":12017,"extent_start":12002,"extent_end":12031,"fully_qualified_name":"dbvm_get_values","ident_utf16":{"start":{"line_number":377,"utf16_col":11},"end":{"line_number":377,"utf16_col":26}},"extent_utf16":{"start":{"line_number":377,"utf16_col":11},"end":{"line_number":377,"utf16_col":40}}},{"name":"dbvm_get_names","kind":"function","ident_start":12353,"ident_end":12367,"extent_start":12353,"extent_end":12381,"fully_qualified_name":"dbvm_get_names","ident_utf16":{"start":{"line_number":392,"utf16_col":11},"end":{"line_number":392,"utf16_col":25}},"extent_utf16":{"start":{"line_number":392,"utf16_col":11},"end":{"line_number":392,"utf16_col":39}}},{"name":"dbvm_get_types","kind":"function","ident_start":12745,"ident_end":12759,"extent_start":12745,"extent_end":12773,"fully_qualified_name":"dbvm_get_types","ident_utf16":{"start":{"line_number":406,"utf16_col":11},"end":{"line_number":406,"utf16_col":25}},"extent_utf16":{"start":{"line_number":406,"utf16_col":11},"end":{"line_number":406,"utf16_col":39}}},{"name":"dbvm_get_uvalues","kind":"function","ident_start":13141,"ident_end":13157,"extent_start":13141,"extent_end":13171,"fully_qualified_name":"dbvm_get_uvalues","ident_utf16":{"start":{"line_number":420,"utf16_col":11},"end":{"line_number":420,"utf16_col":27}},"extent_utf16":{"start":{"line_number":420,"utf16_col":11},"end":{"line_number":420,"utf16_col":41}}},{"name":"dbvm_get_unames","kind":"function","ident_start":13458,"ident_end":13473,"extent_start":13458,"extent_end":13487,"fully_qualified_name":"dbvm_get_unames","ident_utf16":{"start":{"line_number":433,"utf16_col":11},"end":{"line_number":433,"utf16_col":26}},"extent_utf16":{"start":{"line_number":433,"utf16_col":11},"end":{"line_number":433,"utf16_col":40}}},{"name":"dbvm_get_utypes","kind":"function","ident_start":13816,"ident_end":13831,"extent_start":13816,"extent_end":13845,"fully_qualified_name":"dbvm_get_utypes","ident_utf16":{"start":{"line_number":445,"utf16_col":11},"end":{"line_number":445,"utf16_col":26}},"extent_utf16":{"start":{"line_number":445,"utf16_col":11},"end":{"line_number":445,"utf16_col":40}}},{"name":"dbvm_get_named_values","kind":"function","ident_start":14178,"ident_end":14199,"extent_start":14178,"extent_end":14213,"fully_qualified_name":"dbvm_get_named_values","ident_utf16":{"start":{"line_number":457,"utf16_col":11},"end":{"line_number":457,"utf16_col":32}},"extent_utf16":{"start":{"line_number":457,"utf16_col":11},"end":{"line_number":457,"utf16_col":46}}},{"name":"dbvm_get_named_types","kind":"function","ident_start":14588,"ident_end":14608,"extent_start":14588,"extent_end":14622,"fully_qualified_name":"dbvm_get_named_types","ident_utf16":{"start":{"line_number":473,"utf16_col":11},"end":{"line_number":473,"utf16_col":31}},"extent_utf16":{"start":{"line_number":473,"utf16_col":11},"end":{"line_number":473,"utf16_col":45}}},{"name":"dbvm_bind_index","kind":"function","ident_start":15152,"ident_end":15167,"extent_start":15152,"extent_end":15222,"fully_qualified_name":"dbvm_bind_index","ident_utf16":{"start":{"line_number":494,"utf16_col":11},"end":{"line_number":494,"utf16_col":26}},"extent_utf16":{"start":{"line_number":494,"utf16_col":11},"end":{"line_number":494,"utf16_col":81}}},{"name":"dbvm_bind_parameter_count","kind":"function","ident_start":16061,"ident_end":16086,"extent_start":16061,"extent_end":16100,"fully_qualified_name":"dbvm_bind_parameter_count","ident_utf16":{"start":{"line_number":516,"utf16_col":11},"end":{"line_number":516,"utf16_col":36}},"extent_utf16":{"start":{"line_number":516,"utf16_col":11},"end":{"line_number":516,"utf16_col":50}}},{"name":"dbvm_bind_parameter_name","kind":"function","ident_start":16235,"ident_end":16259,"extent_start":16235,"extent_end":16273,"fully_qualified_name":"dbvm_bind_parameter_name","ident_utf16":{"start":{"line_number":522,"utf16_col":11},"end":{"line_number":522,"utf16_col":35}},"extent_utf16":{"start":{"line_number":522,"utf16_col":11},"end":{"line_number":522,"utf16_col":49}}},{"name":"dbvm_bind","kind":"function","ident_start":16495,"ident_end":16504,"extent_start":16495,"extent_end":16518,"fully_qualified_name":"dbvm_bind","ident_utf16":{"start":{"line_number":530,"utf16_col":11},"end":{"line_number":530,"utf16_col":20}},"extent_utf16":{"start":{"line_number":530,"utf16_col":11},"end":{"line_number":530,"utf16_col":34}}},{"name":"dbvm_bind_blob","kind":"function","ident_start":16798,"ident_end":16812,"extent_start":16798,"extent_end":16826,"fully_qualified_name":"dbvm_bind_blob","ident_utf16":{"start":{"line_number":543,"utf16_col":11},"end":{"line_number":543,"utf16_col":25}},"extent_utf16":{"start":{"line_number":543,"utf16_col":11},"end":{"line_number":543,"utf16_col":39}}},{"name":"dbvm_bind_values","kind":"function","ident_start":17105,"ident_end":17121,"extent_start":17105,"extent_end":17135,"fully_qualified_name":"dbvm_bind_values","ident_utf16":{"start":{"line_number":553,"utf16_col":11},"end":{"line_number":553,"utf16_col":27}},"extent_utf16":{"start":{"line_number":553,"utf16_col":11},"end":{"line_number":553,"utf16_col":41}}},{"name":"dbvm_bind_table_fields","kind":"function","ident_start":17737,"ident_end":17759,"extent_start":17737,"extent_end":17808,"fully_qualified_name":"dbvm_bind_table_fields","ident_utf16":{"start":{"line_number":577,"utf16_col":11},"end":{"line_number":577,"utf16_col":33}},"extent_utf16":{"start":{"line_number":577,"utf16_col":11},"end":{"line_number":577,"utf16_col":82}}},{"name":"dbvm_bind_names","kind":"function","ident_start":18447,"ident_end":18462,"extent_start":18447,"extent_end":18476,"fully_qualified_name":"dbvm_bind_names","ident_utf16":{"start":{"line_number":603,"utf16_col":11},"end":{"line_number":603,"utf16_col":26}},"extent_utf16":{"start":{"line_number":603,"utf16_col":11},"end":{"line_number":603,"utf16_col":40}}},{"name":"newdb","kind":"function","ident_start":19177,"ident_end":19182,"extent_start":19177,"extent_end":19197,"fully_qualified_name":"newdb","ident_utf16":{"start":{"line_number":628,"utf16_col":12},"end":{"line_number":628,"utf16_col":17}},"extent_utf16":{"start":{"line_number":628,"utf16_col":12},"end":{"line_number":628,"utf16_col":32}}},{"name":"cleanupdb","kind":"function","ident_start":20007,"ident_end":20016,"extent_start":20007,"extent_end":20039,"fully_qualified_name":"cleanupdb","ident_utf16":{"start":{"line_number":661,"utf16_col":11},"end":{"line_number":661,"utf16_col":20}},"extent_utf16":{"start":{"line_number":661,"utf16_col":11},"end":{"line_number":661,"utf16_col":43}}},{"name":"lsqlite_getdb","kind":"function","ident_start":21962,"ident_end":21975,"extent_start":21962,"extent_end":22000,"fully_qualified_name":"lsqlite_getdb","ident_utf16":{"start":{"line_number":723,"utf16_col":12},"end":{"line_number":723,"utf16_col":25}},"extent_utf16":{"start":{"line_number":723,"utf16_col":12},"end":{"line_number":723,"utf16_col":50}}},{"name":"lsqlite_checkdb","kind":"function","ident_start":22157,"ident_end":22172,"extent_start":22157,"extent_end":22197,"fully_qualified_name":"lsqlite_checkdb","ident_utf16":{"start":{"line_number":729,"utf16_col":12},"end":{"line_number":729,"utf16_col":27}},"extent_utf16":{"start":{"line_number":729,"utf16_col":12},"end":{"line_number":729,"utf16_col":52}}},{"name":"lcontext","kind":"type","ident_start":22573,"ident_end":22581,"extent_start":22516,"extent_end":22582,"fully_qualified_name":"lcontext","ident_utf16":{"start":{"line_number":744,"utf16_col":2},"end":{"line_number":744,"utf16_col":10}},"extent_utf16":{"start":{"line_number":741,"utf16_col":0},"end":{"line_number":744,"utf16_col":11}}},{"name":"lsqlite_make_context","kind":"function","ident_start":22601,"ident_end":22621,"extent_start":22601,"extent_end":22635,"fully_qualified_name":"lsqlite_make_context","ident_utf16":{"start":{"line_number":746,"utf16_col":17},"end":{"line_number":746,"utf16_col":37}},"extent_utf16":{"start":{"line_number":746,"utf16_col":17},"end":{"line_number":746,"utf16_col":51}}},{"name":"lsqlite_getcontext","kind":"function","ident_start":22878,"ident_end":22896,"extent_start":22878,"extent_end":22921,"fully_qualified_name":"lsqlite_getcontext","ident_utf16":{"start":{"line_number":755,"utf16_col":17},"end":{"line_number":755,"utf16_col":35}},"extent_utf16":{"start":{"line_number":755,"utf16_col":17},"end":{"line_number":755,"utf16_col":60}}},{"name":"lsqlite_checkcontext","kind":"function","ident_start":23099,"ident_end":23119,"extent_start":23099,"extent_end":23144,"fully_qualified_name":"lsqlite_checkcontext","ident_utf16":{"start":{"line_number":761,"utf16_col":17},"end":{"line_number":761,"utf16_col":37}},"extent_utf16":{"start":{"line_number":761,"utf16_col":17},"end":{"line_number":761,"utf16_col":62}}},{"name":"lcontext_tostring","kind":"function","ident_start":23304,"ident_end":23321,"extent_start":23304,"extent_end":23335,"fully_qualified_name":"lcontext_tostring","ident_utf16":{"start":{"line_number":767,"utf16_col":11},"end":{"line_number":767,"utf16_col":28}},"extent_utf16":{"start":{"line_number":767,"utf16_col":11},"end":{"line_number":767,"utf16_col":42}}},{"name":"lcontext_check_aggregate","kind":"function","ident_start":23600,"ident_end":23624,"extent_start":23600,"extent_end":23653,"fully_qualified_name":"lcontext_check_aggregate","ident_utf16":{"start":{"line_number":778,"utf16_col":12},"end":{"line_number":778,"utf16_col":36}},"extent_utf16":{"start":{"line_number":778,"utf16_col":12},"end":{"line_number":778,"utf16_col":65}}},{"name":"lcontext_user_data","kind":"function","ident_start":23845,"ident_end":23863,"extent_start":23845,"extent_end":23877,"fully_qualified_name":"lcontext_user_data","ident_utf16":{"start":{"line_number":785,"utf16_col":11},"end":{"line_number":785,"utf16_col":29}},"extent_utf16":{"start":{"line_number":785,"utf16_col":11},"end":{"line_number":785,"utf16_col":43}}},{"name":"lcontext_get_aggregate_context","kind":"function","ident_start":24069,"ident_end":24099,"extent_start":24069,"extent_end":24113,"fully_qualified_name":"lcontext_get_aggregate_context","ident_utf16":{"start":{"line_number":792,"utf16_col":11},"end":{"line_number":792,"utf16_col":41}},"extent_utf16":{"start":{"line_number":792,"utf16_col":11},"end":{"line_number":792,"utf16_col":55}}},{"name":"lcontext_set_aggregate_context","kind":"function","ident_start":24278,"ident_end":24308,"extent_start":24278,"extent_end":24322,"fully_qualified_name":"lcontext_set_aggregate_context","ident_utf16":{"start":{"line_number":799,"utf16_col":11},"end":{"line_number":799,"utf16_col":41}},"extent_utf16":{"start":{"line_number":799,"utf16_col":11},"end":{"line_number":799,"utf16_col":55}}},{"name":"lcontext_aggregate_count","kind":"function","ident_start":24554,"ident_end":24578,"extent_start":24554,"extent_end":24592,"fully_qualified_name":"lcontext_aggregate_count","ident_utf16":{"start":{"line_number":808,"utf16_col":11},"end":{"line_number":808,"utf16_col":35}},"extent_utf16":{"start":{"line_number":808,"utf16_col":11},"end":{"line_number":808,"utf16_col":49}}},{"name":"sqlite3_get_auxdata","kind":"function","ident_start":24769,"ident_end":24788,"extent_start":24769,"extent_end":24811,"fully_qualified_name":"sqlite3_get_auxdata","ident_utf16":{"start":{"line_number":816,"utf16_col":6},"end":{"line_number":816,"utf16_col":25}},"extent_utf16":{"start":{"line_number":816,"utf16_col":6},"end":{"line_number":816,"utf16_col":48}}},{"name":"sqlite3_set_auxdata","kind":"function","ident_start":24818,"ident_end":24837,"extent_start":24818,"extent_end":24884,"fully_qualified_name":"sqlite3_set_auxdata","ident_utf16":{"start":{"line_number":817,"utf16_col":5},"end":{"line_number":817,"utf16_col":24}},"extent_utf16":{"start":{"line_number":817,"utf16_col":5},"end":{"line_number":817,"utf16_col":71}}},{"name":"lcontext_result","kind":"function","ident_start":24905,"ident_end":24920,"extent_start":24905,"extent_end":24934,"fully_qualified_name":"lcontext_result","ident_utf16":{"start":{"line_number":820,"utf16_col":11},"end":{"line_number":820,"utf16_col":26}},"extent_utf16":{"start":{"line_number":820,"utf16_col":11},"end":{"line_number":820,"utf16_col":40}}},{"name":"lcontext_result_blob","kind":"function","ident_start":25690,"ident_end":25710,"extent_start":25690,"extent_end":25724,"fully_qualified_name":"lcontext_result_blob","ident_utf16":{"start":{"line_number":846,"utf16_col":11},"end":{"line_number":846,"utf16_col":31}},"extent_utf16":{"start":{"line_number":846,"utf16_col":11},"end":{"line_number":846,"utf16_col":45}}},{"name":"lcontext_result_double","kind":"function","ident_start":25961,"ident_end":25983,"extent_start":25961,"extent_end":25997,"fully_qualified_name":"lcontext_result_double","ident_utf16":{"start":{"line_number":854,"utf16_col":11},"end":{"line_number":854,"utf16_col":33}},"extent_utf16":{"start":{"line_number":854,"utf16_col":11},"end":{"line_number":854,"utf16_col":47}}},{"name":"lcontext_result_error","kind":"function","ident_start":26155,"ident_end":26176,"extent_start":26155,"extent_end":26190,"fully_qualified_name":"lcontext_result_error","ident_utf16":{"start":{"line_number":861,"utf16_col":11},"end":{"line_number":861,"utf16_col":32}},"extent_utf16":{"start":{"line_number":861,"utf16_col":11},"end":{"line_number":861,"utf16_col":46}}},{"name":"lcontext_result_int","kind":"function","ident_start":26395,"ident_end":26414,"extent_start":26395,"extent_end":26428,"fully_qualified_name":"lcontext_result_int","ident_utf16":{"start":{"line_number":869,"utf16_col":11},"end":{"line_number":869,"utf16_col":30}},"extent_utf16":{"start":{"line_number":869,"utf16_col":11},"end":{"line_number":869,"utf16_col":44}}},{"name":"lcontext_result_null","kind":"function","ident_start":26577,"ident_end":26597,"extent_start":26577,"extent_end":26611,"fully_qualified_name":"lcontext_result_null","ident_utf16":{"start":{"line_number":876,"utf16_col":11},"end":{"line_number":876,"utf16_col":31}},"extent_utf16":{"start":{"line_number":876,"utf16_col":11},"end":{"line_number":876,"utf16_col":45}}},{"name":"lcontext_result_text","kind":"function","ident_start":26725,"ident_end":26745,"extent_start":26725,"extent_end":26759,"fully_qualified_name":"lcontext_result_text","ident_utf16":{"start":{"line_number":882,"utf16_col":11},"end":{"line_number":882,"utf16_col":31}},"extent_utf16":{"start":{"line_number":882,"utf16_col":11},"end":{"line_number":882,"utf16_col":45}}},{"name":"db_isopen","kind":"function","ident_start":27128,"ident_end":27137,"extent_start":27128,"extent_end":27151,"fully_qualified_name":"db_isopen","ident_utf16":{"start":{"line_number":896,"utf16_col":11},"end":{"line_number":896,"utf16_col":20}},"extent_utf16":{"start":{"line_number":896,"utf16_col":11},"end":{"line_number":896,"utf16_col":34}}},{"name":"db_last_insert_rowid","kind":"function","ident_start":27265,"ident_end":27285,"extent_start":27265,"extent_end":27299,"fully_qualified_name":"db_last_insert_rowid","ident_utf16":{"start":{"line_number":902,"utf16_col":11},"end":{"line_number":902,"utf16_col":31}},"extent_utf16":{"start":{"line_number":902,"utf16_col":11},"end":{"line_number":902,"utf16_col":45}}},{"name":"db_changes","kind":"function","ident_start":27536,"ident_end":27546,"extent_start":27536,"extent_end":27560,"fully_qualified_name":"db_changes","ident_utf16":{"start":{"line_number":910,"utf16_col":11},"end":{"line_number":910,"utf16_col":21}},"extent_utf16":{"start":{"line_number":910,"utf16_col":11},"end":{"line_number":910,"utf16_col":35}}},{"name":"db_total_changes","kind":"function","ident_start":27677,"ident_end":27693,"extent_start":27677,"extent_end":27707,"fully_qualified_name":"db_total_changes","ident_utf16":{"start":{"line_number":916,"utf16_col":11},"end":{"line_number":916,"utf16_col":27}},"extent_utf16":{"start":{"line_number":916,"utf16_col":11},"end":{"line_number":916,"utf16_col":41}}},{"name":"db_errcode","kind":"function","ident_start":27830,"ident_end":27840,"extent_start":27830,"extent_end":27854,"fully_qualified_name":"db_errcode","ident_utf16":{"start":{"line_number":922,"utf16_col":11},"end":{"line_number":922,"utf16_col":21}},"extent_utf16":{"start":{"line_number":922,"utf16_col":11},"end":{"line_number":922,"utf16_col":35}}},{"name":"db_errmsg","kind":"function","ident_start":27971,"ident_end":27980,"extent_start":27971,"extent_end":27994,"fully_qualified_name":"db_errmsg","ident_utf16":{"start":{"line_number":928,"utf16_col":11},"end":{"line_number":928,"utf16_col":20}},"extent_utf16":{"start":{"line_number":928,"utf16_col":11},"end":{"line_number":928,"utf16_col":34}}},{"name":"db_interrupt","kind":"function","ident_start":28109,"ident_end":28121,"extent_start":28109,"extent_end":28135,"fully_qualified_name":"db_interrupt","ident_utf16":{"start":{"line_number":934,"utf16_col":11},"end":{"line_number":934,"utf16_col":23}},"extent_utf16":{"start":{"line_number":934,"utf16_col":11},"end":{"line_number":934,"utf16_col":37}}},{"name":"db_db_filename","kind":"function","ident_start":28234,"ident_end":28248,"extent_start":28234,"extent_end":28262,"fully_qualified_name":"db_db_filename","ident_utf16":{"start":{"line_number":940,"utf16_col":11},"end":{"line_number":940,"utf16_col":25}},"extent_utf16":{"start":{"line_number":940,"utf16_col":11},"end":{"line_number":940,"utf16_col":39}}},{"name":"db_push_value","kind":"function","ident_start":28557,"ident_end":28570,"extent_start":28557,"extent_end":28606,"fully_qualified_name":"db_push_value","ident_utf16":{"start":{"line_number":952,"utf16_col":12},"end":{"line_number":952,"utf16_col":25}},"extent_utf16":{"start":{"line_number":952,"utf16_col":12},"end":{"line_number":952,"utf16_col":61}}},{"name":"db_sql_normal_function","kind":"function","ident_start":29704,"ident_end":29726,"extent_start":29704,"extent_end":29784,"fully_qualified_name":"db_sql_normal_function","ident_utf16":{"start":{"line_number":990,"utf16_col":12},"end":{"line_number":990,"utf16_col":34}},"extent_utf16":{"start":{"line_number":990,"utf16_col":12},"end":{"line_number":990,"utf16_col":92}}},{"name":"db_sql_finalize_function","kind":"function","ident_start":31400,"ident_end":31424,"extent_start":31400,"extent_end":31450,"fully_qualified_name":"db_sql_finalize_function","ident_utf16":{"start":{"line_number":1049,"utf16_col":12},"end":{"line_number":1049,"utf16_col":36}},"extent_utf16":{"start":{"line_number":1049,"utf16_col":12},"end":{"line_number":1049,"utf16_col":62}}},{"name":"db_register_function","kind":"function","ident_start":33030,"ident_end":33050,"extent_start":33030,"extent_end":33079,"fully_qualified_name":"db_register_function","ident_utf16":{"start":{"line_number":1105,"utf16_col":11},"end":{"line_number":1105,"utf16_col":31}},"extent_utf16":{"start":{"line_number":1105,"utf16_col":11},"end":{"line_number":1105,"utf16_col":60}}},{"name":"db_create_function","kind":"function","ident_start":34792,"ident_end":34810,"extent_start":34792,"extent_end":34824,"fully_qualified_name":"db_create_function","ident_utf16":{"start":{"line_number":1166,"utf16_col":11},"end":{"line_number":1166,"utf16_col":29}},"extent_utf16":{"start":{"line_number":1166,"utf16_col":11},"end":{"line_number":1166,"utf16_col":43}}},{"name":"db_create_aggregate","kind":"function","ident_start":34880,"ident_end":34899,"extent_start":34880,"extent_end":34913,"fully_qualified_name":"db_create_aggregate","ident_utf16":{"start":{"line_number":1170,"utf16_col":11},"end":{"line_number":1170,"utf16_col":30}},"extent_utf16":{"start":{"line_number":1170,"utf16_col":11},"end":{"line_number":1170,"utf16_col":44}}},{"name":"scc","kind":"type","ident_start":35061,"ident_end":35064,"extent_start":35011,"extent_end":35065,"fully_qualified_name":"scc","ident_utf16":{"start":{"line_number":1180,"utf16_col":2},"end":{"line_number":1180,"utf16_col":5}},"extent_utf16":{"start":{"line_number":1177,"utf16_col":0},"end":{"line_number":1180,"utf16_col":6}}},{"name":"collwrapper","kind":"function","ident_start":35078,"ident_end":35089,"extent_start":35078,"extent_end":35167,"fully_qualified_name":"collwrapper","ident_utf16":{"start":{"line_number":1182,"utf16_col":11},"end":{"line_number":1182,"utf16_col":22}},"extent_utf16":{"start":{"line_number":1182,"utf16_col":11},"end":{"line_number":1183,"utf16_col":46}}},{"name":"collfree","kind":"function","ident_start":35424,"ident_end":35432,"extent_start":35424,"extent_end":35441,"fully_qualified_name":"collfree","ident_utf16":{"start":{"line_number":1194,"utf16_col":12},"end":{"line_number":1194,"utf16_col":20}},"extent_utf16":{"start":{"line_number":1194,"utf16_col":12},"end":{"line_number":1194,"utf16_col":29}}},{"name":"db_create_collation","kind":"function","ident_start":35549,"ident_end":35568,"extent_start":35549,"extent_end":35582,"fully_qualified_name":"db_create_collation","ident_utf16":{"start":{"line_number":1201,"utf16_col":11},"end":{"line_number":1201,"utf16_col":30}},"extent_utf16":{"start":{"line_number":1201,"utf16_col":11},"end":{"line_number":1201,"utf16_col":44}}},{"name":"db_load_extension","kind":"function","ident_start":36643,"ident_end":36660,"extent_start":36643,"extent_end":36674,"fully_qualified_name":"db_load_extension","ident_utf16":{"start":{"line_number":1229,"utf16_col":11},"end":{"line_number":1229,"utf16_col":28}},"extent_utf16":{"start":{"line_number":1229,"utf16_col":11},"end":{"line_number":1229,"utf16_col":42}}},{"name":"db_trace_callback","kind":"function","ident_start":37518,"ident_end":37535,"extent_start":37518,"extent_end":37564,"fully_qualified_name":"db_trace_callback","ident_utf16":{"start":{"line_number":1262,"utf16_col":12},"end":{"line_number":1262,"utf16_col":29}},"extent_utf16":{"start":{"line_number":1262,"utf16_col":12},"end":{"line_number":1262,"utf16_col":58}}},{"name":"db_trace","kind":"function","ident_start":38047,"ident_end":38055,"extent_start":38047,"extent_end":38069,"fully_qualified_name":"db_trace","ident_utf16":{"start":{"line_number":1279,"utf16_col":11},"end":{"line_number":1279,"utf16_col":19}},"extent_utf16":{"start":{"line_number":1279,"utf16_col":11},"end":{"line_number":1279,"utf16_col":33}}},{"name":"db_update_hook_callback","kind":"function","ident_start":39257,"ident_end":39280,"extent_start":39257,"extent_end":39362,"fully_qualified_name":"db_update_hook_callback","ident_utf16":{"start":{"line_number":1321,"utf16_col":12},"end":{"line_number":1321,"utf16_col":35}},"extent_utf16":{"start":{"line_number":1321,"utf16_col":12},"end":{"line_number":1321,"utf16_col":117}}},{"name":"db_update_hook","kind":"function","ident_start":40022,"ident_end":40036,"extent_start":40022,"extent_end":40050,"fully_qualified_name":"db_update_hook","ident_utf16":{"start":{"line_number":1342,"utf16_col":11},"end":{"line_number":1342,"utf16_col":25}},"extent_utf16":{"start":{"line_number":1342,"utf16_col":11},"end":{"line_number":1342,"utf16_col":39}}},{"name":"db_commit_hook_callback","kind":"function","ident_start":41268,"ident_end":41291,"extent_start":41268,"extent_end":41303,"fully_qualified_name":"db_commit_hook_callback","ident_utf16":{"start":{"line_number":1383,"utf16_col":11},"end":{"line_number":1383,"utf16_col":34}},"extent_utf16":{"start":{"line_number":1383,"utf16_col":11},"end":{"line_number":1383,"utf16_col":46}}},{"name":"db_commit_hook","kind":"function","ident_start":41817,"ident_end":41831,"extent_start":41817,"extent_end":41845,"fully_qualified_name":"db_commit_hook","ident_utf16":{"start":{"line_number":1401,"utf16_col":11},"end":{"line_number":1401,"utf16_col":25}},"extent_utf16":{"start":{"line_number":1401,"utf16_col":11},"end":{"line_number":1401,"utf16_col":39}}},{"name":"db_rollback_hook_callback","kind":"function","ident_start":42899,"ident_end":42924,"extent_start":42899,"extent_end":42936,"fully_qualified_name":"db_rollback_hook_callback","ident_utf16":{"start":{"line_number":1440,"utf16_col":12},"end":{"line_number":1440,"utf16_col":37}},"extent_utf16":{"start":{"line_number":1440,"utf16_col":12},"end":{"line_number":1440,"utf16_col":49}}},{"name":"db_rollback_hook","kind":"function","ident_start":43380,"ident_end":43396,"extent_start":43380,"extent_end":43410,"fully_qualified_name":"db_rollback_hook","ident_utf16":{"start":{"line_number":1456,"utf16_col":11},"end":{"line_number":1456,"utf16_col":27}},"extent_utf16":{"start":{"line_number":1456,"utf16_col":11},"end":{"line_number":1456,"utf16_col":41}}},{"name":"db_progress_callback","kind":"function","ident_start":44744,"ident_end":44764,"extent_start":44744,"extent_end":44776,"fully_qualified_name":"db_progress_callback","ident_utf16":{"start":{"line_number":1500,"utf16_col":11},"end":{"line_number":1500,"utf16_col":31}},"extent_utf16":{"start":{"line_number":1500,"utf16_col":11},"end":{"line_number":1500,"utf16_col":43}}},{"name":"db_progress_handler","kind":"function","ident_start":45177,"ident_end":45196,"extent_start":45177,"extent_end":45210,"fully_qualified_name":"db_progress_handler","ident_utf16":{"start":{"line_number":1517,"utf16_col":11},"end":{"line_number":1517,"utf16_col":30}},"extent_utf16":{"start":{"line_number":1517,"utf16_col":11},"end":{"line_number":1517,"utf16_col":44}}},{"name":"db_progress_handler","kind":"function","ident_start":46273,"ident_end":46292,"extent_start":46273,"extent_end":46306,"fully_qualified_name":"db_progress_handler","ident_utf16":{"start":{"line_number":1552,"utf16_col":11},"end":{"line_number":1552,"utf16_col":30}},"extent_utf16":{"start":{"line_number":1552,"utf16_col":11},"end":{"line_number":1552,"utf16_col":44}}},{"name":"sqlite3_backup_init","kind":"function","ident_start":46560,"ident_end":46579,"extent_start":46560,"extent_end":46868,"fully_qualified_name":"sqlite3_backup_init","ident_utf16":{"start":{"line_number":1562,"utf16_col":16},"end":{"line_number":1562,"utf16_col":35}},"extent_utf16":{"start":{"line_number":1562,"utf16_col":16},"end":{"line_number":1567,"utf16_col":1}}},{"name":"sqlite3_backup_step","kind":"function","ident_start":46874,"ident_end":46893,"extent_start":46874,"extent_end":46923,"fully_qualified_name":"sqlite3_backup_step","ident_utf16":{"start":{"line_number":1568,"utf16_col":4},"end":{"line_number":1568,"utf16_col":23}},"extent_utf16":{"start":{"line_number":1568,"utf16_col":4},"end":{"line_number":1568,"utf16_col":53}}},{"name":"sqlite3_backup_finish","kind":"function","ident_start":46929,"ident_end":46950,"extent_start":46929,"extent_end":46969,"fully_qualified_name":"sqlite3_backup_finish","ident_utf16":{"start":{"line_number":1569,"utf16_col":4},"end":{"line_number":1569,"utf16_col":25}},"extent_utf16":{"start":{"line_number":1569,"utf16_col":4},"end":{"line_number":1569,"utf16_col":44}}},{"name":"sqlite3_backup_remaining","kind":"function","ident_start":46975,"ident_end":46999,"extent_start":46975,"extent_end":47018,"fully_qualified_name":"sqlite3_backup_remaining","ident_utf16":{"start":{"line_number":1570,"utf16_col":4},"end":{"line_number":1570,"utf16_col":28}},"extent_utf16":{"start":{"line_number":1570,"utf16_col":4},"end":{"line_number":1570,"utf16_col":47}}},{"name":"sqlite3_backup_pagecount","kind":"function","ident_start":47024,"ident_end":47048,"extent_start":47024,"extent_end":47067,"fully_qualified_name":"sqlite3_backup_pagecount","ident_utf16":{"start":{"line_number":1571,"utf16_col":4},"end":{"line_number":1571,"utf16_col":28}},"extent_utf16":{"start":{"line_number":1571,"utf16_col":4},"end":{"line_number":1571,"utf16_col":47}}},{"name":"sdb_bu","kind":"class","ident_start":47084,"ident_end":47090,"extent_start":47077,"extent_end":47145,"fully_qualified_name":"sdb_bu","ident_utf16":{"start":{"line_number":1574,"utf16_col":7},"end":{"line_number":1574,"utf16_col":13}},"extent_utf16":{"start":{"line_number":1574,"utf16_col":0},"end":{"line_number":1576,"utf16_col":1}}},{"name":"cleanupbu","kind":"function","ident_start":47159,"ident_end":47168,"extent_start":47159,"extent_end":47195,"fully_qualified_name":"cleanupbu","ident_utf16":{"start":{"line_number":1578,"utf16_col":11},"end":{"line_number":1578,"utf16_col":20}},"extent_utf16":{"start":{"line_number":1578,"utf16_col":11},"end":{"line_number":1578,"utf16_col":47}}},{"name":"lsqlite_backup_init","kind":"function","ident_start":47491,"ident_end":47510,"extent_start":47491,"extent_end":47524,"fully_qualified_name":"lsqlite_backup_init","ident_utf16":{"start":{"line_number":1593,"utf16_col":11},"end":{"line_number":1593,"utf16_col":30}},"extent_utf16":{"start":{"line_number":1593,"utf16_col":11},"end":{"line_number":1593,"utf16_col":44}}},{"name":"lsqlite_getbu","kind":"function","ident_start":48646,"ident_end":48659,"extent_start":48646,"extent_end":48684,"fully_qualified_name":"lsqlite_getbu","ident_utf16":{"start":{"line_number":1628,"utf16_col":15},"end":{"line_number":1628,"utf16_col":28}},"extent_utf16":{"start":{"line_number":1628,"utf16_col":15},"end":{"line_number":1628,"utf16_col":53}}},{"name":"lsqlite_checkbu","kind":"function","ident_start":48863,"ident_end":48878,"extent_start":48863,"extent_end":48903,"fully_qualified_name":"lsqlite_checkbu","ident_utf16":{"start":{"line_number":1634,"utf16_col":15},"end":{"line_number":1634,"utf16_col":30}},"extent_utf16":{"start":{"line_number":1634,"utf16_col":15},"end":{"line_number":1634,"utf16_col":55}}},{"name":"dbbu_gc","kind":"function","ident_start":49077,"ident_end":49084,"extent_start":49077,"extent_end":49098,"fully_qualified_name":"dbbu_gc","ident_utf16":{"start":{"line_number":1640,"utf16_col":11},"end":{"line_number":1640,"utf16_col":18}},"extent_utf16":{"start":{"line_number":1640,"utf16_col":11},"end":{"line_number":1640,"utf16_col":32}}},{"name":"dbbu_step","kind":"function","ident_start":49293,"ident_end":49302,"extent_start":49293,"extent_end":49316,"fully_qualified_name":"dbbu_step","ident_utf16":{"start":{"line_number":1650,"utf16_col":11},"end":{"line_number":1650,"utf16_col":20}},"extent_utf16":{"start":{"line_number":1650,"utf16_col":11},"end":{"line_number":1650,"utf16_col":34}}},{"name":"dbbu_remaining","kind":"function","ident_start":49486,"ident_end":49500,"extent_start":49486,"extent_end":49514,"fully_qualified_name":"dbbu_remaining","ident_utf16":{"start":{"line_number":1657,"utf16_col":11},"end":{"line_number":1657,"utf16_col":25}},"extent_utf16":{"start":{"line_number":1657,"utf16_col":11},"end":{"line_number":1657,"utf16_col":39}}},{"name":"dbbu_pagecount","kind":"function","ident_start":49645,"ident_end":49659,"extent_start":49645,"extent_end":49673,"fully_qualified_name":"dbbu_pagecount","ident_utf16":{"start":{"line_number":1663,"utf16_col":11},"end":{"line_number":1663,"utf16_col":25}},"extent_utf16":{"start":{"line_number":1663,"utf16_col":11},"end":{"line_number":1663,"utf16_col":39}}},{"name":"dbbu_finish","kind":"function","ident_start":49804,"ident_end":49815,"extent_start":49804,"extent_end":49829,"fully_qualified_name":"dbbu_finish","ident_utf16":{"start":{"line_number":1669,"utf16_col":11},"end":{"line_number":1669,"utf16_col":22}},"extent_utf16":{"start":{"line_number":1669,"utf16_col":11},"end":{"line_number":1669,"utf16_col":36}}},{"name":"db_busy_callback","kind":"function","ident_start":50164,"ident_end":50180,"extent_start":50164,"extent_end":50203,"fully_qualified_name":"db_busy_callback","ident_utf16":{"start":{"line_number":1684,"utf16_col":11},"end":{"line_number":1684,"utf16_col":27}},"extent_utf16":{"start":{"line_number":1684,"utf16_col":11},"end":{"line_number":1684,"utf16_col":50}}},{"name":"db_busy_handler","kind":"function","ident_start":50624,"ident_end":50639,"extent_start":50624,"extent_end":50653,"fully_qualified_name":"db_busy_handler","ident_utf16":{"start":{"line_number":1702,"utf16_col":11},"end":{"line_number":1702,"utf16_col":26}},"extent_utf16":{"start":{"line_number":1702,"utf16_col":11},"end":{"line_number":1702,"utf16_col":40}}},{"name":"db_busy_timeout","kind":"function","ident_start":51503,"ident_end":51518,"extent_start":51503,"extent_end":51532,"fully_qualified_name":"db_busy_timeout","ident_utf16":{"start":{"line_number":1733,"utf16_col":11},"end":{"line_number":1733,"utf16_col":26}},"extent_utf16":{"start":{"line_number":1733,"utf16_col":11},"end":{"line_number":1733,"utf16_col":40}}},{"name":"db_exec_callback","kind":"function","ident_start":52150,"ident_end":52166,"extent_start":52150,"extent_end":52218,"fully_qualified_name":"db_exec_callback","ident_utf16":{"start":{"line_number":1756,"utf16_col":11},"end":{"line_number":1756,"utf16_col":27}},"extent_utf16":{"start":{"line_number":1756,"utf16_col":11},"end":{"line_number":1756,"utf16_col":79}}},{"name":"db_exec","kind":"function","ident_start":53324,"ident_end":53331,"extent_start":53324,"extent_end":53345,"fully_qualified_name":"db_exec","ident_utf16":{"start":{"line_number":1803,"utf16_col":11},"end":{"line_number":1803,"utf16_col":18}},"extent_utf16":{"start":{"line_number":1803,"utf16_col":11},"end":{"line_number":1803,"utf16_col":32}}},{"name":"db_prepare","kind":"function","ident_start":54198,"ident_end":54208,"extent_start":54198,"extent_end":54222,"fully_qualified_name":"db_prepare","ident_utf16":{"start":{"line_number":1835,"utf16_col":11},"end":{"line_number":1835,"utf16_col":21}},"extent_utf16":{"start":{"line_number":1835,"utf16_col":11},"end":{"line_number":1835,"utf16_col":35}}},{"name":"db_do_next_row","kind":"function","ident_start":54907,"ident_end":54921,"extent_start":54907,"extent_end":54947,"fully_qualified_name":"db_do_next_row","ident_utf16":{"start":{"line_number":1857,"utf16_col":11},"end":{"line_number":1857,"utf16_col":25}},"extent_utf16":{"start":{"line_number":1857,"utf16_col":11},"end":{"line_number":1857,"utf16_col":51}}},{"name":"db_next_row","kind":"function","ident_start":56472,"ident_end":56483,"extent_start":56472,"extent_end":56497,"fully_qualified_name":"db_next_row","ident_utf16":{"start":{"line_number":1913,"utf16_col":11},"end":{"line_number":1913,"utf16_col":22}},"extent_utf16":{"start":{"line_number":1913,"utf16_col":11},"end":{"line_number":1913,"utf16_col":36}}},{"name":"db_next_packed_row","kind":"function","ident_start":56547,"ident_end":56565,"extent_start":56547,"extent_end":56579,"fully_qualified_name":"db_next_packed_row","ident_utf16":{"start":{"line_number":1917,"utf16_col":11},"end":{"line_number":1917,"utf16_col":29}},"extent_utf16":{"start":{"line_number":1917,"utf16_col":11},"end":{"line_number":1917,"utf16_col":43}}},{"name":"db_next_named_row","kind":"function","ident_start":56629,"ident_end":56646,"extent_start":56629,"extent_end":56660,"fully_qualified_name":"db_next_named_row","ident_utf16":{"start":{"line_number":1921,"utf16_col":11},"end":{"line_number":1921,"utf16_col":28}},"extent_utf16":{"start":{"line_number":1921,"utf16_col":11},"end":{"line_number":1921,"utf16_col":42}}},{"name":"dbvm_do_rows","kind":"function","ident_start":56710,"ident_end":56722,"extent_start":56710,"extent_end":56758,"fully_qualified_name":"dbvm_do_rows","ident_utf16":{"start":{"line_number":1925,"utf16_col":11},"end":{"line_number":1925,"utf16_col":23}},"extent_utf16":{"start":{"line_number":1925,"utf16_col":11},"end":{"line_number":1925,"utf16_col":59}}},{"name":"dbvm_rows","kind":"function","ident_start":56917,"ident_end":56926,"extent_start":56917,"extent_end":56940,"fully_qualified_name":"dbvm_rows","ident_utf16":{"start":{"line_number":1934,"utf16_col":11},"end":{"line_number":1934,"utf16_col":20}},"extent_utf16":{"start":{"line_number":1934,"utf16_col":11},"end":{"line_number":1934,"utf16_col":34}}},{"name":"dbvm_nrows","kind":"function","ident_start":57005,"ident_end":57015,"extent_start":57005,"extent_end":57029,"fully_qualified_name":"dbvm_nrows","ident_utf16":{"start":{"line_number":1938,"utf16_col":11},"end":{"line_number":1938,"utf16_col":21}},"extent_utf16":{"start":{"line_number":1938,"utf16_col":11},"end":{"line_number":1938,"utf16_col":35}}},{"name":"dbvm_urows","kind":"function","ident_start":57093,"ident_end":57103,"extent_start":57093,"extent_end":57117,"fully_qualified_name":"dbvm_urows","ident_utf16":{"start":{"line_number":1942,"utf16_col":11},"end":{"line_number":1942,"utf16_col":21}},"extent_utf16":{"start":{"line_number":1942,"utf16_col":11},"end":{"line_number":1942,"utf16_col":35}}},{"name":"db_do_rows","kind":"function","ident_start":57175,"ident_end":57185,"extent_start":57175,"extent_end":57221,"fully_qualified_name":"db_do_rows","ident_utf16":{"start":{"line_number":1946,"utf16_col":11},"end":{"line_number":1946,"utf16_col":21}},"extent_utf16":{"start":{"line_number":1946,"utf16_col":11},"end":{"line_number":1946,"utf16_col":57}}},{"name":"db_rows","kind":"function","ident_start":58955,"ident_end":58962,"extent_start":58955,"extent_end":58976,"fully_qualified_name":"db_rows","ident_utf16":{"start":{"line_number":2000,"utf16_col":11},"end":{"line_number":2000,"utf16_col":18}},"extent_utf16":{"start":{"line_number":2000,"utf16_col":11},"end":{"line_number":2000,"utf16_col":32}}},{"name":"db_nrows","kind":"function","ident_start":59039,"ident_end":59047,"extent_start":59039,"extent_end":59061,"fully_qualified_name":"db_nrows","ident_utf16":{"start":{"line_number":2004,"utf16_col":11},"end":{"line_number":2004,"utf16_col":19}},"extent_utf16":{"start":{"line_number":2004,"utf16_col":11},"end":{"line_number":2004,"utf16_col":33}}},{"name":"db_urows","kind":"function","ident_start":59157,"ident_end":59165,"extent_start":59157,"extent_end":59179,"fully_qualified_name":"db_urows","ident_utf16":{"start":{"line_number":2009,"utf16_col":11},"end":{"line_number":2009,"utf16_col":19}},"extent_utf16":{"start":{"line_number":2009,"utf16_col":11},"end":{"line_number":2009,"utf16_col":33}}},{"name":"db_tostring","kind":"function","ident_start":59235,"ident_end":59246,"extent_start":59235,"extent_end":59260,"fully_qualified_name":"db_tostring","ident_utf16":{"start":{"line_number":2013,"utf16_col":11},"end":{"line_number":2013,"utf16_col":22}},"extent_utf16":{"start":{"line_number":2013,"utf16_col":11},"end":{"line_number":2013,"utf16_col":36}}},{"name":"db_close","kind":"function","ident_start":59515,"ident_end":59523,"extent_start":59515,"extent_end":59537,"fully_qualified_name":"db_close","ident_utf16":{"start":{"line_number":2024,"utf16_col":11},"end":{"line_number":2024,"utf16_col":19}},"extent_utf16":{"start":{"line_number":2024,"utf16_col":11},"end":{"line_number":2024,"utf16_col":33}}},{"name":"db_close_vm","kind":"function","ident_start":59647,"ident_end":59658,"extent_start":59647,"extent_end":59672,"fully_qualified_name":"db_close_vm","ident_utf16":{"start":{"line_number":2030,"utf16_col":11},"end":{"line_number":2030,"utf16_col":22}},"extent_utf16":{"start":{"line_number":2030,"utf16_col":11},"end":{"line_number":2030,"utf16_col":36}}},{"name":"db_get_ptr","kind":"function","ident_start":60559,"ident_end":60569,"extent_start":60559,"extent_end":60583,"fully_qualified_name":"db_get_ptr","ident_utf16":{"start":{"line_number":2061,"utf16_col":11},"end":{"line_number":2061,"utf16_col":21}},"extent_utf16":{"start":{"line_number":2061,"utf16_col":11},"end":{"line_number":2061,"utf16_col":35}}},{"name":"db_gc","kind":"function","ident_start":60689,"ident_end":60694,"extent_start":60689,"extent_end":60708,"fully_qualified_name":"db_gc","ident_utf16":{"start":{"line_number":2067,"utf16_col":11},"end":{"line_number":2067,"utf16_col":16}},"extent_utf16":{"start":{"line_number":2067,"utf16_col":11},"end":{"line_number":2067,"utf16_col":30}}},{"name":"lsqlite_version","kind":"function","ident_start":61009,"ident_end":61024,"extent_start":61009,"extent_end":61038,"fully_qualified_name":"lsqlite_version","ident_utf16":{"start":{"line_number":2080,"utf16_col":11},"end":{"line_number":2080,"utf16_col":26}},"extent_utf16":{"start":{"line_number":2080,"utf16_col":11},"end":{"line_number":2080,"utf16_col":40}}},{"name":"lsqlite_complete","kind":"function","ident_start":61114,"ident_end":61130,"extent_start":61114,"extent_end":61144,"fully_qualified_name":"lsqlite_complete","ident_utf16":{"start":{"line_number":2085,"utf16_col":11},"end":{"line_number":2085,"utf16_col":27}},"extent_utf16":{"start":{"line_number":2085,"utf16_col":11},"end":{"line_number":2085,"utf16_col":41}}},{"name":"lsqlite_temp_directory","kind":"function","ident_start":61283,"ident_end":61305,"extent_start":61283,"extent_end":61319,"fully_qualified_name":"lsqlite_temp_directory","ident_utf16":{"start":{"line_number":2092,"utf16_col":11},"end":{"line_number":2092,"utf16_col":33}},"extent_utf16":{"start":{"line_number":2092,"utf16_col":11},"end":{"line_number":2092,"utf16_col":47}}},{"name":"lsqlite_activate_cerod","kind":"function","ident_start":61832,"ident_end":61854,"extent_start":61832,"extent_end":61868,"fully_qualified_name":"lsqlite_activate_cerod","ident_utf16":{"start":{"line_number":2113,"utf16_col":11},"end":{"line_number":2113,"utf16_col":33}},"extent_utf16":{"start":{"line_number":2113,"utf16_col":11},"end":{"line_number":2113,"utf16_col":47}}},{"name":"lsqlite_do_open","kind":"function","ident_start":62001,"ident_end":62016,"extent_start":62001,"extent_end":62063,"fully_qualified_name":"lsqlite_do_open","ident_utf16":{"start":{"line_number":2121,"utf16_col":11},"end":{"line_number":2121,"utf16_col":26}},"extent_utf16":{"start":{"line_number":2121,"utf16_col":11},"end":{"line_number":2121,"utf16_col":73}}},{"name":"lsqlite_open","kind":"function","ident_start":62588,"ident_end":62600,"extent_start":62588,"extent_end":62614,"fully_qualified_name":"lsqlite_open","ident_utf16":{"start":{"line_number":2141,"utf16_col":11},"end":{"line_number":2141,"utf16_col":23}},"extent_utf16":{"start":{"line_number":2141,"utf16_col":11},"end":{"line_number":2141,"utf16_col":37}}},{"name":"lsqlite_open_memory","kind":"function","ident_start":62813,"ident_end":62832,"extent_start":62813,"extent_end":62846,"fully_qualified_name":"lsqlite_open_memory","ident_utf16":{"start":{"line_number":2147,"utf16_col":11},"end":{"line_number":2147,"utf16_col":30}},"extent_utf16":{"start":{"line_number":2147,"utf16_col":11},"end":{"line_number":2147,"utf16_col":44}}},{"name":"lsqlite_open_ptr","kind":"function","ident_start":63212,"ident_end":63228,"extent_start":63212,"extent_end":63242,"fully_qualified_name":"lsqlite_open_ptr","ident_utf16":{"start":{"line_number":2156,"utf16_col":11},"end":{"line_number":2156,"utf16_col":27}},"extent_utf16":{"start":{"line_number":2156,"utf16_col":11},"end":{"line_number":2156,"utf16_col":41}}},{"name":"lsqlite_newindex","kind":"function","ident_start":63786,"ident_end":63802,"extent_start":63786,"extent_end":63816,"fully_qualified_name":"lsqlite_newindex","ident_utf16":{"start":{"line_number":2175,"utf16_col":11},"end":{"line_number":2175,"utf16_col":27}},"extent_utf16":{"start":{"line_number":2175,"utf16_col":11},"end":{"line_number":2175,"utf16_col":41}}},{"name":"LSQLITE_VERSION","kind":"macro","ident_start":64003,"ident_end":64018,"extent_start":63995,"extent_end":64029,"fully_qualified_name":"LSQLITE_VERSION","ident_utf16":{"start":{"line_number":2183,"utf16_col":8},"end":{"line_number":2183,"utf16_col":23}},"extent_utf16":{"start":{"line_number":2183,"utf16_col":0},"end":{"line_number":2184,"utf16_col":0}}},{"name":"lsqlite_lversion","kind":"function","ident_start":64085,"ident_end":64101,"extent_start":64085,"extent_end":64115,"fully_qualified_name":"lsqlite_lversion","ident_utf16":{"start":{"line_number":2188,"utf16_col":11},"end":{"line_number":2188,"utf16_col":27}},"extent_utf16":{"start":{"line_number":2188,"utf16_col":11},"end":{"line_number":2188,"utf16_col":41}}},{"name":"create_meta","kind":"function","ident_start":72056,"ident_end":72067,"extent_start":72056,"extent_end":72120,"fully_qualified_name":"create_meta","ident_utf16":{"start":{"line_number":2417,"utf16_col":12},"end":{"line_number":2417,"utf16_col":23}},"extent_utf16":{"start":{"line_number":2417,"utf16_col":12},"end":{"line_number":2417,"utf16_col":76}}},{"name":"luaopen_lsqlite3","kind":"function","ident_start":72477,"ident_end":72493,"extent_start":72477,"extent_end":72507,"fully_qualified_name":"luaopen_lsqlite3","ident_utf16":{"start":{"line_number":2430,"utf16_col":15},"end":{"line_number":2430,"utf16_col":31}},"extent_utf16":{"start":{"line_number":2430,"utf16_col":15},"end":{"line_number":2430,"utf16_col":45}}}]}},"copilotInfo":null,"copilotAccessAllowed":false,"csrf_tokens":{"/elliotsayes/ao/branches":{"post":"gSTKDiWPHsULtfxCWZxbJBmUf2BoG5brvAyoLAG5e2rHW1CKwFyOv53sND6s7mJAQBkAfTbn3HuNwT52QyFCnw"},"/repos/preferences":{"post":"o0sb-d5WOigGVeXv9mIcEH7fphQK77IQ8EUCTEpNWGkH4Ukb1BrEnqR3Z1GY9xwWnWHVZ6PHWP1jFDI-x0o7VQ"}}},"title":"ao/dev-cli/container/src/lsqlite3.c at sqlite · elliotsayes/ao","appPayload":{"helpUrl":"https://docs.github.com","findFileWorkerPath":"/assets-cdn/worker/find-file-worker-a007d7f370d6.js","findInFileWorkerPath":"/assets-cdn/worker/find-in-file-worker-d0f0ff069004.js","githubDevUrl":null,"enabled_features":{"code_nav_ui_events":false,"copilot_conversational_ux":false,"react_blob_overlay":false,"copilot_conversational_ux_embedding_update":false,"copilot_popover_file_editor_header":false,"copilot_smell_icebreaker_ux":true,"copilot_workspace":false,"overview_async_data_channel":false}}}</script>
-  <div data-target="react-app.reactRoot"></div>
-</react-app>
-</turbo-frame>
-
-
-
-  </div>
-
-</turbo-frame>
-
-    </main>
-  </div>
-
-  </div>
-
-          <footer class="footer pt-8 pb-6 f6 color-fg-muted p-responsive" role="contentinfo" >
-  <h2 class='sr-only'>Footer</h2>
-
-  
-
-
-  <div class="d-flex flex-justify-center flex-items-center flex-column-reverse flex-lg-row flex-wrap flex-lg-nowrap">
-    <div class="d-flex flex-items-center flex-shrink-0 mx-2">
-      <a aria-label="Homepage" title="GitHub" class="footer-octicon mr-2" href="https://github.com">
-        <svg aria-hidden="true" height="24" viewBox="0 0 16 16" version="1.1" width="24" data-view-component="true" class="octicon octicon-mark-github">
-    <path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path>
-</svg>
-</a>
-      <span>
-        &copy; 2024 GitHub,&nbsp;Inc.
-      </span>
-    </div>
-
-    <nav aria-label="Footer">
-      <h3 class="sr-only" id="sr-footer-heading">Footer navigation</h3>
-
-      <ul class="list-style-none d-flex flex-justify-center flex-wrap mb-2 mb-lg-0" aria-labelledby="sr-footer-heading">
-
-          <li class="mx-2">
-            <a data-analytics-event="{&quot;category&quot;:&quot;Footer&quot;,&quot;action&quot;:&quot;go to Terms&quot;,&quot;label&quot;:&quot;text:terms&quot;}" href="https://docs.github.com/site-policy/github-terms/github-terms-of-service" data-view-component="true" class="Link--secondary Link">Terms</a>
-          </li>
-
-          <li class="mx-2">
-            <a data-analytics-event="{&quot;category&quot;:&quot;Footer&quot;,&quot;action&quot;:&quot;go to privacy&quot;,&quot;label&quot;:&quot;text:privacy&quot;}" href="https://docs.github.com/site-policy/privacy-policies/github-privacy-statement" data-view-component="true" class="Link--secondary Link">Privacy</a>
-          </li>
-
-          <li class="mx-2">
-            <a data-analytics-event="{&quot;category&quot;:&quot;Footer&quot;,&quot;action&quot;:&quot;go to security&quot;,&quot;label&quot;:&quot;text:security&quot;}" href="/security" data-view-component="true" class="Link--secondary Link">Security</a>
-          </li>
-
-          <li class="mx-2">
-            <a data-analytics-event="{&quot;category&quot;:&quot;Footer&quot;,&quot;action&quot;:&quot;go to status&quot;,&quot;label&quot;:&quot;text:status&quot;}" href="https://www.githubstatus.com/" data-view-component="true" class="Link--secondary Link">Status</a>
-          </li>
-
-          <li class="mx-2">
-            <a data-analytics-event="{&quot;category&quot;:&quot;Footer&quot;,&quot;action&quot;:&quot;go to docs&quot;,&quot;label&quot;:&quot;text:docs&quot;}" href="https://docs.github.com/" data-view-component="true" class="Link--secondary Link">Docs</a>
-          </li>
-
-          <li class="mx-2">
-            <a data-analytics-event="{&quot;category&quot;:&quot;Footer&quot;,&quot;action&quot;:&quot;go to contact&quot;,&quot;label&quot;:&quot;text:contact&quot;}" href="https://support.github.com?tags=dotcom-footer" data-view-component="true" class="Link--secondary Link">Contact</a>
-          </li>
-
-          <li class="mx-2" >
-  <cookie-consent-link>
-    <button type="button" class="Link--secondary underline-on-hover border-0 p-0 color-bg-transparent" data-action="click:cookie-consent-link#showConsentManagement">
-      Manage cookies
-    </button>
-  </cookie-consent-link>
-</li>
-
-<li class="mx-2">
-  <cookie-consent-link>
-    <button type="button" class="Link--secondary underline-on-hover border-0 p-0 color-bg-transparent" data-action="click:cookie-consent-link#showConsentManagement">
-      Do not share my personal information
-    </button>
-  </cookie-consent-link>
-</li>
-
-      </ul>
-    </nav>
-  </div>
-</footer>
-
-
-
-
-    <cookie-consent id="cookie-consent-banner" class="position-fixed bottom-0 left-0" style="z-index: 999999" data-initial-cookie-consent-allowed="" data-cookie-consent-required="false"></cookie-consent>
-
-
-  <div id="ajax-error-message" class="ajax-error-message flash flash-error" hidden>
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-alert">
-    <path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path>
-</svg>
-    <button type="button" class="flash-close js-ajax-error-dismiss" aria-label="Dismiss error">
-      <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-x">
-    <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"></path>
-</svg>
-    </button>
-    You can’t perform that action at this time.
-  </div>
-
-    <template id="site-details-dialog">
-  <details class="details-reset details-overlay details-overlay-dark lh-default color-fg-default hx_rsm" open>
-    <summary role="button" aria-label="Close dialog"></summary>
-    <details-dialog class="Box Box--overlay d-flex flex-column anim-fade-in fast hx_rsm-dialog hx_rsm-modal">
-      <button class="Box-btn-octicon m-0 btn-octicon position-absolute right-0 top-0" type="button" aria-label="Close dialog" data-close-dialog>
-        <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-x">
-    <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.749.749 0 0 1 1.275.326.749.749 0 0 1-.215.734L9.06 8l3.22 3.22a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L8 9.06l-3.22 3.22a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z"></path>
-</svg>
-      </button>
-      <div class="octocat-spinner my-6 js-details-dialog-spinner"></div>
-    </details-dialog>
-  </details>
-</template>
-
-    <div class="Popover js-hovercard-content position-absolute" style="display: none; outline: none;" tabindex="0">
-  <div class="Popover-message Popover-message--bottom-left Popover-message--large Box color-shadow-large" style="width:360px;">
-  </div>
-</div>
-
-    <template id="snippet-clipboard-copy-button">
-  <div class="zeroclipboard-container position-absolute right-0 top-0">
-    <clipboard-copy aria-label="Copy" class="ClipboardButton btn js-clipboard-copy m-2 p-0 tooltipped-no-delay" data-copy-feedback="Copied!" data-tooltip-direction="w">
-      <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-copy js-clipboard-copy-icon m-2">
-    <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path>
-</svg>
-      <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-check js-clipboard-check-icon color-fg-success d-none m-2">
-    <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path>
-</svg>
-    </clipboard-copy>
-  </div>
-</template>
-<template id="snippet-clipboard-copy-button-unpositioned">
-  <div class="zeroclipboard-container">
-    <clipboard-copy aria-label="Copy" class="ClipboardButton btn btn-invisible js-clipboard-copy m-2 p-0 tooltipped-no-delay d-flex flex-justify-center flex-items-center" data-copy-feedback="Copied!" data-tooltip-direction="w">
-      <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-copy js-clipboard-copy-icon">
-    <path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path>
-</svg>
-      <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" data-view-component="true" class="octicon octicon-check js-clipboard-check-icon color-fg-success d-none">
-    <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path>
-</svg>
-    </clipboard-copy>
-  </div>
-</template>
-
-
-
-
-    </div>
-
-    <div id="js-global-screen-reader-notice" class="sr-only" aria-live="polite" aria-atomic="true" ></div>
-    <div id="js-global-screen-reader-notice-assertive" class="sr-only" aria-live="assertive" aria-atomic="true"></div>
-  </body>
-</html>
-
+    /* terminator */
+    { NULL, 0 }
+};
+
+/* ======================================================= */
+
+static const luaL_Reg dblib[] = {
+    {"isopen",              db_isopen               },
+    {"last_insert_rowid",   db_last_insert_rowid    },
+    {"changes",             db_changes              },
+    {"total_changes",       db_total_changes        },
+    {"errcode",             db_errcode              },
+    {"error_code",          db_errcode              },
+    {"errmsg",              db_errmsg               },
+    {"error_message",       db_errmsg               },
+    {"interrupt",           db_interrupt            },
+    {"db_filename",         db_db_filename          },
+
+    {"create_function",     db_create_function      },
+    {"create_aggregate",    db_create_aggregate     },
+    {"create_collation",    db_create_collation     },
+    {"load_extension",      db_load_extension       },
+
+    {"trace",               db_trace                },
+    {"progress_handler",    db_progress_handler     },
+    {"busy_timeout",        db_busy_timeout         },
+    {"busy_handler",        db_busy_handler         },
+#if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK
+    {"update_hook",         db_update_hook          },
+    {"commit_hook",         db_commit_hook          },
+    {"rollback_hook",       db_rollback_hook        },
+#endif
+
+    {"prepare",             db_prepare              },
+    {"rows",                db_rows                 },
+    {"urows",               db_urows                },
+    {"nrows",               db_nrows                },
+
+    {"exec",                db_exec                 },
+    {"execute",             db_exec                 },
+    {"close",               db_close                },
+    {"close_vm",            db_close_vm             },
+    {"get_ptr",             db_get_ptr              },
+
+    {"__tostring",          db_tostring             },
+    {"__gc",                db_gc                   },
+
+    {NULL, NULL}
+};
+
+static const luaL_Reg vmlib[] = {
+    {"isopen",              dbvm_isopen             },
+
+    {"step",                dbvm_step               },
+    {"reset",               dbvm_reset              },
+    {"finalize",            dbvm_finalize           },
+
+    {"columns",             dbvm_columns            },
+
+    {"bind",                dbvm_bind               },
+    {"bind_values",         dbvm_bind_values        },
+    {"bind_names",          dbvm_bind_names         },
+    {"bind_blob",           dbvm_bind_blob          },
+    {"bind_parameter_count",dbvm_bind_parameter_count},
+    {"bind_parameter_name", dbvm_bind_parameter_name},
+
+    {"get_value",           dbvm_get_value          },
+    {"get_values",          dbvm_get_values         },
+    {"get_name",            dbvm_get_name           },
+    {"get_names",           dbvm_get_names          },
+    {"get_type",            dbvm_get_type           },
+    {"get_types",           dbvm_get_types          },
+    {"get_uvalues",         dbvm_get_uvalues        },
+    {"get_unames",          dbvm_get_unames         },
+    {"get_utypes",          dbvm_get_utypes         },
+
+    {"get_named_values",    dbvm_get_named_values   },
+    {"get_named_types",     dbvm_get_named_types    },
+
+    {"rows",                dbvm_rows               },
+    {"urows",               dbvm_urows              },
+    {"nrows",               dbvm_nrows              },
+
+    {"last_insert_rowid",   dbvm_last_insert_rowid  },
+
+    /* compatibility names (added by request) */
+    {"idata",               dbvm_get_values         },
+    {"inames",              dbvm_get_names          },
+    {"itypes",              dbvm_get_types          },
+    {"data",                dbvm_get_named_values   },
+    {"type",                dbvm_get_named_types    },
+
+    {"__tostring",          dbvm_tostring           },
+    {"__gc",                dbvm_gc                 },
+
+    { NULL, NULL }
+};
+
+static const luaL_Reg ctxlib[] = {
+    {"user_data",               lcontext_user_data              },
+
+    {"get_aggregate_data",      lcontext_get_aggregate_context  },
+    {"set_aggregate_data",      lcontext_set_aggregate_context  },
+    {"aggregate_count",         lcontext_aggregate_count        },
+
+    {"result",                  lcontext_result                 },
+    {"result_null",             lcontext_result_null            },
+    {"result_number",           lcontext_result_double          },
+    {"result_double",           lcontext_result_double          },
+    {"result_int",              lcontext_result_int             },
+    {"result_text",             lcontext_result_text            },
+    {"result_blob",             lcontext_result_blob            },
+    {"result_error",            lcontext_result_error           },
+
+    {"__tostring",              lcontext_tostring               },
+    {NULL, NULL}
+};
+
+static const luaL_Reg dbbulib[] = {
+
+    {"step",        dbbu_step       },
+    {"remaining",   dbbu_remaining  },
+    {"pagecount",   dbbu_pagecount  },
+    {"finish",      dbbu_finish     },
+
+/*  {"__tostring",  dbbu_tostring   },   */
+    {"__gc",        dbbu_gc         },
+    {NULL, NULL}
+};
+
+static const luaL_Reg sqlitelib[] = {
+    {"lversion",        lsqlite_lversion        },
+    {"version",         lsqlite_version         },
+    {"complete",        lsqlite_complete        },
+#ifndef _WIN32
+    {"temp_directory",  lsqlite_temp_directory  },
+#endif
+#if defined(SQLITE_ENABLE_CEROD)
+    {"activate_cerod",  lsqlite_activate_cerod  },
+#endif
+    {"open",            lsqlite_open            },
+    {"open_memory",     lsqlite_open_memory     },
+    {"open_ptr",        lsqlite_open_ptr        },
+
+    {"backup_init",     lsqlite_backup_init     },
+
+    {"__newindex",      lsqlite_newindex        },
+    {NULL, NULL}
+};
+
+static void create_meta(lua_State *L, const char *name, const luaL_Reg *lib) {
+    luaL_newmetatable(L, name);
+    lua_pushstring(L, "__index");
+    lua_pushvalue(L, -2);               /* push metatable */
+    lua_rawset(L, -3);                  /* metatable.__index = metatable */
+
+    /* register metatable functions */
+    luaL_openlib(L, NULL, lib, 0);
+
+    /* remove metatable from stack */
+    lua_pop(L, 1);
+}
+
+LUALIB_API int luaopen_lsqlite3(lua_State *L) {
+    create_meta(L, sqlite_meta, dblib);
+    create_meta(L, sqlite_vm_meta, vmlib);
+    create_meta(L, sqlite_bu_meta, dbbulib);
+    create_meta(L, sqlite_ctx_meta, ctxlib);
+
+    luaL_getmetatable(L, sqlite_ctx_meta);
+    sqlite_ctx_meta_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    /* register (local) sqlite metatable */
+    luaL_register(L, "sqlite3", sqlitelib);
+
+    {
+        int i = 0;
+        /* add constants to global table */
+        while (sqlite_constants[i].name) {
+            lua_pushstring(L, sqlite_constants[i].name);
+            lua_pushinteger(L, sqlite_constants[i].value);
+            lua_rawset(L, -3);
+            ++i;
+        }
+    }
+
+    /* set sqlite's metatable to itself - set as readonly (__newindex) */
+    lua_pushvalue(L, -1);
+    lua_setmetatable(L, -2);
+
+    return 1;
+}
