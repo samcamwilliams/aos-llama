@@ -1,0 +1,16 @@
+{
+  "name": "aos-sqlite",
+  "version": "1.0.0",
+  "main": "index.js",
+  "repository": "https://github.com/twilson63/aos-sqlite.git",
+  "author": "Tom Wilson <tom@hyper.io>",
+  "license": "MIT",
+  "scripts": {
+    "balance": "arkb balance --use-bundler https://up.arweave.net -w $WALLET",
+    "fund": "arkb fund-bundler 80000000000 -w $WALLET --use-bundler https://up.arweave.net",
+    "deploy": "arkb deploy aos/process/process.wasm -w $WALLET --use-bundler https://up.arweave.net --tag-name Data-Protocol --tag-value ao --tag-name Variant --tag-value ao.TN.1 --tag-name Type --tag-name Module --tag-name Module-Format --tag-value wasm32-unknown-emscripten2 --tag-name Input-Encoding --tag-value JSON-1 --tag-name Output-Encoding JSON-1 --tag-name Content-Type --tag-value application/wasm --tag-name Memory-Limit --tag-value 500-mb --tag-name Compute-Limit --tag-value 9000000000000"
+  },
+  "devDependencies": {
+    "arkb": "^1.1.61"
+  }
+}
