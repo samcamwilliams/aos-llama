@@ -1,5 +1,7 @@
 # AOS-SQLITE
 
+> The bulk of this effort was done by @elliotsayes during the Hack the Weave competition, Elliot was able to create this WASM Binary that includes both SQLite, LUA, and aos, as an `ao` Module.
+
 This project builds the AOS-SQLITE WASM Binary and Publishes it to Arweave.
 
 ## Build Process
