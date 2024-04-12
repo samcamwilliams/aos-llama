@@ -60,6 +60,7 @@ cd container
 2. Get Latest aos module
 
 ```sh
+git submodule init
 git submodule update --remote
 ```
 
