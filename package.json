@@ -10,7 +10,6 @@
     "deploy": "node deploy.js"
   },
   "devDependencies": {
-    "@irys/sdk": "^0.1.21",
-    "arkb": "^1.1.61"
+    "@irys/sdk": "0.1.16"
   }
 }
