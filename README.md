@@ -4,12 +4,18 @@ AOS-SQLite combines the ao operating system module and sqlite to create an ao cu
 
 > The bulk of this effort was done by @elliotsayes during the Hack the Weave competition, Elliot was able to create this WASM Binary that includes both SQLite, LUA, and aos, as an `ao` Module.
 
-AOS-SQLite Module - `Jxex6RjvDx2fuYV7JF_iowjiJjehm9Fx_fiaexkiyO0`
+AOS-SQLite Module - `ij7nvQ5XnAqqzEy-8vVz6GxSyb5HYZJ2SMtwDIUVMQY`
 
 Run a SQLite Database with AOS
 
 ```sh
-AOS_MODULE=Jxex6RjvDx2fuYV7JF_iowjiJjehm9Fx_fiaexkiyO0 aos my-sqlite
+AOS_MODULE=ij7nvQ5XnAqqzEy-8vVz6GxSyb5HYZJ2SMtwDIUVMQY aos my-sqlite
+```
+
+## Spawn via a process
+
+```lua
+Spawn('ij7nvQ5XnAqqzEy-8vVz6GxSyb5HYZJ2SMtwDIUVMQY', {})
 ```
 
 ## Examples
