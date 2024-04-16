@@ -22,7 +22,17 @@ class Definition():
             self.functions = data.get('functions', [])
             self.entry_file = data.get('entry_file', '')
             self.output_file = data.get('output_file', '')
-            self.extra_compile_arguments = data.get('extra_args', {})
+            self.extra_compile_arguments = {
+                **data.get('extra_args', {})
+            }
+            self.extra_compile_sqlite_arguments = [
+                'SQLITE_ENABLE_MATH_FUNCTIONS',
+                'SQLITE_ENABLE_GEOPOLY',
+                'SQLITE_ENABLE_FTS5',
+                'SQLITE_ENABLE_API_ARMOR',
+            ]
+            self.output_file = data.get('output_file', '')
+
             self.pre_js = data.get('pre_js', '')
 
     def get_entry_file(self):
@@ -35,6 +45,8 @@ class Definition():
         args = []
         for key, val in self.extra_compile_arguments.items():
             args.extend(['-s', '{}={}'.format(key, val)])
+        for key in self.extra_compile_sqlite_arguments:
+            args.extend(['-D{}'.format(key)])
 
         if self.pre_js:
             if not os.path.isfile(self.pre_js):
