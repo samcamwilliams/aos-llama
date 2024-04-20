@@ -94,10 +94,6 @@ COPY ./src/sqlite3.c /opt/sqlite3.c
 COPY ./src/sqlite3.h /opt/sqlite3.h
 COPY ./src/main.lua /opt/main.lua
 
-COPY ./src/llama.o /opt/llama.o
-COPY ./src/model.o /opt/model.o
-COPY ./src/tokenizer.o /opt/tokenizer.o
-
 RUN chmod +x /usr/local/bin/emcc-lua
 
 ENV CC 'emcc -s WASM=1'
@@ -117,6 +113,10 @@ COPY ./src/Makefile /opt/Makefile
 RUN cd /opt && \
   make emscripten
 
+# COPY ./src/llama.o /opt/llama.o
+# COPY ./src/model.o /opt/model.o
+# COPY ./src/tokenizer.o /opt/tokenizer.o
+  
 ###########################################
 ### Publish, Bundler, Process, Contract ###
 ###########################################
