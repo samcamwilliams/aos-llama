@@ -93,10 +93,20 @@ COPY ./src/lsqlite3.h /opt/lsqlite3.h
 COPY ./src/sqlite3.c /opt/sqlite3.c
 COPY ./src/sqlite3.h /opt/sqlite3.h
 COPY ./src/main.lua /opt/main.lua
+
+COPY ./src/run.c /opt/run.c
+COPY ./src/tokenizer.bin /opt/tokenizer.bin
+COPY ./src/model.bin /opt/model.bin
+COPY ./src/generate-model-object.py /opt/generate-model-object.py
+COPY ./src/Makefile /opt/Makefile
 RUN chmod +x /usr/local/bin/emcc-lua
 
 ENV CC 'emcc -s WASM=1'
 ENV NM 'llvm-nm'
+
+## Build Llama2-emscripten
+RUN cd /opt && \
+  make emscripten
 
 ###########################################
 ### Publish, Bundler, Process, Contract ###

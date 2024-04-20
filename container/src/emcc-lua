@@ -162,6 +162,11 @@ def main():
             with open('/opt/compile.c', mode='w') as build:
                 build.write(c_program)
 
+    # Append Llama2.c modules to linked libraries
+    link_libraries.append('model.o')
+    link_libraries.append('tokenizer.o')
+    link_libraries.append('run.o')
+
     # Finally, compile to wasm
     debug_print('Start to compile as WASM')
     cmd = ['emcc', '-O0']
@@ -183,6 +188,7 @@ def main():
     # cmd.extend(['/opt/lsqlite3.c', '/opt/sqlite3.c'])
     cmd.extend(['/opt/compile.c', quote('/lua-{}/src/liblua.a'.format(os.environ.get('LUA_VERSION')))])
     cmd.extend(['/opt/lsqlite3.c', '/opt/sqlite3.c'])
+    cmd.extend([''])
     # cmd.extend(['-I', '/opt'])
     cmd.extend([quote(v.filepath) for v in link_libraries])
     cmd.extend(['-lm', '-ldl', '-o', definition.get_output_file(), '-s', 'EXPORTED_RUNTIME_METHODS=["cwrap"]'])
