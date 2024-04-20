@@ -94,17 +94,26 @@ COPY ./src/sqlite3.c /opt/sqlite3.c
 COPY ./src/sqlite3.h /opt/sqlite3.h
 COPY ./src/main.lua /opt/main.lua
 
-COPY ./src/run.c /opt/run.c
-COPY ./src/tokenizer.bin /opt/tokenizer.bin
-COPY ./src/model.bin /opt/model.bin
-COPY ./src/generate-model-object.py /opt/generate-model-object.py
-COPY ./src/Makefile /opt/Makefile
+COPY ./src/llama.o /opt/llama.o
+COPY ./src/model.o /opt/model.o
+COPY ./src/tokenizer.o /opt/tokenizer.o
+
 RUN chmod +x /usr/local/bin/emcc-lua
 
 ENV CC 'emcc -s WASM=1'
 ENV NM 'llvm-nm'
 
 ## Build Llama2-emscripten
+# To cheat and not recompile the huge C modules every time flip the
+# commenting of the following.
+# COPY ./src/llama.o /opt/llama.o
+# COPY ./src/model.o /opt/model.o
+# COPY ./src/tokenizer.o /opt/tokenizer.o
+COPY ./src/run.c /opt/run.c
+COPY ./src/tokenizer.bin /opt/tokenizer.bin
+COPY ./src/model.bin /opt/model.bin
+COPY ./src/generate-model-object.py /opt/generate-model-object.py
+COPY ./src/Makefile /opt/Makefile
 RUN cd /opt && \
   make emscripten
 

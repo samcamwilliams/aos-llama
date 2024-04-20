@@ -20,9 +20,6 @@ $ ./run
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
-#if defined __EMSCRIPTEN__
-    #include <emscripten.h>
-#endif
 
 // Reference the symbols created by the model.c and tokenizer.c generator
 extern unsigned char preload_model[];
@@ -420,7 +417,7 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-unsigned long long rng_seed;
+unsigned long rng_seed;
 unsigned int random_u32() {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
     rng_seed ^= rng_seed >> 12;
@@ -478,13 +475,7 @@ int pos = 0;              // position in the sequence
 void* on_token_callback = NULL;
 
 
-void main_loop(void * dummy) {
-#if defined __EMSCRIPTEN__
-    if (pos >= steps) {
-        emscripten_pause_main_loop();
-        return; // pointers might be invalid when this resumes
-    }
-#endif
+char* llama_get_next_token(void) {
 
     // forward the transformer to get logits for the next token
     transformer(token, pos, &config, &state, &weights);
@@ -513,41 +504,21 @@ void main_loop(void * dummy) {
 
     // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
     char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next]+1 : vocab[next];
-    printf("%s", token_str);
-    fflush(stdout);
 
     // advance forward
     token = next;
     pos++;
+
+    return token_str;
 }
 
-int old_main(int argc, char *argv[]) {
+int llama_init(void) {
 
     // poor man's C argparse
     char *checkpoint = NULL;  // e.g. out/model.bin
     char *prompt = NULL;      // prompt string
-
-    // 'checkpoint' is necessary arg
-    if (argc < 2) {
-        printf("Usage: %s <checkpoint_file> [temperature] [steps] [prompt]\n", argv[0]);
-        return 1;
-    }
-    if (argc >= 2) {
-        checkpoint = argv[1];
-    }
-    if (argc >= 3) {
-        // optional temperature. 0.0 = (deterministic) argmax sampling. 1.0 = baseline
-        temperature = atof(argv[2]);
-    }
-    if (argc >= 4) {
-        steps = atoi(argv[3]);
-    }
-    if (argc >= 5) {
-        prompt = argv[4];
-    }
-
     // seed rng with time. if you want deterministic behavior use temperature 0.0
-    rng_seed = (unsigned int)time(NULL);
+    rng_seed = random();
 
     // read in the model.bin file
     int fd = 0;         // file descriptor for memory mapping
@@ -612,7 +583,7 @@ int old_main(int argc, char *argv[]) {
 
 #if defined __EMSCRIPTEN__
     pos = steps; // to make the loop pause initially
-    emscripten_set_main_loop_arg(main_loop, NULL, 0, 1);
+    // emscripten_set_main_loop_arg(main_loop, NULL, 0, 1);
 #else
     while (pos < steps) {
         main_loop(NULL);
@@ -621,7 +592,7 @@ int old_main(int argc, char *argv[]) {
         if (start == 0) { start = time_in_ms(); }
     }
 #endif
-
+/*
     // report achieved tok/s
     long end = time_in_ms();
     printf("\nachieved tok/s: %f\n", (steps-1) / (double)(end-start)*1000);
@@ -634,6 +605,7 @@ int old_main(int argc, char *argv[]) {
     if (prompt_tokens != NULL) free(prompt_tokens);
     if (data != MAP_FAILED) munmap(data, file_size);
     if (fd != -1) close(fd);
+*/
     return 0;
 }
 
@@ -653,7 +625,7 @@ void set_parameters(float _tempature, int _steps) {
     }
 }
 
-void generate(char* prompt) {
+void llama_set_prompt(char* prompt) {
     // reset state
     free_run_state(&state);
     if (prompt_tokens != NULL) {
@@ -672,7 +644,6 @@ void generate(char* prompt) {
     pos = 0;
 
     // (re-) start the main loop for generation
-    emscripten_resume_main_loop();
 }
 
 //
@@ -691,10 +662,6 @@ int get_vocab_size() {
 }
 
 int manual_start(char* prompt) {
-    // stop the main loop of any prior generate()
-    // the manual_ functions aren't using it
-    emscripten_pause_main_loop();
-
     // reset state
     free_run_state(&state);
     if (prompt_tokens != NULL) {

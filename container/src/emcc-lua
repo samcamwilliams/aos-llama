@@ -162,17 +162,13 @@ def main():
             with open('/opt/compile.c', mode='w') as build:
                 build.write(c_program)
 
-    # Append Llama2.c modules to linked libraries
-    link_libraries.append('model.o')
-    link_libraries.append('tokenizer.o')
-    link_libraries.append('run.o')
 
     # Finally, compile to wasm
     debug_print('Start to compile as WASM')
     cmd = ['emcc', '-O0']
     cmd.extend([
         '-s', 'ALLOW_MEMORY_GROWTH=1',
-        '-s', 'INITIAL_MEMORY=6291456',
+        '-s', 'INITIAL_MEMORY=75497472',
         '-s', 'MAXIMUM_MEMORY=524288000',
         '-s', 'WASM=1',
         '-s', 'MODULARIZE',
@@ -191,6 +187,8 @@ def main():
     cmd.extend([''])
     # cmd.extend(['-I', '/opt'])
     cmd.extend([quote(v.filepath) for v in link_libraries])
+    # Append Llama2.c modules to linked libraries
+    cmd.extend(['/opt/model.o', '/opt/tokenizer.o', '/opt/llama.o'])
     cmd.extend(['-lm', '-ldl', '-o', definition.get_output_file(), '-s', 'EXPORTED_RUNTIME_METHODS=["cwrap"]'])
 
     print('Compile command is {}'.format(' '.join(cmd)))

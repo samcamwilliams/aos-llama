@@ -48,14 +48,7 @@ runompgnu:
 # includes model & tokenizer
 .PHONY: emscripten
 emscripten: run.c model.o tokenizer.o
-	emcc -c run.c \
-    -o llama.o \
-    -s EXPORTED_FUNCTIONS='["_main", "_main_loop", "_malloc", "_free", "_register_callback", "_set_parameters", "_generate", "_manual_start", "_manual_next", "_get_vocab", "_get_vocab_size"]' \
-    -s EXPORTED_RUNTIME_METHODS='["ccall", "addFunction", "UTF8ToString"]' \
-    -s ALLOW_MEMORY_GROWTH=1 \
-    -s ALLOW_TABLE_GROWTH=1 \
-    -s MODULARIZE \
-    -s EXPORT_NAME='Llama2'
+	emcc -c run.c -o llama.o
 
 model.bin:
 	wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin

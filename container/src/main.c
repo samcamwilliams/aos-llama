@@ -18,6 +18,11 @@ static const unsigned char program[] = {__LUA_BASE__};
 // Pre-compiled entry script which user wrote
 static const unsigned char lua_main_program[] = {__LUA_MAIN__};
 
+// Add Llama2.c functions
+extern int llama_init(void);
+extern void llama_set_prompt(char* prompt);
+extern char* llama_get_next_token(void);
+
 // This line will be injected by emcc-lua as export functions to WASM declaration
 __LUA_FUNCTION_DECLARATIONS__
 
@@ -112,6 +117,18 @@ int main(void) {
     return 0;
   }
   wasm_lua_state = luaL_newstate();
+
+  // Initialize the Llama2 model
+  llama_init();
+  llama_set_prompt("A story about AOS:");
+
+  char* token;
+  for(int i = 0; i < 50; i++) {
+    token = llama_get_next_token();
+    printf("%s ", token);
+    fflush(stdout);
+  }
+
   if (boot_lua(wasm_lua_state)) {
     printf("failed to boot lua runtime\\n");
     lua_close(wasm_lua_state);
