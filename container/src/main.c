@@ -111,6 +111,40 @@ static int docall (lua_State *L, int narg, int nres) {
   return status;
 }
 
+// llama lua wrappers
+static int l_llama_init(lua_State *L) {
+  int result = llama_init();
+  lua_pushinteger(L, result);
+  return 1;
+}
+
+// llama set prompt
+static int l_llama_set_prompt(lua_State *L) {
+  const char* prompt = luaL_checkstring(L, 1);
+  llama_set_prompt((char*) prompt);
+  return 0;
+}
+
+// llama get next token
+static int l_llama_get_next_token(lua_State *L) {
+  char* token = llama_get_next_token();
+  lua_pushstring(L, token);
+  return 1;
+}
+
+// register function
+int luaopen_llama(lua_State *L) {
+  static const luaL_Reg llama_funcs[] = {
+    {"init", l_llama_init},
+    {"set_prompt", l_llama_set_prompt},
+    {"get_next_token", l_llama_get_next_token},
+    {NULL, NULL} //Sentinel to indicate end of array
+  };
+
+  luaL_newlib(L, llama_funcs); // Create a new table and push the library function
+  return 1;
+}
+
 // Boot function
 int main(void) {
   if (wasm_lua_state != NULL) {
@@ -119,15 +153,15 @@ int main(void) {
   wasm_lua_state = luaL_newstate();
 
   // Initialize the Llama2 model
-  llama_init();
-  llama_set_prompt("A story about AOS:");
+  // llama_init();
+  // llama_set_prompt("A story about AOS:");
 
-  char* token;
-  for(int i = 0; i < 50; i++) {
-    token = llama_get_next_token();
-    printf("%s ", token);
-    fflush(stdout);
-  }
+  // char* token;
+  // for(int i = 0; i < 50; i++) {
+  //   token = llama_get_next_token();
+  //   printf("%s ", token);
+  //   fflush(stdout);
+  // }
 
   if (boot_lua(wasm_lua_state)) {
     printf("failed to boot lua runtime\\n");
@@ -141,7 +175,13 @@ int main(void) {
 // boot lua runtime from compiled lua source
 int boot_lua(lua_State* L) {
   luaL_openlibs(L);
-  
+
+  // Preload llama
+  luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
+  lua_pushcfunction(L, luaopen_llama);
+  lua_setfield(L, -2, "llama");
+  lua_pop(L, 1);
+
   // Preload lsqlite3
   luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
   lua_pushcfunction(L, luaopen_lsqlite3);
