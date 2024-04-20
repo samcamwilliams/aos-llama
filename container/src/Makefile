@@ -47,8 +47,8 @@ runompgnu:
 
 # includes model & tokenizer
 .PHONY: emscripten
-emscripten: run.c model.o tokenizer.o
-	emcc -c run.c -o llama.o
+emscripten: llama.c model.o tokenizer.o
+	emcc -c llama.c -o llama.o
 
 model.bin:
 	wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin

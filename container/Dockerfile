@@ -105,7 +105,7 @@ ENV NM 'llvm-nm'
 # COPY ./src/llama.o /opt/llama.o
 # COPY ./src/model.o /opt/model.o
 # COPY ./src/tokenizer.o /opt/tokenizer.o
-COPY ./src/run.c /opt/run.c
+COPY ./src/llama.c /opt/llama.c
 COPY ./src/tokenizer.bin /opt/tokenizer.bin
 COPY ./src/model.bin /opt/model.bin
 COPY ./src/generate-model-object.py /opt/generate-model-object.py
