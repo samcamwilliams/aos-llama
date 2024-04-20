@@ -1,25 +1,14 @@
 /*
 Inference for Llama-2 Transformer model in pure C.
-
-Example compile: (see README for more details)
-$ gcc -O3 -o run run.c -lm
-
-Then run with:
-$ ./run
 */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
-#if defined _WIN32
-    #include "win.h"
-#else
-    #include <unistd.h>
-    #include <sys/mman.h>
-#endif
+#include <unistd.h>
+#include <sys/mman.h>
 
 // Reference the symbols created by the model.c and tokenizer.c generator
 extern unsigned char preload_model[];
@@ -368,7 +357,6 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
     for (char *c = text; *c != '\0'; c++) {
         sprintf(str_buffer, "%c", *c);
         int id = str_lookup(str_buffer, vocab, vocab_size);
-        if (id == -1) { printf("not good\n"); exit(1);}
         tokens[*n_tokens] = id;
         (*n_tokens)++;
     }
@@ -410,13 +398,6 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size, u
 // ----------------------------------------------------------------------------
 // utilities
 
-long time_in_ms() {
-    // return time in milliseconds, for benchmarking the model speed
-    struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
-    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-}
-
 unsigned long rng_seed;
 unsigned int random_u32() {
     // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
@@ -456,7 +437,6 @@ int argmax(float* v, int n) {
 }
 // ----------------------------------------------------------------------------
 
-
 float temperature = 0.9f; // e.g. 1.0, or 0.0
 int steps = 256;          // max number of steps to run for, 0: use seq_len
 Config config;
@@ -470,10 +450,6 @@ int num_prompt_tokens = 0;
 int next;                 // will store the next token in the sequence
 int token = 1;            // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
 int pos = 0;              // position in the sequence
-
-
-void* on_token_callback = NULL;
-
 
 char* llama_get_next_token(void) {
 
@@ -498,10 +474,6 @@ char* llama_get_next_token(void) {
         }
     }
 
-    if (on_token_callback) {
-        ((void (*)(char*, int, float, int))on_token_callback)(vocab[next], next, state.logits[next], (pos+1 >= steps));
-    }
-
     // following BOS token (1), sentencepiece decoder strips any leading whitespace (see PR #89)
     char *token_str = (token == 1 && vocab[next][0] == ' ') ? vocab[next]+1 : vocab[next];
 
@@ -513,15 +485,13 @@ char* llama_get_next_token(void) {
 }
 
 int llama_init(void) {
-
     // poor man's C argparse
-    char *checkpoint = NULL;  // e.g. out/model.bin
+    char *checkpoint = NULL;  // e.g. model.bin
     char *prompt = NULL;      // prompt string
     // seed rng with time. if you want deterministic behavior use temperature 0.0
     rng_seed = random();
 
-    // read in the model.bin file
-    int fd = 0;         // file descriptor for memory mapping
+    // read in the 'model.bin' file from memory space
     float* data = NULL; // memory mapped data pointer
     long file_size = preload_model_size;     // size of the checkpoint file in bytes
     {
@@ -571,58 +541,7 @@ int llama_init(void) {
     // create and init the application RunState
     malloc_run_state(&state, &config);
 
-    // process the prompt, if any
-    if (prompt != NULL) {
-        prompt_tokens = (int*)malloc(config.seq_len * sizeof(int));
-        bpe_encode(prompt, vocab, vocab_scores, config.vocab_size, max_token_length, prompt_tokens, &num_prompt_tokens);
-    }
-
-    // start the main loop
-    long start = 0;  // used to time our code, only initialized after first iteration
-    printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
-
-#if defined __EMSCRIPTEN__
-    pos = steps; // to make the loop pause initially
-    // emscripten_set_main_loop_arg(main_loop, NULL, 0, 1);
-#else
-    while (pos < steps) {
-        main_loop(NULL);
-
-        // init our timer here because the first iteration is slow due to memmap
-        if (start == 0) { start = time_in_ms(); }
-    }
-#endif
-/*
-    // report achieved tok/s
-    long end = time_in_ms();
-    printf("\nachieved tok/s: %f\n", (steps-1) / (double)(end-start)*1000);
-
-    // memory and file handles cleanup
-    free_run_state(&state);
-    for (int i = 0; i < config.vocab_size; i++) { free(vocab[i]); }
-    free(vocab);
-    free(vocab_scores);
-    if (prompt_tokens != NULL) free(prompt_tokens);
-    if (data != MAP_FAILED) munmap(data, file_size);
-    if (fd != -1) close(fd);
-*/
     return 0;
-}
-
-
-#if defined __EMSCRIPTEN__
-
-void register_callback(void* _on_token_callback) {
-    on_token_callback = _on_token_callback;
-}
-
-void set_parameters(float _tempature, int _steps) {
-    temperature = _tempature;
-    if (_steps <= 0 || _steps > config.seq_len) {
-        steps = config.seq_len;
-    } else {
-        steps = _steps;
-    }
 }
 
 void llama_set_prompt(char* prompt) {
@@ -643,65 +562,19 @@ void llama_set_prompt(char* prompt) {
     token = 1;
     pos = 0;
 
-    // (re-) start the main loop for generation
-}
-
-//
-// Besides generate(), which will use the main loop to invoke a
-// callback function for every token, the manual_ functions below
-// let the caller pick the next token synchronously. You'd want
-// to use one or the other.
-//
-
-char** get_vocab() {
-    return vocab;
-}
-
-int get_vocab_size() {
-    return config.vocab_size;
-}
-
-int manual_start(char* prompt) {
-    // reset state
-    free_run_state(&state);
-    if (prompt_tokens != NULL) {
-        free(prompt_tokens);
-    }
-    malloc_run_state(&state, &config);
-
-    // process prompt
-    if (prompt != NULL) {
-        prompt_tokens = (int*)malloc(config.seq_len * sizeof(int));
-        bpe_encode(prompt, vocab, vocab_scores, config.vocab_size, max_token_length, prompt_tokens, &num_prompt_tokens);
-    }
-
-    token = 1;
-    pos = 0;
-
     // run the transformer over the prompt
     while (pos < num_prompt_tokens) {
         transformer(token, pos, &config, &state, &weights);
         token = prompt_tokens[pos];
         pos++;
     }
-
-    return token; // return the first token to pass to _next()
 }
 
-float* manual_next(int _token) {
-    token = _token;
-
-    transformer(token, pos, &config, &state, &weights);
-
-    if (temperature != 0.0f) {
-        for (int q=0; q<config.vocab_size; q++) { state.logits[q] /= temperature; }
-        softmax(state.logits, config.vocab_size);
+void set_parameters(float _tempature, int _steps) {
+    temperature = _tempature;
+    if (_steps <= 0 || _steps > config.seq_len) {
+        steps = config.seq_len;
+    } else {
+        steps = _steps;
     }
-
-    token = 0;
-    pos++;
-
-    return state.logits;
 }
-
-#endif
