@@ -1,4 +1,6 @@
-# AOS-SQLITE
+# AOS-Llama2
+
+WIP rebuild of the AOS-Sqlite code to run llama2.c.
 
 AOS-SQLite combines the ao operating system module and sqlite to create an ao custom module to add a lightweight but powerful indexer to your aos experience.
 
