@@ -12,8 +12,7 @@ aos/package.json:
 	git submodule update --remote
 
 aos/process/process.wasm: aos/package.json container
-	cd container; \
-		docker run -v .:/src p3rmaw3b/ao aos/process/emcc-lua
+		docker run -v container:/src p3rmaw3b/ao emcc-lua
 
 .PHONY: container
 container:
