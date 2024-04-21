@@ -6,51 +6,45 @@ LABEL maintainer "tom wilson <tom@hyper.io>"
 # 
 # https://github.com/emscripten-core/emsdk/blob/9b0db91883452051aca8deddc932363aab29060b/docker/Dockerfile#L120
 
-RUN apt-get update -qq -y
-RUN apt-get install -y curl vim make gcc libreadline6-dev libssl-dev zlib1g-dev zip unzip
+RUN apt-get update -qq && \
+    apt-get install -y curl vim make gcc libreadline6-dev libssl-dev zlib1g-dev zip unzip && \
+    rm -rf /var/lib/apt/lists/*
 
-ENV LUA_VERSION 5.3.4
-ENV LUAROCKS_VERSION 2.4.4
-ENV PYTHON_VERSION 3.6.6
+# Consolidate environment variables, including those for WASM compilation
+ENV LUA_VERSION=5.3.4 \
+    LUAROCKS_VERSION=2.4.4 \
+    PYTHON_VERSION=3.6.6 \
+    NODE_VERSION=18.17.0 \
+    NVM_DIR=/root/.nvm \
+    DENO_INSTALL="/root/.deno" \
+    PATH="/root/.nvm/versions/node/v${NODE_VERSION}/bin/:$DENO_INSTALL/bin:${PATH}" \
+    CC='emcc -s WASM=1' \
+    NM='llvm-nm'
 
-# install deno
-# RUN curl -fsSL https://deno.land/x/install/install.sh | sh
-# RUN echo 'export DENO_INSTALL="/root/.deno"' >> $HOME/.bashrc
-# RUN echo 'export PATH="$DENO_INSTALL/bin:$PATH"' >> $HOME/.bashrc
 
-# Intall yaml
-RUN pip3 install pyyaml
+# Consolidate installations to reduce layers, and clean up in the same layer to use less space
+RUN pip3 install pyyaml && \
+    curl -L http://www.lua.org/ftp/lua-${LUA_VERSION}.tar.gz | tar xzf - -C / && \
+    cd /lua-${LUA_VERSION} && \
+    make linux test && \
+    make install && \
+    cd / && \
+    curl -L https://luarocks.org/releases/luarocks-${LUAROCKS_VERSION}.tar.gz | tar xzf - -C / && \
+    cd /luarocks-${LUAROCKS_VERSION} && \
+    ./configure && \
+    make build && \
+    make install && \
+    cd / && rm -rf /luarocks-${LUAROCKS_VERSION} && \
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash && \
+    . "$NVM_DIR/nvm.sh" && nvm install ${NODE_VERSION} && \
+    nvm use v${NODE_VERSION} && nvm alias default v${NODE_VERSION} && \
+    node --version && npm --version
 
-# Install lua runtime
-RUN cd / && \
-  curl -L http://www.lua.org/ftp/lua-${LUA_VERSION}.tar.gz | tar xzf - && \
-  cd /lua-${LUA_VERSION} && \
-  make linux test && \
-  make install
 
-# Install luarocks
-RUN cd / && \
-  curl -L https://luarocks.org/releases/luarocks-${LUAROCKS_VERSION}.tar.gz | tar xzf - && \
-  cd /luarocks-${LUAROCKS_VERSION} && \
-  ./configure && \
-  make build && \
-  make install
-
-# Install NodeJS
-ENV NODE_VERSION=18.17.0
-RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
-ENV NVM_DIR=/root/.nvm
-RUN . "$NVM_DIR/nvm.sh" && nvm install ${NODE_VERSION}
-RUN . "$NVM_DIR/nvm.sh" && nvm use v${NODE_VERSION}
-RUN . "$NVM_DIR/nvm.sh" && nvm alias default v${NODE_VERSION}
-ENV PATH="/root/.nvm/versions/node/v${NODE_VERSION}/bin/:${PATH}"
-RUN node --version
-RUN npm --version
-
-# And, re-compile lua with "generic WASM"
+# Re-compile lua with "generic WASM" 
 RUN cd /lua-${LUA_VERSION} && \
-  make clean && \
-  make generic CC='emcc -s WASM=1 -U LUA_32BITS' 
+    make clean && \
+    make generic CC='emcc -s WASM=1 -U LUA_32BITS' 
 
 #############################
 ##### Install Commands ######
@@ -75,48 +69,37 @@ RUN cd /lua-${LUA_VERSION} && \
 ###############
 #### Build ####
 ###############
+# Specific files copied as per original requirement
+
+RUN mkdir -p /opt/src
+
 COPY ./src/emcc-lua /usr/local/bin/emcc-lua
 COPY ./src/emcc_lua_lib /usr/local/emcc-lua/emcc_lua_lib
 
-COPY ./src/pre.js /opt/pre.js
-COPY ./src/definition.yml /opt/definition.yml
-COPY ./src/loader.lua /opt/loader.lua
+COPY ["./src/pre.js", \
+      "./src/definition.yml", \
+      "./src/loader.lua", \
+      "/opt/"]
 
-RUN mkdir -p /opt/src
-COPY ./src/json.lua /opt/src/json.lua
-COPY ./src/ao.lua /opt/src/ao.lua
-# COPY ./src/pack.lua /opt/pack.lua
-COPY ./src/main.c /opt/main.c
-# COPY ./src/linit.c /opt/linit.c
-COPY ./src/lsqlite3.c /opt/lsqlite3.c
-COPY ./src/lsqlite3.h /opt/lsqlite3.h
-COPY ./src/sqlite3.c /opt/sqlite3.c
-COPY ./src/sqlite3.h /opt/sqlite3.h
-COPY ./src/main.lua /opt/main.lua
+COPY ["./src/json.lua", \
+      "./src/ao.lua", \
+      "./src/main.c", \
+      "./src/lsqlite3.c", \
+      "./src/lsqlite3.h", \
+      "./src/sqlite3.c", \
+      "./src/sqlite3.h", \
+      "./src/main.lua", \
+      "./src/llama.c", \
+      "./src/tokenizer.bin", \
+      "./src/model.bin", \
+      "./src/generate-model-object.py", \
+      "./src/Makefile", \
+      "/opt/src/"]
 
-RUN chmod +x /usr/local/bin/emcc-lua
+COPY ./src/node /opt/node
 
-ENV CC 'emcc -s WASM=1'
-ENV NM 'llvm-nm'
 
 ## Build Llama2-emscripten
-# To cheat and not recompile the huge C modules every time flip the
-# commenting of the following.
-# COPY ./src/llama.o /opt/llama.o
-# COPY ./src/model.o /opt/model.o
-# COPY ./src/tokenizer.o /opt/tokenizer.o
-COPY ./src/llama.c /opt/llama.c
-COPY ./src/tokenizer.bin /opt/tokenizer.bin
-COPY ./src/model.bin /opt/model.bin
-COPY ./src/generate-model-object.py /opt/generate-model-object.py
-COPY ./src/Makefile /opt/Makefile
-RUN cd /opt && \
-  make emscripten
-
-# COPY ./src/llama.o /opt/llama.o
-# COPY ./src/model.o /opt/model.o
-# COPY ./src/tokenizer.o /opt/tokenizer.o
-  
 ###########################################
 ### Publish, Bundler, Process, Contract ###
 ###########################################
@@ -125,8 +108,11 @@ RUN cd /opt && \
 # 
 # By running npm link, we allow any commands exposed by
 # the node module to be ran globally within the container
-RUN mkdir -p /opt/node
-COPY ./src/node /opt/node
-RUN cd /opt/node && \
-  npm install --omit="dev" && \
-  npm link
+
+RUN chmod +x /usr/local/bin/emcc-lua && \
+    cd /opt/src && make emscripten && \
+    cd /opt/node && npm install --omit="dev" && npm link
+
+ENV CC 'emcc -s WASM=1'
+ENV NM 'llvm-nm'
+
