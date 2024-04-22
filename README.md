@@ -25,7 +25,7 @@ Special thanks to all of the following, whose work made this build possible:
 AOS-Llama offers a simple interface for running LLM compute inside your AO processes. You will need to run a new AOS process using a module published from this repository in order to access it. You can start an AOS-Llama process as follows:
 
 ```bash
-AOS_MODULE=AQhN6EY8jbwcd9YygzN1JvuaV_E86lHB-rjkQ7X3Omg aos your-llama-process-name
+aos your-llama-process-name --module AQhN6EY8jbwcd9YygzN1JvuaV_E86lHB-rjkQ7X3Omg
 ```
 
 The above module ID is an example AOS-Llama that you can use without having to do any manual building yourself.
