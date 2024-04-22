@@ -101,6 +101,7 @@ ENV NM 'llvm-nm'
 
 COPY ./src/llama.c /opt/llama.c
 COPY ./src/llama.h /opt/llama.h
+COPY ./src/llama.lua /opt/llama.lua
 COPY ./src/llama-bindings.c /opt/llama-bindings.c
 
 ###########################################

@@ -1,89 +1,119 @@
-# AOS-Llama2
+# AOS-Llama
 
-WIP rebuild of the AOS-Sqlite code to run llama2.c.
+![Dank AO Llama](image.webp)
 
-AOS-SQLite combines the ao operating system module and sqlite to create an ao custom module to add a lightweight but powerful indexer to your aos experience.
+_WIP: Here be dragons. The product of 3 nights of hacking -- use at your own risk!_
 
-> The bulk of this effort was done by @elliotsayes during the Hack the Weave competition, Elliot was able to create this WASM Binary that includes both SQLite, LUA, and aos, as an `ao` Module.
+This repository builds an AOS image that contains the [llama2.c](https://github.com/karpathy/llama2.c) inference engine. It is a simple implementation of the core transformer architecture used by Meta's [Llama](https://llama.meta.com/) models.
 
-AOS-SQLite Module - `GYrbbe0VbHim_7Hi6zrOpHQXrSQz07XNtwCnfbFo2I0`
+When using this version of AOS, you can use the `llama` Lua module to load a model from Arweave and generate text using it. You can then use that output in whatever way you would like in your AOS processes.
 
-Run a SQLite Database with AOS
+You can also use the tools in this repository to convert compatible models to the format that llama2.c expects, as well as publish them on to Arweave.
 
-```sh
-AOS_MODULE=GYrbbe0VbHim_7Hi6zrOpHQXrSQz07XNtwCnfbFo2I0 aos my-sqlite
+Special thanks to all of the following, whose work made this build possible:
+
+- [@Karpathy](https://github.com/karpathy)
+- [@Allquantor](https://github.com/allquantor)
+- [@twilson63](https://github.com/twilson63)
+- [@elliotsayes](https://github.com/elliotsayes)
+- [@Meta](https://github.com/meta-ai)
+
+...and the many others that made the infrastructure of the permaweb!
+
+## Requirements
+
+In order to build the AOS process module, your machine must have:
+
+- Docker
+- Node
+- >=8 GB of RAM
+
+If you would like to publish a model to Arweave, you will need:
+
+- Python 3
+- An Arweave wallet topped up with credits for [Ardrive Turbo](https://ardrive.com/turbo)
+- A model that can be converted to the appropriate format (see [here for details](https://github.com/karpathy/llama2.c#metas-llama-2-models))
+
+## Publish an AOS-Llama model
+
+AOS-Llama uses the `Onchain-Llama` data protocol to store models on Arweave. This format creates a chain of Arweave data items to allow the model uploads to be 'streamed' (via assigned messages) into AO processes. In order to publish a model, you will need to convert it to the appropriate format and then publish it to Arweave using this format.
+
+### Converting your model
+
+Use the `convert.py` script to convert your model to the appropriate format.
+
+If your model is in Meta's 'original' Llama format, use the `--meta-llama` flag on `convert-model.py` to prepare it:
+
+```bash
+python3 convert-model.py <output-model-name> --meta-llama <path-to-model>
 ```
 
-## Spawn via a process
+If your model is in Huggingface weight format (`hf`), use the following:
 
-```lua
-Spawn('GYrbbe0VbHim_7Hi6zrOpHQXrSQz07XNtwCnfbFo2I0', {})
+```bash
+python3 convert-model.py <output-model-name> --hf <path-to-model>
 ```
 
-## Examples
+### Preparing your tokenizer
 
-```lua
-local sqlite3 = require("lsqlite3")
- 
-db = sqlite3.open_memory()
-  
-db:exec[[
-  CREATE TABLE test (id INTEGER PRIMARY KEY, content);
-  INSERT INTO test VALUES (NULL, 'Hello Lua');
-  INSERT INTO test VALUES (NULL, 'Hello Sqlite3');
-  INSERT INTO test VALUES (NULL, 'Hello ao!!!');
-]]
-return "ok"
+Your model may also use a different vocabular/tokenizer file to the original Llama2. If so, please run the following script to convert it:
 
+```bash
+python tokenizer.py --tokenizer-model=<path-to-tokenizer.model>
 ```
 
-```lua
-local s = ""
- 
-for row in db:nrows("SELECT * FROM test") do
-  s = s .. row.id .. ": " .. row.content .. "\\n"
-end
- 
-return s
+These scripts were prepared by [@Karpathy](https://github.com/karpathy) for the original Llama2.c implementation. You can find the original implementation and details about their use [here](https://github.com/karpathy/llama2.c).
+
+### Deploy to Arweave
+
+You can use the `publish-model` script to deploy your model to Arweave. You will need to install the necessary node libraries first:
+
+```bash
+make install
 ```
 
-## AO Resources
+Once installed, you can run the following to see the parameters of the deployment script:
 
-* https://ao.arweave.dev
-* https://cookbook_ao.arweave.dev
+```bash
+./publish-model
 
----
-
-This project builds the AOS-SQLITE WASM Binary and Publishes it to Arweave.
-
-## Build Process
-
-1. Build docker image
-
-```sh
-cd container
-./build.sh
+Usage: publish-model [options]
+Options:
+  -w [path]       Path to the Arweave wallet JSON file (default from ARWEAVE_WALLET env)
+  -m [path]       Path to the model binary file (default: ./model.bin)
+  -t [path]       Path to the tokenizer binary file (default: ./tokenizer.bin)
+  -s [size]       Chunk size in megabytes (default: 100)
+  -b [url]        Base URL for the bundler (default: https://turbo.ardrive.io)
+  -h, --help      Display this help message and exit
 ```
 
-2. Get Latest aos module
+An example invocation of the script may look as follows:
 
-```sh
-git submodule init
-git submodule update --remote
+```bash
+./publish-model -w ~/key.json -t tokenizer.bin -m model.bin -s 10
+```
+Remember to have credits with the bundler before you upload! You can buy Ardrive Turbo credits via Stripe [here](https://app.ardrive.io/#/sign-in).
+
+## Building the AOS image
+
+To build and run the tests on the AOS image, simply run the following command in the root directory:
+
+```bash
+make 
 ```
 
-3. Use docker image to compile process.wasm
+This repo uses a docker environment to create a sandboxed environment for building AOS images -- downloading and installing the toolchain in a predictable environment, lowering the requirements on your host machine.
 
-```sh
-cd aos/process
-docker run -v .:/src p3rmaw3b/ao emcc-lua
+If you would like to build the AOS image without running the tests, you can run the following command:
+
+```bash
+make build
 ```
 
-4. Publish Module with tags via arkb
+## Publish the AOS image
 
-> You will need a funded wallet for this step 
+When you would like to publish your AOS module to Arweave, you can use the following:
 
-```sh
-export WALLET=~/.wallet.json
-npm run deploy
+```
+make publish-module WALLET=<path-to-wallet>
 ```

@@ -1,11 +1,18 @@
 # Set the location of your wallet for publication:
-WALLET_LOC = ~/key.json
+WALLET_LOC ?= key.json
 
 .PHONY: test
 test: demo/process.wasm
 	cd demo; \
 		npm install; \
 		node --test eval.test.js
+
+.PHONY: build
+build: aos/process/process.wasm
+
+.PHONY: install
+install: aos/package.json
+	npm install
 
 aos/package.json:
 	git submodule init
@@ -22,5 +29,6 @@ aos/process/process.wasm: aos/package.json container
 container:
 	docker build container -t p3rmaw3b/ao
 
-publish: aos/process/process.wasm
-	WALLET=$(WALLET_LOC) npm run deploy
+publish-module: aos/process/process.wasm
+	npm install
+	WALLET=$(WALLET_LOC) ./publish-module
