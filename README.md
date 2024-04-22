@@ -1,6 +1,6 @@
 # AOS-Llama
 
-![Dank AO Llama](image.webp)
+![Dank AO Llama](image.webp | width=200)
 
 _WIP: Here be dragons. The product of 3 nights of hacking -- use at your own risk!_
 
@@ -26,7 +26,7 @@ In order to build the AOS process module, your machine must have:
 
 - Docker
 - Node
-- >=8 GB of RAM
+- At least 8 GB of RAM
 
 If you would like to publish a model to Arweave, you will need:
 
