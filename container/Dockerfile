@@ -113,6 +113,3 @@ RUN chmod +x /usr/local/bin/emcc-lua && \
     cd /opt/src && make emscripten && \
     cd /opt/node && npm install --omit="dev" && npm link
 
-ENV CC 'emcc -s WASM=1'
-ENV NM 'llvm-nm'
-
