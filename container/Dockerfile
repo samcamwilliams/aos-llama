@@ -75,34 +75,34 @@ RUN cd /lua-${LUA_VERSION} && \
 ###############
 #### Build ####
 ###############
-COPY ./src/emcc-lua /usr/local/bin/emcc-lua
-COPY ./src/emcc_lua_lib /usr/local/emcc-lua/emcc_lua_lib
+COPY container/src/emcc-lua /usr/local/bin/emcc-lua
+COPY container/src/emcc_lua_lib /usr/local/emcc-lua/emcc_lua_lib
 
-COPY ./src/pre.js /opt/pre.js
-COPY ./src/definition.yml /opt/definition.yml
-COPY ./src/loader.lua /opt/loader.lua
+COPY container/src/pre.js /opt/pre.js
+COPY container/src/definition.yml /opt/definition.yml
+COPY container/src/loader.lua /opt/loader.lua
 
 RUN mkdir -p /opt/src
-COPY ./src/json.lua /opt/src/json.lua
-COPY ./src/ao.lua /opt/src/ao.lua
-# COPY ./src/pack.lua /opt/pack.lua
-COPY ./src/main.c /opt/main.c
-# COPY ./src/linit.c /opt/linit.c
-COPY ./src/lsqlite3.c /opt/lsqlite3.c
-COPY ./src/lsqlite3.h /opt/lsqlite3.h
-COPY ./src/sqlite3.c /opt/sqlite3.c
-COPY ./src/sqlite3.h /opt/sqlite3.h
-COPY ./src/main.lua /opt/main.lua
+COPY container/src/json.lua /opt/src/json.lua
+COPY container/src/ao.lua /opt/src/ao.lua
+# COPY container/src/pack.lua /opt/pack.lua
+COPY container/src/main.c /opt/main.c
+# COPY container/src/linit.c /opt/linit.c
+COPY container/src/lsqlite3.c /opt/lsqlite3.c
+COPY container/src/lsqlite3.h /opt/lsqlite3.h
+COPY container/src/sqlite3.c /opt/sqlite3.c
+COPY container/src/sqlite3.h /opt/sqlite3.h
+COPY container/src/main.lua /opt/main.lua
 
 RUN chmod +x /usr/local/bin/emcc-lua
 
 ENV CC 'emcc -s WASM=1'
 ENV NM 'llvm-nm'
 
-COPY ./src/llama.c /opt/llama.c
-COPY ./src/llama.h /opt/llama.h
-COPY ./src/llama.lua /opt/llama.lua
-COPY ./src/llama-bindings.c /opt/llama-bindings.c
+COPY container/../../src/llama.c /opt/llama.c
+COPY container/../../src/llama.h /opt/llama.h
+COPY container/../../src/llama-bindings.c /opt/llama-bindings.c
+COPY container/../../src/llama.lua /opt/src/llama.lua
 
 ###########################################
 ### Publish, Bundler, Process, Contract ###
@@ -113,7 +113,7 @@ COPY ./src/llama-bindings.c /opt/llama-bindings.c
 # By running npm link, we allow any commands exposed by
 # the node module to be ran globally within the container
 RUN mkdir -p /opt/node
-COPY ./src/node /opt/node
+COPY container/src/node /opt/node
 RUN cd /opt/node && \
   npm install --omit="dev" && \
   npm link

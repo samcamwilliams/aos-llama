@@ -110,6 +110,12 @@ If you would like to build the AOS image without running the tests, you can run 
 make build
 ```
 
+If you would like to print more debugging details to the console during compilation of any `make` target, you can use the `DEBUG=1` flag. For example:
+
+```bash
+make build DEBUG=1
+```
+
 ## Publish the AOS image
 
 When you would like to publish your AOS module to Arweave, you can use the following:

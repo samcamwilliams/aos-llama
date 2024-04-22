@@ -6,4 +6,4 @@ functions:
       - string
 
 entry_file: loader.lua
-output_file: process.js
+output_file: AOS.js
