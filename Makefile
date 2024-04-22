@@ -22,10 +22,10 @@ install: build/aos/package.json
 
 .PHONY: clean
 clean:
-	rm -rf build/aos/*
 	rm AOS.wasm test/AOS.wasm
 	rm package-lock.json
 	rm -rf node_modules
+	docker rmi p3rmaw3b/ao || true
 
 build/aos/package.json:
 	cd build; \
@@ -41,4 +41,4 @@ container:
 
 publish-module: AOS.wasm
 	npm install
-	WALLET=$(WALLET_LOC) ./publish-module
+	WALLET=$(WALLET_LOC) scripts/publish-module

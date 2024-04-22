@@ -15,7 +15,7 @@ const main = async () => {
     key: wallet, // Arweave wallet
   });
 
-  const receipt = await bundler.uploadFile("./aos/process/process.wasm", {
+  const receipt = await bundler.uploadFile("AOS.wasm", {
     tags: [
       { name: 'Content-Type', value: 'application/wasm' },
       { name: 'Data-Protocol', value: 'ao' },

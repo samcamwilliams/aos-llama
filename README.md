@@ -45,13 +45,13 @@ Use the `convert.py` script to convert your model to the appropriate format.
 If your model is in Meta's 'original' Llama format, use the `--meta-llama` flag on `convert-model.py` to prepare it:
 
 ```bash
-python3 convert-model.py <output-model-name> --meta-llama <path-to-model>
+python3 scripts/convert-model.py <output-model-name> --meta-llama <path-to-model>
 ```
 
 If your model is in Huggingface weight format (`hf`), use the following:
 
 ```bash
-python3 convert-model.py <output-model-name> --hf <path-to-model>
+python3 scripts/convert-model.py <output-model-name> --hf <path-to-model>
 ```
 
 ### Preparing your tokenizer
@@ -59,7 +59,7 @@ python3 convert-model.py <output-model-name> --hf <path-to-model>
 Your model may also use a different vocabular/tokenizer file to the original Llama2. If so, please run the following script to convert it:
 
 ```bash
-python tokenizer.py --tokenizer-model=<path-to-tokenizer.model>
+python scripts/tokenizer.py --tokenizer-model=<path-to-tokenizer.model>
 ```
 
 These scripts were prepared by [@Karpathy](https://github.com/karpathy) for the original Llama2.c implementation. You can find the original implementation and details about their use [here](https://github.com/karpathy/llama2.c).
@@ -75,7 +75,7 @@ make install
 Once installed, you can run the following to see the parameters of the deployment script:
 
 ```bash
-./publish-model
+scripts/publish-model
 
 Usage: publish-model [options]
 Options:
@@ -90,7 +90,7 @@ Options:
 An example invocation of the script may look as follows:
 
 ```bash
-./publish-model -w ~/key.json -t tokenizer.bin -m model.bin -s 10
+scripts/publish-model -w ~/key.json -t tokenizer.bin -m model.bin -s 10
 ```
 Remember to have credits with the bundler before you upload! You can buy Ardrive Turbo credits via Stripe [here](https://app.ardrive.io/#/sign-in).
 
