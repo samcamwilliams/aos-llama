@@ -188,7 +188,7 @@ def main():
     # cmd.extend(['-I', '/opt'])
     cmd.extend([quote(v.filepath) for v in link_libraries])
     # Append Llama2.c modules to linked libraries
-    cmd.extend(['/opt/model.o', '/opt/tokenizer.o', '/opt/llama.o'])
+    cmd.extend(['/opt/llama.c', '/opt/llama-bindings.c'])
     cmd.extend(['-lm', '-ldl', '-o', definition.get_output_file(), '-s', 'EXPORTED_RUNTIME_METHODS=["cwrap"]'])
 
     print('Compile command is {}'.format(' '.join(cmd)))

@@ -3,6 +3,7 @@
 #include <lualib.h>
 
 #include "lsqlite3.h"
+#include "llama.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,11 +18,6 @@ static lua_State *wasm_lua_state = NULL;
 static const unsigned char program[] = {__LUA_BASE__};
 // Pre-compiled entry script which user wrote
 static const unsigned char lua_main_program[] = {__LUA_MAIN__};
-
-// Add Llama2.c functions
-extern int llama_init(void);
-extern void llama_set_prompt(char* prompt);
-extern char* llama_get_next_token(void);
 
 // This line will be injected by emcc-lua as export functions to WASM declaration
 __LUA_FUNCTION_DECLARATIONS__
@@ -111,57 +107,12 @@ static int docall (lua_State *L, int narg, int nres) {
   return status;
 }
 
-// llama lua wrappers
-static int l_llama_init(lua_State *L) {
-  int result = llama_init();
-  lua_pushinteger(L, result);
-  return 1;
-}
-
-// llama set prompt
-static int l_llama_set_prompt(lua_State *L) {
-  const char* prompt = luaL_checkstring(L, 1);
-  llama_set_prompt((char*) prompt);
-  return 0;
-}
-
-// llama get next token
-static int l_llama_get_next_token(lua_State *L) {
-  char* token = llama_get_next_token();
-  lua_pushstring(L, token);
-  return 1;
-}
-
-// register function
-int luaopen_llama(lua_State *L) {
-  static const luaL_Reg llama_funcs[] = {
-    {"init", l_llama_init},
-    {"set_prompt", l_llama_set_prompt},
-    {"get_next_token", l_llama_get_next_token},
-    {NULL, NULL} //Sentinel to indicate end of array
-  };
-
-  luaL_newlib(L, llama_funcs); // Create a new table and push the library function
-  return 1;
-}
-
 // Boot function
 int main(void) {
   if (wasm_lua_state != NULL) {
     return 0;
   }
   wasm_lua_state = luaL_newstate();
-
-  // Initialize the Llama2 model
-  // llama_init();
-  // llama_set_prompt("A story about AOS:");
-
-  // char* token;
-  // for(int i = 0; i < 50; i++) {
-  //   token = llama_get_next_token();
-  //   printf("%s ", token);
-  //   fflush(stdout);
-  // }
 
   if (boot_lua(wasm_lua_state)) {
     printf("failed to boot lua runtime\\n");

@@ -45,26 +45,10 @@ rungnu:
 runompgnu:
 	$(CC) -Ofast -fopenmp -std=gnu11 run.c  -lm  -o run
 
-# includes model & tokenizer
 .PHONY: emscripten
-emscripten: llama.c model.o tokenizer.o
+emscripten: llama.c llama.h llama-bindings.c
 	emcc -c llama.c -o llama.o
-
-model.bin:
-	wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
-	mv stories15M model.bin
-
-model.c: model.bin
-	python3 generate-model-object.py
-
-model.o: model.c
-	emcc -c model.c -o model.o
-
-tokenizer.c: tokenizer.bin
-	python3 generate-model-object.py
-
-tokenizer.o: tokenizer.c
-	emcc -c tokenizer.c -o tokenizer.o
+	emcc -c llama-bindings.c -o llama-bindings.o
 
 .PHONY: clean
 clean:

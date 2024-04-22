@@ -26,18 +26,10 @@ test('run evaluate action unsuccessfully', async () => {
       { name: 'Action', value: 'Eval' }
     ],
     Data: `
-local llama = require("llama")
-llama.init()
-llama.set_prompt("Hello World")
-local story = ""
-for i=1,50 do
-  story = story .. llama.get_next_token()
-end
-return story
+return "ok"
     `
   }
   const result = await handle(null, msg, env)
   console.log(result.Output.data.output)
-  //assert.equal(result.Output.data.output, 'ok')
-  assert.ok(true)
+  assert.equal(result.Output.data.output, 'ok')
 })

@@ -99,24 +99,11 @@ RUN chmod +x /usr/local/bin/emcc-lua
 ENV CC 'emcc -s WASM=1'
 ENV NM 'llvm-nm'
 
-## Build Llama2-emscripten
-# To cheat and not recompile the huge C modules every time flip the
-# commenting of the following.
-# COPY ./src/llama.o /opt/llama.o
-# COPY ./src/model.o /opt/model.o
-# COPY ./src/tokenizer.o /opt/tokenizer.o
 COPY ./src/llama.c /opt/llama.c
-COPY ./src/tokenizer.bin /opt/tokenizer.bin
-COPY ./src/model.bin /opt/model.bin
-COPY ./src/generate-model-object.py /opt/generate-model-object.py
+COPY ./src/llama.h /opt/llama.h
+COPY ./src/llama-bindings.c /opt/llama-bindings.c
 COPY ./src/Makefile /opt/Makefile
-RUN cd /opt && \
-  make emscripten
 
-# COPY ./src/llama.o /opt/llama.o
-# COPY ./src/model.o /opt/model.o
-# COPY ./src/tokenizer.o /opt/tokenizer.o
-  
 ###########################################
 ### Publish, Bundler, Process, Contract ###
 ###########################################

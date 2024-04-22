@@ -10,13 +10,6 @@ Inference for Llama-2 Transformer model in pure C.
 #include <unistd.h>
 #include <sys/mman.h>
 
-// Reference the symbols created by the model.c and tokenizer.c generator
-extern unsigned char preload_model[];
-extern unsigned int preload_model_size;
-
-extern unsigned char preload_tokenizer[];
-extern unsigned int preload_tokenizer_size;
-
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
@@ -451,6 +444,25 @@ int next;                 // will store the next token in the sequence
 int token = 1;            // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
 int pos = 0;              // position in the sequence
 
+unsigned char* raw_model = NULL;
+unsigned char* raw_tokenizer = NULL;
+size_t raw_model_size = 0;
+size_t raw_tokenizer_size = 0;
+
+void llama_load_model(char* bytes, int size, int total_size) {
+    if(raw_model == NULL) {
+        raw_model = (unsigned char*)malloc(total_size);
+    }
+    memcpy(raw_model + raw_model_size, bytes, size);
+    raw_model_size += size;
+}
+
+void llama_load_tokenizer(char* bytes, int size) {
+    raw_tokenizer = (unsigned char*)malloc(size);
+    memcpy(raw_tokenizer, bytes, size);
+    raw_tokenizer_size = size;
+}
+
 char* llama_get_next_token(void) {
 
     // forward the transformer to get logits for the next token
@@ -493,15 +505,15 @@ int llama_init(void) {
 
     // read in the 'model.bin' file from memory space
     float* data = NULL; // memory mapped data pointer
-    long file_size = preload_model_size;     // size of the checkpoint file in bytes
+    long file_size = raw_model_size;     // size of the checkpoint file in bytes
     {
-        memcpy(&config, preload_model, sizeof(Config));
+        memcpy(&config, raw_model, sizeof(Config));
         // negative vocab size is hacky way of signaling unshared weights. bit yikes.
         int shared_weights = config.vocab_size > 0 ? 1 : 0;
         config.vocab_size = abs(config.vocab_size);
 
         // Assign the pointer to the data just after the Config structure
-        data = (float *)(preload_model + sizeof(Config));
+        data = (float *)(raw_model + sizeof(Config));
 
         checkpoint_init_weights(&weights, &config, data, shared_weights);
     }
@@ -513,8 +525,8 @@ int llama_init(void) {
     vocab_scores = (float*)malloc(config.vocab_size * sizeof(float));
 
     {
-        unsigned char *data_ptr = preload_tokenizer;
-        unsigned char *end_ptr = preload_tokenizer + preload_tokenizer_size;
+        unsigned char *data_ptr = raw_tokenizer;
+        unsigned char *end_ptr = raw_tokenizer + raw_tokenizer_size;
         int config_vocab_size = config.vocab_size;
 
         memcpy(&max_token_length, data_ptr, sizeof(int));
