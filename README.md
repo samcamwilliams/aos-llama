@@ -6,7 +6,7 @@ _WIP: Here be dragons. The product of 3 nights of hacking -- use at your own ris
 
 This repository builds an AOS image that contains the [llama2.c](https://github.com/karpathy/llama2.c) inference engine. It is a simple implementation of the core transformer architecture used by Meta's [Llama](https://llama.meta.com/) models, running fully onchain with AO.
 
-When using this version of AOS, you can use the `llama` Lua module to load a model from Arweave and generate text using it. You can then use that output in whatever way you would like in your AOS processes.
+When utilizing this version of AOS, you can use the `llama` Lua module to load a model from Arweave and generate text using it. You can then use that output in whatever way you would like in your AOS processes.
 
 You can also use the tools in this repository to convert compatible models to the format that llama2.c expects, as well as publish them on to Arweave.
 
