@@ -1,15 +1,14 @@
 {
-  "name": "aos-sqlite",
+  "name": "aos-llama2",
   "type": "module",
   "version": "1.0.0",
   "main": "index.js",
-  "repository": "https://github.com/twilson63/aos-sqlite.git",
-  "author": "Tom Wilson <tom@hyper.io>",
+  "repository": "https://github.com/twilson63/aos-llama2.git",
   "license": "MIT",
   "scripts": {
     "deploy": "node deploy.js"
   },
-  "devDependencies": {
-    "@irys/sdk": "0.1.16"
+  "dependencies": {
+    "@ardrive/turbo-sdk": "^1.5.0"
   }
 }

@@ -173,7 +173,7 @@ def main():
         '-s', 'WASM=1',
         '-s', 'MODULARIZE',
         # '-s', 'FILESYSTEM=0',
-        '-s', 'DETERMINISTIC=1', 
+        '-s', 'DETERMINISTIC=1',
         '-s', 'NODERAWFS=0'
     ])
     cmd.extend(['-s', 'ASSERTIONS=1'])

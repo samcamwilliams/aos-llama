@@ -102,7 +102,6 @@ ENV NM 'llvm-nm'
 COPY ./src/llama.c /opt/llama.c
 COPY ./src/llama.h /opt/llama.h
 COPY ./src/llama-bindings.c /opt/llama-bindings.c
-COPY ./src/Makefile /opt/Makefile
 
 ###########################################
 ### Publish, Bundler, Process, Contract ###

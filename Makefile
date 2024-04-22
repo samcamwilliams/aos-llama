@@ -11,13 +11,11 @@ aos/package.json:
 	git submodule init
 	git submodule update --remote
 
-demo/process.wasm: container/src/process.wasm
-	cp container/src/process.wasm demo/process.wasm
-	cp container/src/process.js demo/process.js
+demo/process.wasm: aos/process/process.wasm
+	cp aos/process/process.wasm demo/process.wasm
 
-container/src/process.wasm: aos/package.json container
-	cd container/src; \
-		set -e; \
+aos/process/process.wasm: aos/package.json container
+	cd aos/process; \
 		docker run -v .:/src p3rmaw3b/ao emcc-lua
 
 .PHONY: container
