@@ -79,10 +79,6 @@ COPY ./src/emcc_lua_lib /usr/local/emcc-lua/emcc_lua_lib
 COPY ["./src/pre.js", \
       "./src/definition.yml", \
       "./src/loader.lua", \
-      "/opt/"]
-
-COPY ["./src/json.lua", \
-      "./src/ao.lua", \
       "./src/main.c", \
       "./src/lsqlite3.c", \
       "./src/lsqlite3.h", \
@@ -94,6 +90,10 @@ COPY ["./src/json.lua", \
       "./src/model.bin", \
       "./src/generate-model-object.py", \
       "./src/Makefile", \
+      "/opt/"]
+
+COPY ["./src/json.lua", \
+      "./src/ao.lua", \
       "/opt/src/"]
 
 COPY ./src/node /opt/node
@@ -109,7 +109,11 @@ COPY ./src/node /opt/node
 # By running npm link, we allow any commands exposed by
 # the node module to be ran globally within the container
 
-RUN chmod +x /usr/local/bin/emcc-lua && \
-    cd /opt/src && make emscripten && \
-    cd /opt/node && npm install --omit="dev" && npm link
+# Ensuring emcc-lua is executable
+RUN chmod +x /usr/local/bin/emcc-lua
 
+# Execute emcc-lua; adjust for any necessary command line arguments or environmental setups
+RUN cd /opt/src && /usr/local/bin/emcc-lua
+
+# Install node modules and link, assuming /opt/node contains a package.json or similar setup
+RUN cd /opt/node && npm install --omit="dev" && npm link
