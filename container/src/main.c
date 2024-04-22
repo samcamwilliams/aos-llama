@@ -127,17 +127,17 @@ int main(void) {
 int boot_lua(lua_State* L) {
   luaL_openlibs(L);
 
-  // Preload llama
-  luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
-  lua_pushcfunction(L, luaopen_llama);
-  lua_setfield(L, -2, "llama");
-  lua_pop(L, 1);
-
   // Preload lsqlite3
   luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
   lua_pushcfunction(L, luaopen_lsqlite3);
   lua_setfield(L, -2, LUA_SQLLIBNAME);
   lua_pop(L, 1);  // remove PRELOAD table
+
+  // Preload llama
+  luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
+  lua_pushcfunction(L, luaopen_llama);
+  lua_setfield(L, -2, "_llama");
+  lua_pop(L, 1);
 
   if (luaL_loadbuffer(L, (const char*)program, sizeof(program), "main")) {
     fprintf(stderr, "error on luaL_loadbuffer()\n");

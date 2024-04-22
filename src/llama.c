@@ -457,6 +457,10 @@ void llama_load_model(char* bytes, int size, int total_size) {
     raw_model_size += size;
 }
 
+size_t llama_get_model_size() {
+    return raw_model_size;
+}
+
 void llama_load_tokenizer(char* bytes, int size) {
     raw_tokenizer = (unsigned char*)malloc(size);
     memcpy(raw_tokenizer, bytes, size);

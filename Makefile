@@ -22,7 +22,7 @@ install: build/aos/package.json
 
 .PHONY: clean
 clean:
-	rm AOS.wasm test/AOS.wasm
+	rm AOS.wasm test/AOS.wasm build/aos/process/AOS.wasm
 	rm package-lock.json
 	rm -rf node_modules
 	docker rmi p3rmaw3b/ao || true

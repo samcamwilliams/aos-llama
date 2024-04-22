@@ -27,7 +27,8 @@ test('Load the compiled AOS module and Llama library.', async () => {
     ],
     Data: `
     local llama = require("llama")
-    return "ok"
+
+    return llama.info()
     `
   }
   const result = await handle(null, msg, env)
