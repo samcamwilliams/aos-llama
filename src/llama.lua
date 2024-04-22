@@ -35,6 +35,8 @@ function llama.loadModel(id, onModelLoaded)
                 if llama.onModelLoaded then
                     llama.onModelLoaded()
                 end
+                -- Reset the loading state
+                llama.expects = nil
             else
                 -- This is a model chunk, so we should load it
                 llama.backend.load_model(msg.data, #msg.data, msg.modelSize)

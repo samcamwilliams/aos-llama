@@ -4,7 +4,7 @@
 
 _WIP: Here be dragons. The product of 3 nights of hacking -- use at your own risk!_
 
-This repository builds an AOS image that contains the [llama2.c](https://github.com/karpathy/llama2.c) inference engine. It is a simple implementation of the core transformer architecture used by Meta's [Llama](https://llama.meta.com/) models.
+This repository builds an AOS image that contains the [llama2.c](https://github.com/karpathy/llama2.c) inference engine. It is a simple implementation of the core transformer architecture used by Meta's [Llama](https://llama.meta.com/) models, running fully onchain with AO.
 
 When using this version of AOS, you can use the `llama` Lua module to load a model from Arweave and generate text using it. You can then use that output in whatever way you would like in your AOS processes.
 
@@ -20,7 +20,47 @@ Special thanks to all of the following, whose work made this build possible:
 
 ...and the many others that made the infrastructure of the permaweb!
 
-## Requirements
+## Usage
+
+AOS-Llama offers a simple interface for running LLM compute inside your AO processes. You will need to run a new AOS process using a module published from this repository in order to access it. You can start an AOS-Llama process as follows:
+
+```bash
+AOS_MODULE=AQhN6EY8jbwcd9YygzN1JvuaV_E86lHB-rjkQ7X3Omg aos your-llama-process-name
+```
+
+The above module ID is an example AOS-Llama that you can use without having to do any manual building yourself.
+
+Once you have an AOS-Llama process live, you can load the library into your environment:
+
+```Lua
+Llama = require "llama"
+```
+
+We can now use our Llama engine to load a model into the process:
+
+```Lua
+Llama.loadModel(
+  "m9ibqUzBAwc8PXgMXHBw5RP_TR-Ra3vJnt90RTTuuLg",
+  function()
+    -- Do something once the model has loaded.
+  end
+)
+```
+
+The second parameter to `loadModel` is a callback function that will be executed once the model has been streamed into memory. The model in the ID referenced above is a `tinystories-15m` LLM.
+
+Now that we have the model in our inference engine on AO, you can set its prompt and start generating text:
+
+```Lua
+Llama.setPrompt("One day, in a cyberspace far far away...")
+print(Llama.generate(25))
+```
+
+The `Llama.generate` function allows you to specify the number of tokens you would like to generate. If you would then like to run a new prompt, simply `setPrompt` again and generation will start again.
+
+Have fun!
+
+## Build and Deployment Requirements
 
 In order to build the AOS process module, your machine must have:
 
