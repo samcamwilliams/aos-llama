@@ -40,7 +40,7 @@ We can now use our Llama engine to load a model into the process:
 
 ```Lua
 Llama.loadModel(
-  "m9ibqUzBAwc8PXgMXHBw5RP_TR-Ra3vJnt90RTTuuLg",
+  "_HJccCSYUDmk4cMAz7BRHZ3emAAa06WkKA_CqchYU7g",
   function()
     -- Do something once the model has loaded.
   end
