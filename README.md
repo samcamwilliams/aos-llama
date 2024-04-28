@@ -1,6 +1,6 @@
 # AOS-Llama
 
-<img src="https://raw.githubusercontent.com/samcamwilliams/aos-llama2/main/image.webp" width="200">
+<img src="https://raw.githubusercontent.com/samcamwilliams/aos-llama2/main/image.webp" width="400">
 
 _WIP: Here be dragons. The product of 3 nights of hacking -- use at your own risk!_
 
