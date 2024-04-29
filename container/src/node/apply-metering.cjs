@@ -2,5 +2,5 @@
 // the metering functions to the wasm and replace it.
 const fs = require('fs')
 const metering = require('wasm-metering')
-const wasm = fs.readFileSync('/src/process.wasm')
-fs.writeFileSync('/src/process.wasm', metering.meterWASM(wasm))
+const wasm = fs.readFileSync('/src/AOS.wasm')
+fs.writeFileSync('/src/AOS.wasm', metering.meterWASM(wasm))

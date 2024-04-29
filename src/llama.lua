@@ -33,7 +33,7 @@ function llama.loadModel(id, onModelLoaded)
                 llama.backend.init()
                 -- Now that the model is ready, we should run the onModelLoaded callback, if set
                 if llama.onModelLoaded then
-                    llama.onModelLoaded()
+                     llama.onModelLoaded()
                 end
                 -- Reset the loading state
                 llama.expects = nil
@@ -43,6 +43,7 @@ function llama.loadModel(id, onModelLoaded)
                 llama.expects = msg.Next
                 Assign({ Processes = {ao.id}, Message = msg.Next })
             end
+            msg.Data = nil 
         end
     )
 

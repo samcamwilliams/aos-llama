@@ -8,7 +8,7 @@ test: build
 	cp AOS.wasm test/AOS.wasm
 	cd test; \
 		npm install; \
-		node --test eval.test.js
+		node --test load.test.js
 
 .PHONY: build
 build: install AOS.wasm
