@@ -2,6 +2,23 @@
 # yarn lockfile v1
 
 
+"@permaweb/wasm-json-toolkit@^0.2.9":
+  version "0.2.9"
+  resolved "https://registry.yarnpkg.com/@permaweb/wasm-json-toolkit/-/wasm-json-toolkit-0.2.9.tgz#241cdf37c1690a751a73dd05987336142e5576d1"
+  integrity sha512-CGCeUwS+UeqUdvORiyG0LykkQXLTwS5TWc590CUkDfOYyBUSPv8pse0sJStvTC9LKAzuNx3ELBvmqHCI4muUAA==
+  dependencies:
+    buffer-pipe "0.0.3"
+    leb128 "0.0.4"
+    safe-buffer "^5.1.2"
+
+"@permaweb/wasm-metering@^0.2.2":
+  version "0.2.2"
+  resolved "https://registry.yarnpkg.com/@permaweb/wasm-metering/-/wasm-metering-0.2.2.tgz#a854c485d9ddbbefb4a17a3692822b696d54a2c7"
+  integrity sha512-xM2MbPkHc4rzhTR6VH5eXtfC+liaYSuNCa0kPRaqSZO2gr1SirJWnzUBDa5VOfTBTgIlIVv5RW+Mkbt/VuK+oA==
+  dependencies:
+    "@permaweb/wasm-json-toolkit" "^0.2.9"
+    leb128 "^0.0.4"
+
 bn.js@^4.11.6, bn.js@^4.11.8:
   version "4.12.0"
   resolved "https://registry.yarnpkg.com/bn.js/-/bn.js-4.12.0.tgz#775b3f278efbb9718eec7361f483fb36fbbfea88"
@@ -21,6 +38,13 @@ buffer-pipe@0.0.2:
   dependencies:
     safe-buffer "^5.1.1"
 
+buffer-pipe@0.0.3:
+  version "0.0.3"
+  resolved "https://registry.yarnpkg.com/buffer-pipe/-/buffer-pipe-0.0.3.tgz#242197681d4591e7feda213336af6c07a5ce2409"
+  integrity sha512-GlxfuD/NrKvCNs0Ut+7b1IHjylfdegMBxQIlZHj7bObKVQBxB5S84gtm2yu1mQ8/sSggceWBDPY0cPXgvX2MuA==
+  dependencies:
+    safe-buffer "^5.1.2"
+
 leb128@0.0.4, leb128@^0.0.4:
   version "0.0.4"
   resolved "https://registry.yarnpkg.com/leb128/-/leb128-0.0.4.tgz#f96d698cf3ba5b677423abfe50b7e9b2df1463ff"
@@ -29,7 +53,7 @@ leb128@0.0.4, leb128@^0.0.4:
     bn.js "^4.11.6"
     buffer-pipe "0.0.0"
 
-safe-buffer@^5.1.1:
+safe-buffer@^5.1.1, safe-buffer@^5.1.2:
   version "5.2.1"
   resolved "https://registry.yarnpkg.com/safe-buffer/-/safe-buffer-5.2.1.tgz#1eaf9fa9bdb1fdd4ec75f58f9cdb4e6b7827eec6"
   integrity sha512-rp3So07KcdmmKbGvgaNxQSJr7bGVSVk5S9Eq1F+ppbRo70+YeaDxkw5Dd8NPN+GD6bjnYm2VuPuCXmpuYvmCXQ==
