@@ -169,9 +169,9 @@ def main():
     cmd.extend([
         #'-s', 'SAFE_HEAP=1',
         '-s', 'ABORTING_MALLOC=0',
-        '-s', 'STACK_SIZE=209715200',
+        '-s', 'STACK_SIZE=419430400',
         '-s', 'ALLOW_MEMORY_GROWTH=1',
-        '-s', 'INITIAL_MEMORY=419430400',
+        '-s', 'INITIAL_MEMORY=838860800',
         '-s', 'MAXIMUM_MEMORY=4294967296',
         '-s', 'WASM=1',
         '-s', 'MODULARIZE',
@@ -198,8 +198,8 @@ def main():
     shell_exec(*cmd)
 
     # add metering library
-    # meter_cmd = ['node', '/opt/node/apply-metering.cjs']
-    # shell_exec(*meter_cmd)
+    meter_cmd = ['node', '/opt/node/apply-metering.cjs']
+    shell_exec(*meter_cmd)
     # shell_exec(*['rm', '/src/process.js'])
 
 if __name__ == '__main__':

@@ -16,7 +16,7 @@ const options = { format: "wasm32-unknown-emscripten3", computeLimit: 9e12 }
 
 function loadData(datFile, id, nextId) {
   let data = uint8ArrayToBase64(new Uint8Array(fs.readFileSync(datFile)))
-  
+
   return {
     Target: 'AOS',
     Owner: 'FOOBAR',
@@ -36,24 +36,24 @@ function loadData(datFile, id, nextId) {
 }
 
 function loadTokenizer(datFile, id) {
-    let data = uint8ArrayToBase64(new Uint8Array(fs.readFileSync(datFile)))
-    
-    return {
-      Target: 'AOS',
-      Owner: 'FOOBAR',
-      ['Block-Height']: "1000",
-      Id: id,
-      Module: "WOOPAWOOPA",
-      Tags: [
-        { name: 'Content-Type', value: 'application/octet-stream' },
-        { name: 'Data-Protocol', value: 'Onchain-Llama' },
-        { name: 'Type', value: 'Tokenizer' },
-        { name: 'Model-Size', value: '60816028' },
-        { name: 'Tokenizer-Size', value: '432717' }
-      ],
-      Data: data
-    }
+  let data = uint8ArrayToBase64(new Uint8Array(fs.readFileSync(datFile)))
+
+  return {
+    Target: 'AOS',
+    Owner: 'FOOBAR',
+    ['Block-Height']: "1000",
+    Id: id,
+    Module: "WOOPAWOOPA",
+    Tags: [
+      { name: 'Content-Type', value: 'application/octet-stream' },
+      { name: 'Data-Protocol', value: 'Onchain-Llama' },
+      { name: 'Type', value: 'Tokenizer' },
+      { name: 'Model-Size', value: '60816028' },
+      { name: 'Tokenizer-Size', value: '432717' }
+    ],
+    Data: data
   }
+}
 
 test('Load the compiled AOS module and Llama library.', async () => {
   const handle = await AoLoader(wasm, options)
@@ -90,15 +90,15 @@ test('Load the compiled AOS module and Llama library.', async () => {
     ], Message: 'm9ibqUzBAwc8PXgMXHBw5RP_TR-Ra3vJnt90RTTuuLg'
   }])
   assert.equal('ok', 'ok')
-  
+
   global.gc()
 
   result = await handle(
-    result.Memory, 
+    result.Memory,
     loadData('./1.dat', 'm9ibqUzBAwc8PXgMXHBw5RP_TR-Ra3vJnt90RTTuuLg', 'wtl94hMrEoDt3cpPVIJjmvtbexZWDTg1BBEP3ZZOGaE'),
     env
   )
-  
+
   //console.log(result2)
   console.log(result.Assignments)
   assert.equal('ok', 'ok')
@@ -110,7 +110,7 @@ test('Load the compiled AOS module and Llama library.', async () => {
   )
   console.log(result.Assignments)
   assert.equal('ok', 'ok')
- 
+
 
   result = await handle(
     result.Memory,
@@ -119,7 +119,7 @@ test('Load the compiled AOS module and Llama library.', async () => {
   )
   console.log(result.Assignments)
   assert.equal('ok', 'ok')
- 
+
   result = await handle(
     result.Memory,
     loadData('./4.dat', 'wHe6fX12v-PefoiCByxvUx11YmxFtC_Cj-NhLOMi4Ls', 'hJmLSlQcTJzj0pBUWIvMA0T26XqNyTzSQjULPtPKAPY'),
@@ -135,7 +135,7 @@ test('Load the compiled AOS module and Llama library.', async () => {
   )
   console.log(result.Assignments)
   assert.equal('ok', 'ok')
-  
+
   result = await handle(
     result.Memory,
     loadData('./6.dat', 'Qi91unaKVotbu1rQzRV7D6MhMOt89wpCxhMSL7qfLPg', 'SeiXJ7oScUMiBVVQENUjYdvtNHsuEDIu9r1zdk2cFCs'),
@@ -143,7 +143,7 @@ test('Load the compiled AOS module and Llama library.', async () => {
   )
   console.log(result.Assignments)
   assert.equal('ok', 'ok')
-  
+
   result = await handle(
     result.Memory,
     loadTokenizer('./7.dat', 'SeiXJ7oScUMiBVVQENUjYdvtNHsuEDIu9r1zdk2cFCs'),
@@ -152,4 +152,26 @@ test('Load the compiled AOS module and Llama library.', async () => {
   console.log(result.Assignments)
   assert.equal('ok', 'ok')
 
+  result = await handle(
+    result.Memory,
+    {
+      Target: 'AOS',
+      Owner: 'FOOBAR',
+      ['Block-Height']: "1000",
+      Id: "1234xyxfoo",
+      Module: "WOOPAWOOPA",
+      Tags: [
+        { name: 'Action', value: 'Eval' }
+      ],
+      Data: `
+      local llama = require("llama")
+  
+      llama.setPrompt('Hello World')
+      return llama.generate(30)
+      `
+    },
+    env
+  )
+  console.log(result.Output.data.output)
+  assert.equal('ok', 'ok')
 })
