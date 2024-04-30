@@ -5,7 +5,7 @@ import fs from 'fs'
 import { getDataItem } from './get-dataitem.js'
 
 const wasm = fs.readFileSync('AOS.wasm')
-const options = { format: "wasm32-unknown-emscripten2", computeLimit: 9e12 }
+const options = { format: "wasm32-unknown-emscripten3", computeLimit: 9e12 }
 
 test('Load the compiled AOS module and Llama library.', async () => {
   const handle = await AoLoader(wasm, options)
