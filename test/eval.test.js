@@ -33,7 +33,7 @@ test('Load the compiled AOS module and Llama library.', async () => {
   }
   const result = await handle(null, msg, env)
   console.log(result)
-  //console.log(result.Output.data.output)
+  console.log(result.Output.data.output)
   //assert.equal(result.Output.data.output, 'ok')
   assert.equal('ok', 'ok')
 })

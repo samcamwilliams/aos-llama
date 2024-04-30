@@ -22,6 +22,7 @@ static int l_llama_set_prompt(lua_State *L) {
 static int l_llama_get_next_token(lua_State *L) {
   char* token = llama_get_next_token();
   lua_pushstring(L, token);
+
   return 1;
 }
 

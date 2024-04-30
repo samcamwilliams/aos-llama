@@ -450,11 +450,18 @@ size_t raw_model_size = 0;
 size_t raw_tokenizer_size = 0;
 
 void llama_load_model(char* bytes, int size, int total_size) {
+    fprintf(stderr, "llama_load_model: %p %d %d\n", bytes, size, total_size);
+    fprintf(stderr, "llama_load_model: raw_model is currently %p\n", raw_model);
     if(raw_model == NULL) {
         raw_model = (unsigned char*)malloc(total_size);
+        fprintf(stderr, "llama_load_model: raw_model initialized to %p\n", raw_model);
     }
+    fprintf(stderr, "llama_load_model: raw_model_size is currently %d\n", raw_model_size);
     memcpy(raw_model + raw_model_size, bytes, size);
+
     raw_model_size += size;
+    fprintf(stderr, "llama_load_model: raw_model_size updated to %d\n", raw_model_size);
+    //fprintf(stderr, "First %d bytes of raw_model as string: %.*s\n", raw_model_size, raw_model_size, raw_model);
 }
 
 size_t llama_get_model_size() {
