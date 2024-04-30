@@ -25,7 +25,6 @@ function llama.loadModel(id, onModelLoaded)
         "_llama_loadModel",
         function(msg) return msg.Id == llama.expects end,
         function(msg)
-            _G['_print']("Loading Model...")
             if llama.modelSize == nil then
                 -- This is the first model chunk, so we should set the model size
                 llama.modelSize = tonumber(msg["Model-Size"])
@@ -43,6 +42,8 @@ function llama.loadModel(id, onModelLoaded)
                 end
                 -- Reset the loading state
                 llama.expects = nil
+                model = nil
+                tokenizer = nil
             else
                 -- This is a model chunk, so we should load it
                 -- llama.backend.load_model(msg.Data, #msg.Data, llama.modelSize)

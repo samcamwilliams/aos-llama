@@ -450,7 +450,6 @@ size_t raw_model_size = 0;
 size_t raw_tokenizer_size = 0;
 
 void llama_load_model(char* bytes, int size, int total_size) {
-    printf("Loading Bytes...\n");
     if(raw_model == NULL) {
         raw_model = (unsigned char*)malloc(total_size);
     }
