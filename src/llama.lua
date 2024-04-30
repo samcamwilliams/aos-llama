@@ -20,16 +20,16 @@ function llama.loadModel(id, onModelLoaded)
     -- Add a handler to process each of the model chunks that we receive
     Handlers.add(
         "_llama_loadModel",
-        function(msg) return msg.id == llama.expects end,
+        function(msg) return msg.Id == llama.expects end,
         function(msg)
             if llama.modelSize == nil then
                 -- This is the first model chunk, so we should set the model size
                 llama.modelSize = tonumber(msg["Model-Size"])
             end
 
-            if ~msg.Next then
+            if not msg.Next then
                 -- This was the last part, so we should load it as the tokenizer and init the model
-                llama.backend.load_tokenizer(msg.data, #msg.data)
+                llama.backend.load_tokenizer(msg.Data, #msg.Data)
                 llama.backend.init()
                 -- Now that the model is ready, we should run the onModelLoaded callback, if set
                 if llama.onModelLoaded then
@@ -39,7 +39,7 @@ function llama.loadModel(id, onModelLoaded)
                 llama.expects = nil
             else
                 -- This is a model chunk, so we should load it
-                llama.backend.load_model(msg.data, #msg.data, msg.modelSize)
+                llama.backend.load_model(msg.Data, #msg.Data, llama.modelSize)
                 llama.expects = msg.Next
                 Assign({ Processes = {ao.id}, Message = msg.Next })
             end
