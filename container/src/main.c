@@ -4,6 +4,9 @@
 
 #include "lsqlite3.h"
 #include "llama.h"
+#include "LuaBase64.h"
+
+extern LUALIB_API int luaopen_LuaBase64_c(Lua* L);
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,6 +143,12 @@ int boot_lua(lua_State* L) {
   lua_pushcfunction(L, luaopen_llama);
   lua_setfield(L, -2, "_llama");
   lua_pop(L, 1);
+
+   // Preload LuaBase64
+  luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
+  lua_pushcfunction(L, luaopen_LuaBase64_c);
+  lua_setfield(L, -2, "cBase64");
+  lua_pop(L, 1); 
 
   if (luaL_loadbuffer(L, (const char*)program, sizeof(program), "main")) {
     fprintf(stderr, "error on luaL_loadbuffer()\n");

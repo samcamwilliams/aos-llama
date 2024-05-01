@@ -94,6 +94,13 @@ COPY container/src/sqlite3.c /opt/sqlite3.c
 COPY container/src/sqlite3.h /opt/sqlite3.h
 COPY container/src/main.lua /opt/main.lua
 
+# Copy fast Base64 files to the container
+COPY container/src/cbase64/b64enc.c /opt/b64enc.c
+COPY container/src/cbase64/b64dec.c /opt/b64dec.c
+COPY container/src/cbase64/LuaBase64.c /opt/LuaBase64.c
+COPY container/src/cbase64/LuaBase64.h /opt/LuaBase64.h
+COPY container/src/cbase64/LuaBase64.lua /opt/src/LuaBase64.lua
+
 RUN chmod +x /usr/local/bin/emcc-lua
 
 ENV CC 'emcc -s WASM=1'
