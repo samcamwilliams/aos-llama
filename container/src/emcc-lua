@@ -118,7 +118,7 @@ def main():
 
     
     #Generate compile target file
-    debug_print('Start to generate complie.c')
+    debug_print('Start to generate compile.c')
 
     with open('/opt/main.lua', mode='r') as lua:
         lua_program = lua.read()
