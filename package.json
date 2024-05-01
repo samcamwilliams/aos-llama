@@ -11,5 +11,8 @@
   "dependencies": {
     "@ardrive/turbo-sdk": "^1.5.0",
     "@irys/sdk": "0.1.16"
+  },
+  "devDependencies": {
+    "mocha": "^10.4.0"
   }
 }
