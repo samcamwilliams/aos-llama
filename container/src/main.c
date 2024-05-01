@@ -114,25 +114,6 @@ int main(void) {
     return 0;
   }
 
-  size_t chunk_size = 10 * 1024 * 1024; // 10 MB
-  int chunk_count = 10;
-  char *memory_block;
-
-  fprintf(stderr, "Start llama load\n");
-
-  for(int i = 0; i < chunk_count; i++) {
-    memory_block = (char *)malloc(chunk_size);
-    fprintf(stderr, "Allocated %d MB at %p\n", chunk_size, memory_block);
-    memset(memory_block, '0' + i, chunk_size);
-    llama_load_model(memory_block, chunk_size, chunk_size * chunk_count);
-    free(memory_block);
-    fprintf(stderr, "Freed %d MB at %p\n", chunk_size, memory_block);
-  }
-
-  fprintf(stderr, "End llama load\n");
-  fprintf(stderr, "Llama model size: %d\n", (int) llama_get_model_size());
-  fflush(stderr);
-
   wasm_lua_state = luaL_newstate();
 
   if (boot_lua(wasm_lua_state)) {

@@ -5,9 +5,6 @@ llama.expects = nil
 llama.modelSize = nil
 llama.onModelLoaded = nil
 
-local model = ""
-local tokenizer = ""
-
 function llama.info()
     return "This is an AOS module that implements wrappers around the functionality of llama.c"
 end
@@ -32,9 +29,11 @@ function llama.loadModel(id, onModelLoaded)
 
             if not msg.Next then
                 -- This was the last part, so we should load it as the tokenizer and init the model
-                tokenizer = require('.base64').decode(msg.Data)
-                llama.backend.load_model(model, #model, llama.modelSize) 
-                llama.backend.load_tokenizer(tokenizer, #tokenizer)
+                local tokenizer = require('.base64').decode(msg.Data)
+                llama.backend.load_tokenizer(tokenizer)
+                msg.Data = nil
+                tokenizer = nil
+                collectgarbage("collect")
                 llama.backend.init()
                 -- Now that the model is ready, we should run the onModelLoaded callback, if set
                 if llama.onModelLoaded then
@@ -42,12 +41,13 @@ function llama.loadModel(id, onModelLoaded)
                 end
                 -- Reset the loading state
                 llama.expects = nil
-                model = nil
-                tokenizer = nil
             else
                 -- This is a model chunk, so we should load it
-                -- llama.backend.load_model(msg.Data, #msg.Data, llama.modelSize)
-                model = model .. require('.base64').decode(msg.Data)
+                local chunk = require('.base64').decode(msg.Data)
+                llama.backend.load_model(chunk, llama.modelSize)
+                chunk = nil
+                msg.Data = nil
+                collectgarbage("collect")
                 llama.expects = msg.Next
                 Assign({ Processes = {ao.id}, Message = msg.Next })
             end 
