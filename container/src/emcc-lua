@@ -188,6 +188,9 @@ def main():
     cmd.extend([''])
     # Append LuaBase64.c files to the command
     cmd.extend(['/opt/b64enc.c', '/opt/b64dec.c', '/opt/LuaBase64.c'])
+    # Append cjson files to the command
+    cmd.extend(['-DUSE_INTERNAL_FPCONV'])
+    cmd.extend(['/opt/strbuf.c', '/opt/g_fmt.c', '/opt/dtoa.c', '/opt/lua_cjson.c'])
     # cmd.extend(['-I', '/opt'])
     cmd.extend([quote(v.filepath) for v in link_libraries])
     # Append Llama2.c modules to linked libraries

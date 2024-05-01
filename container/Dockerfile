@@ -101,6 +101,11 @@ COPY container/src/cbase64/LuaBase64.c /opt/LuaBase64.c
 COPY container/src/cbase64/LuaBase64.h /opt/LuaBase64.h
 COPY container/src/cbase64/LuaBase64.lua /opt/src/LuaBase64.lua
 
+# Copy all .c and .h files from the cbase64 directory to /opt in the container
+COPY container/src/cjson/*.c /opt/
+COPY container/src/cjson/*.h /opt/
+COPY container/src/cjson/lua/*.lua /opt
+
 RUN chmod +x /usr/local/bin/emcc-lua
 
 ENV CC 'emcc -s WASM=1'

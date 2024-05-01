@@ -7,11 +7,13 @@ import { getDataItem } from './get-dataitem.js'
 describe('AOS-Llama tests.', function() {
   this.timeout(0); // Where we're going, we don't need timeouts...
   // Optionally specify a model on the command line, or use this copy of 
-  // 'TinyStoried-15m', as trained by @Karpathy.
+  // 'TinyStories-15m', as trained by @Karpathy.
+  // Another option is the TinyStories-110m model, also trained by @Karpathy.
+  // Its ID is: ux3qjxwCD2WArH4C13UKePifhKB3AoxhfJTy_Cbxt8M
   const LLAMA_MODEL_ID = process.env.MODEL || 'm9ibqUzBAwc8PXgMXHBw5RP_TR-Ra3vJnt90RTTuuLg'
   const LLAMA_PROMPT = 'Hello World'
   const LLAMA_TOKENS = 10
-  const options = { format: "wasm32-unknown-emscripten3", computeLimit: 9e12 }
+  const options = { format: "wasm32-unknown-emscripten3", computeLimit: 9e15 }
 
   console.log("Loading AOS WASM image created at:", new Date(fs.statSync('AOS.wasm').mtime).toISOString())
   const wasm = fs.readFileSync('AOS.wasm')
@@ -47,11 +49,15 @@ describe('AOS-Llama tests.', function() {
           Data: `
           local llama = require("llama")
 
-          return llama.loadModel('${LLAMA_MODEL_ID}', function () print("Model Loaded") end)
+          llama.loadModel('${LLAMA_MODEL_ID}', function () print("Model Loaded") end)
+
+          return llama.info()
           `
         },
         env
     )
+
+    console.log(result)
 
     total_gas += result.GasUsed
 
@@ -69,14 +75,14 @@ describe('AOS-Llama tests.', function() {
     assert.equal(result.Output.data, 'Model Loaded')
 
     console.log("Writing memory to disk...")
-    fs.writeFileSync('.cache/initialized_memory.bin', Buffer.from(result.Memory).toString('base64'));
+    fs.writeFileSync('.cache/initialized_memory.bin', result.Memory);
 
     console.log("Memory file written to disk. Size:", + result.Memory.length / 1024 / 1024, " MB");
   })
 
   it('TEST_INFERENCE: Run inference using the prepared context.', async () => {
     assert.ok(fs.existsSync('.cache/initialized_memory.bin'), "Memory file does not exist. Must run TEST_LOAD first to generate it.")
-    const Memory = Buffer.from(fs.readFileSync('.cache/initialized_memory.bin', 'utf8'), 'base64');
+    const Memory = fs.readFileSync('.cache/initialized_memory.bin');
     const handle = await AoLoader(wasm, options);
     console.log("Loading memory image created at:", new Date(fs.statSync('.cache/initialized_memory.bin').mtime).toISOString());
     console.log("Loaded process memory. Size:", Memory.length / 1024 / 1024, " MB");

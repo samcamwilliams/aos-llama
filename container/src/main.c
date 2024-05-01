@@ -7,6 +7,7 @@
 #include "LuaBase64.h"
 
 extern LUALIB_API int luaopen_LuaBase64_c(Lua* L);
+extern int luaopen_cjson(lua_State *l);
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -144,11 +145,23 @@ int boot_lua(lua_State* L) {
   lua_setfield(L, -2, "_llama");
   lua_pop(L, 1);
 
+  fprintf(stderr, "Preload llama complete\n");
+  fflush(stderr);
+
    // Preload LuaBase64
   luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
   lua_pushcfunction(L, luaopen_LuaBase64_c);
   lua_setfield(L, -2, "cBase64");
   lua_pop(L, 1); 
+
+   // Preload cjson
+  //luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
+  //lua_pushcfunction(L, luaopen_cjson);
+  //lua_setfield(L, -2, "cjson");
+  //lua_pop(L, 1);
+  luaopen_cjson(L);
+  fprintf(stderr, "Preload cjson complete\n");
+  fflush(stderr);
 
   if (luaL_loadbuffer(L, (const char*)program, sizeof(program), "main")) {
     fprintf(stderr, "error on luaL_loadbuffer()\n");

@@ -5,8 +5,10 @@ llama.expects = nil
 llama.modelSize = nil
 llama.onModelLoaded = nil
 
+local LuaBase64 = require('LuaBase64')
+
 function llama.info()
-    return "This is an AOS module that implements wrappers around the functionality of llama.c"
+    return "This is an AOS module that implements wrappers around llama.c, using LuaBase64 for base64 encoding/decoding."
 end
 
 function llama.loadModel(id, onModelLoaded)
@@ -29,7 +31,7 @@ function llama.loadModel(id, onModelLoaded)
 
             if not msg.Next then
                 -- This was the last part, so we should load it as the tokenizer and init the model
-                local tokenizer = require('.base64').decode(msg.Data)
+                local tokenizer = LuaBase64.decode(msg.Data)
                 llama.backend.load_tokenizer(tokenizer)
                 msg.Data = nil
                 tokenizer = nil
@@ -43,7 +45,7 @@ function llama.loadModel(id, onModelLoaded)
                 llama.expects = nil
             else
                 -- This is a model chunk, so we should load it
-                local chunk = require('.base64').decode(msg.Data)
+                local chunk = LuaBase64.decode(msg.Data)
                 llama.backend.load_model(chunk, llama.modelSize)
                 chunk = nil
                 msg.Data = nil

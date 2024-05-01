@@ -1415,7 +1415,7 @@ static int lua_cjson_safe_new(lua_State *l)
 
 CJSON_EXPORT int luaopen_cjson(lua_State *l)
 {
-    lua_cjson_new(l);
+  lua_cjson_new(l);
 
 #ifdef ENABLE_CJSON_GLOBAL
     /* Register a global "cjson" table. */

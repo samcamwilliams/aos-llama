@@ -1,2 +1,6 @@
 node_modules
+stories110M.bin
 .cache/
+.initialized_memory.bin
+.cache/
+AOS.wasm
