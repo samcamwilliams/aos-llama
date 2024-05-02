@@ -6,5 +6,16 @@
   "license": "MIT",
   "dependencies": {
     "@permaweb/ao-loader": "^0.0.29"
+  },
+  "scripts": {
+    "test:INFERENCE": "node --experimental-wasm-memory64 --test --test-name-pattern='TEST_INFERENCE' load.test.js",
+    "test:LOAD": "node --experimental-wasm-memory64 --test --test-name-pattern='TEST_LOAD' load.test.js",
+    "test": "node --experimental-wasm-memory64 --test load.test.js"
+  },
+  "devDependencies": {
+    "mocha": "^10.4.0"
+  },
+  "engines": {
+    "node": "22"
   }
 }

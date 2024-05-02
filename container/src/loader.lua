@@ -1,4 +1,4 @@
-local json = require "lunajson"
+local json = require "json"
 local process = require ".process"
 ao = require "ao"
 

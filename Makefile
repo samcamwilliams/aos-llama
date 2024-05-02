@@ -12,13 +12,15 @@ build: install AOS.wasm
 .PHONY: test
 test:
 	cp AOS.wasm test/AOS.wasm
-	npm install
+	cd test && npm install
 ifeq ($(TEST),inference)
-	./node_modules/.bin/mocha --grep="TEST_INFERENCE" test/load.test.js
+# ./node_modules/.bin/mocha --grep="TEST_INFERENCE" test/load.test.js
+	npm run test:INFERENCE
 else ifeq ($(TEST),load)
-	./node_modules/.bin/mocha --grep="TEST_LOAD" test/load.test.js
+#	./node_modules/.bin/mocha --grep="TEST_LOAD" test/load.test.js
+	npm run test:LOAD
 else
-	./node_modules/.bin/mocha test/load.test.js
+	cd test && npm test 
 endif
 
 AOS.wasm: build/aos/process/AOS.wasm

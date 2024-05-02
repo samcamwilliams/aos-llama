@@ -1,17 +1,17 @@
-import { test } from 'node:test'
+import { describe, it } from 'node:test'
 import * as assert from 'node:assert'
 import AoLoader from '@permaweb/ao-loader'
 import fs from 'fs'
 import { getDataItem } from './get-dataitem.js'
 
-describe('AOS-Llama tests.', function() {
-  this.timeout(0); // Where we're going, we don't need timeouts...
+describe('AOS-Llama tests.', function () {
+  //this.timeout(0); // Where we're going, we don't need timeouts...
   // Optionally specify a model on the command line, or use this copy of 
   // 'TinyStoried-15m', as trained by @Karpathy.
   const LLAMA_MODEL_ID = process.env.MODEL || 'm9ibqUzBAwc8PXgMXHBw5RP_TR-Ra3vJnt90RTTuuLg'
   const LLAMA_PROMPT = 'Hello World'
   const LLAMA_TOKENS = 10
-  const options = { format: "wasm32-unknown-emscripten3", computeLimit: 9e12 }
+  const options = { format: "wasm64-unknown-emscripten-draft_2024_02_15", computeLimit: 9e12 }
 
   console.log("Loading AOS WASM image created at:", new Date(fs.statSync('AOS.wasm').mtime).toISOString())
   const wasm = fs.readFileSync('AOS.wasm')
@@ -36,21 +36,21 @@ describe('AOS-Llama tests.', function() {
     const handle = await AoLoader(wasm, options)
 
     let result = await handle(null, {
-          Target: 'AOS',
-          Owner: 'FOOBAR',
-          ['Block-Height']: "1000",
-          Id: "1234xyxfoo",
-          Module: "WOOPAWOOPA",
-          Tags: [
-            { name: 'Action', value: 'Eval' }
-          ],
-          Data: `
-          local llama = require("llama")
+      Target: 'AOS',
+      Owner: 'FOOBAR',
+      ['Block-Height']: "1000",
+      Id: "1234xyxfoo",
+      Module: "WOOPAWOOPA",
+      Tags: [
+        { name: 'Action', value: 'Eval' }
+      ],
+      Data: `
+local llama = require("llama")
 
-          return llama.loadModel('${LLAMA_MODEL_ID}', function () print("Model Loaded") end)
+return llama.loadModel('${LLAMA_MODEL_ID}', function () print("Model Loaded") end)
           `
-        },
-        env
+    },
+      env
     )
 
     total_gas += result.GasUsed
@@ -75,12 +75,12 @@ describe('AOS-Llama tests.', function() {
   })
 
   it('TEST_INFERENCE: Run inference using the prepared context.', async () => {
-    assert.ok(fs.existsSync('.cache/initialized_memory.bin'), "Memory file does not exist. Must run TEST_LOAD first to generate it.")
+    //assert.ok(fs.existsSync('.cache/initialized_memory.bin'), "Memory file does not exist. Must run TEST_LOAD first to generate it.")
     const Memory = Buffer.from(fs.readFileSync('.cache/initialized_memory.bin', 'utf8'), 'base64');
     const handle = await AoLoader(wasm, options);
-    console.log("Loading memory image created at:", new Date(fs.statSync('.cache/initialized_memory.bin').mtime).toISOString());
-    console.log("Loaded process memory. Size:", Memory.length / 1024 / 1024, " MB");
-    console.log("Running inference on prompt: \"", LLAMA_PROMPT, "\". Tokens:", LLAMA_TOKENS)
+    // console.log("Loading memory image created at:", new Date(fs.statSync('.cache/initialized_memory.bin').mtime).toISOString());
+    // console.log("Loaded process memory. Size:", Memory.length / 1024 / 1024, " MB");
+    // console.log("Running inference on prompt: \"", LLAMA_PROMPT, "\". Tokens:", LLAMA_TOKENS)
 
     let result = await handle(
       Memory,
@@ -94,11 +94,9 @@ describe('AOS-Llama tests.', function() {
           { name: 'Action', value: 'Eval' }
         ],
         Data: `
-        local llama = require("llama")
-    
-        llama.setPrompt('${LLAMA_PROMPT}')
-        return llama.generate(${LLAMA_TOKENS})
-        `
+local llama = require('llama')
+llama.setPrompt('${LLAMA_PROMPT}')
+return llama.generate(${LLAMA_TOKENS})`
       },
       env
     )
@@ -106,6 +104,7 @@ describe('AOS-Llama tests.', function() {
     console.log("LLM inference result:", result.Output.data.output)
     console.log("Final memory used:", + result.Memory.length, ". Gas used in inference: ", + result.GasUsed)
     assert.ok(result.Output.data.output)
+
   })
 })
 

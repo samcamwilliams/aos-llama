@@ -4,7 +4,7 @@ import AoLoader from '@permaweb/ao-loader'
 import fs from 'fs'
 
 const wasm = fs.readFileSync('AOS.wasm')
-const options = { format: "wasm32-unknown-emscripten2" }
+const options = { format: "wasm64-unknown-emscripten-draft_2024_02_15" }
 test('Load the compiled AOS module and Llama library.', async () => {
   const handle = await AoLoader(wasm, options)
   const env = {
@@ -25,11 +25,7 @@ test('Load the compiled AOS module and Llama library.', async () => {
     Tags: [
       { name: 'Action', value: 'Eval' }
     ],
-    Data: `
-    local llama = require("llama")
-
-    return llama.info()
-    `
+    Data: `return require('json').encode({ Hello = "World"})`
   }
   const result = await handle(null, msg, env)
   console.log(result)

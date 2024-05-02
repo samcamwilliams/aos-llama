@@ -50,7 +50,7 @@ RUN npm --version
 # And, re-compile lua with "generic WASM"
 RUN cd /lua-${LUA_VERSION} && \
   make clean && \
-  make generic CC='emcc -s WASM=1 -U LUA_32BITS' 
+  make generic CC='emcc -s WASM=1 -s MEMORY64=1 -s SUPPORT_LONGJMP=1' 
 
 #############################
 ##### Install Commands ######
