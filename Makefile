@@ -10,11 +10,11 @@ EMCC_CFLAGS=-O3 -msimd128 -fno-rtti -DNDEBUG \
 	-s EXPORTED_FUNCTIONS=_main -s EXPORTED_RUNTIME_METHODS=callMain -s \
 	NO_EXIT_RUNTIME=1
 
+.PHONY: image
+image: install AOS.wasm
+
 .PHONY: build-test
 build-test: build test
-
-.PHONY: build
-build: install AOS.wasm
 
 .PHONY: test
 test:
@@ -35,14 +35,18 @@ AOS.wasm: build/aos/process/AOS.wasm
 install: build/aos/package.json
 	npm install
 
+build:
+	mkdir -p build
+
 .PHONY: clean
 clean:
-	rm AOS.wasm test/AOS.wasm build/aos/process/AOS.wasm
-	rm package-lock.json
+	rm -rf build
+	rm -f AOS.wasm test/AOS.wasm build/aos/process/AOS.wasm
+	rm -f package-lock.json
 	rm -rf node_modules
 	docker rmi p3rmaw3b/ao || true
 
-build/aos/package.json:
+build/aos/package.json: build
 	cd build; \
 		git submodule init; \
 		git submodule update --remote
