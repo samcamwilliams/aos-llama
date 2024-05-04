@@ -26,26 +26,6 @@ static const unsigned char lua_main_program[] = {__LUA_MAIN__};
 // This line will be injected by emcc-lua as export functions to WASM declaration
 __LUA_FUNCTION_DECLARATIONS__
 
-// ArweaveFS Entry
-EM_ASYNC_JS(int, afs_fopen, (const char* filename, const char* mode), {
-  try {
-    const file = await AFS.open(UTF8ToString(filename), UTF8ToString(mode));
-    return file.fd;
-  } catch (err) {
-    console.error('Error opening file:', err);
-    return -1;
-  }
-});
-
-EM_ASYNC_JS(int, afs_fread, (int fd, void* buffer, int size), {
-  try {
-    const data = await AFS.read(FS.streams[fd], HEAPU8, buffer, size, 0);
-    return data;
-  } catch (err) {
-    console.error('Error reading file: ', err);
-    return -1;
-  }
-});
 // This function is for debug to see an C <-> Lua stack values
 // void dumpStack(lua_State *L) {
 //   int i;

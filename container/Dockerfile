@@ -3,6 +3,7 @@ LABEL maintainer "tom wilson <tom@hyper.io>"
 
 # The working directory used by the base image is /src, so we can mount volumes to there
 # to expose files on the host to the ao container
+# 1
 # 
 # https://github.com/emscripten-core/emsdk/blob/9b0db91883452051aca8deddc932363aab29060b/docker/Dockerfile#L120
 
@@ -103,6 +104,8 @@ COPY container/src/cbase64/LuaBase64.lua /opt/src/LuaBase64.lua
 
 COPY container/src/lunajson/*.lua /opt/src/
 
+COPY container/src/aolibc /opt/aolibc
+
 RUN chmod +x /usr/local/bin/emcc-lua
 
 ENV CC 'emcc -s WASM=1'
@@ -126,3 +129,5 @@ COPY container/src/node /opt/node
 RUN cd /opt/node && \
   npm install --omit="dev" && \
   npm link
+
+RUN cd /opt/aolibc && make clean && make CC="emcc -s WASM=1 -s MEMORY64=1"

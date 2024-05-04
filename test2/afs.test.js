@@ -18,8 +18,8 @@ describe('vfs-1 test', async () => {
   })
 
   it('should send data successfully', () => {
-    instance.FS.mkdirTree('/afs/data')
-    instance.FS.writeFile('/afs/data/1.bin', Buffer.from('HELLOWORLD'))
+    // instance.FS.mkdirTree('/afs/data')
+    // instance.FS.writeFile('/afs/data/1.bin', Buffer.from('HELLOWORLD'))
     // see if directory exits
     const result = handle(getData(), getEnv())
     assert.ok(result.ok)
