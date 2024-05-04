@@ -69,3 +69,7 @@ container:
 publish-module: AOS.wasm
 	npm install
 	WALLET=$(WALLET_LOC) scripts/publish-module
+
+.PHONY: dockersh
+dockersh:
+	docker run -v .:/src -it p3rmaw3b/ao /bin/bash
