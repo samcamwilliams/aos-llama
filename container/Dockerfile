@@ -8,7 +8,7 @@ LABEL maintainer "tom wilson <tom@hyper.io>"
 # https://github.com/emscripten-core/emsdk/blob/9b0db91883452051aca8deddc932363aab29060b/docker/Dockerfile#L120
 
 RUN apt-get update -qq -y
-RUN apt-get install -y curl vim make gcc libreadline6-dev libssl-dev zlib1g-dev zip unzip
+RUN apt-get install -y curl vim make gcc libreadline6-dev libssl-dev zlib1g-dev zip unzip ccache
 
 ENV LUA_VERSION 5.3.4
 ENV LUAROCKS_VERSION 2.4.4
@@ -104,17 +104,11 @@ COPY container/src/cbase64/LuaBase64.lua /opt/src/LuaBase64.lua
 
 COPY container/src/lunajson/*.lua /opt/src/
 
-COPY container/src/aolibc /opt/aolibc
-
 RUN chmod +x /usr/local/bin/emcc-lua
 
 ENV CC 'emcc -s WASM=1'
 ENV NM 'llvm-nm'
 
-COPY container/../../src/llama.c /opt/llama.c
-COPY container/../../src/llama.h /opt/llama.h
-COPY container/../../src/llama-bindings.c /opt/llama-bindings.c
-COPY container/../../src/llama.lua /opt/src/llama.lua
 
 ###########################################
 ### Publish, Bundler, Process, Contract ###
@@ -129,5 +123,3 @@ COPY container/src/node /opt/node
 RUN cd /opt/node && \
   npm install --omit="dev" && \
   npm link
-
-RUN cd /opt/aolibc && make clean && make CC="emcc -s WASM=1 -s MEMORY64=1"

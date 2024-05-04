@@ -9,6 +9,7 @@ Inference for Llama-2 Transformer model in pure C.
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include "stream.h"
 
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
@@ -444,30 +445,6 @@ int next;                 // will store the next token in the sequence
 int token = 1;            // init with token 1 (=BOS), as done in Llama-2 sentencepiece tokenizer
 int pos = 0;              // position in the sequence
 
-unsigned char* raw_model = NULL;
-unsigned char* raw_tokenizer = NULL;
-size_t raw_model_size = 0;
-size_t raw_tokenizer_size = 0;
-
-void llama_load_model(char* bytes, int size, int total_size) {
-    if(raw_model == NULL) {
-        raw_model = (unsigned char*)malloc(total_size);
-    }
-    memcpy(raw_model + raw_model_size, bytes, size);
-
-    raw_model_size += size;
-}
-
-size_t llama_get_model_size() {
-    return raw_model_size;
-}
-
-void llama_load_tokenizer(char* bytes, int size) {
-    raw_tokenizer = (unsigned char*)malloc(size);
-    memcpy(raw_tokenizer, bytes, size);
-    raw_tokenizer_size = size;
-}
-
 char* llama_get_next_token(void) {
 
     // forward the transformer to get logits for the next token
@@ -510,7 +487,8 @@ int llama_init(void) {
 
     // read in the 'model.bin' file from memory space
     float* data = NULL; // memory mapped data pointer
-    long file_size = raw_model_size;     // size of the checkpoint file in bytes
+    unsigned char* raw_model = stream_get_slot(0);
+    long file_size = stream_get_size(0);     // size of the checkpoint file in bytes
     {
         memcpy(&config, raw_model, sizeof(Config));
         // negative vocab size is hacky way of signaling unshared weights. bit yikes.
@@ -530,8 +508,8 @@ int llama_init(void) {
     vocab_scores = (float*)malloc(config.vocab_size * sizeof(float));
 
     {
-        unsigned char *data_ptr = raw_tokenizer;
-        unsigned char *end_ptr = raw_tokenizer + raw_tokenizer_size;
+        unsigned char *data_ptr = stream_get_slot(1);
+        unsigned char *end_ptr = data_ptr + stream_get_size(1);
         int config_vocab_size = config.vocab_size;
 
         memcpy(&max_token_length, data_ptr, sizeof(int));

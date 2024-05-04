@@ -1,12 +1,13 @@
 ---@diagnostic disable: missing-parameter
 local llama = {}
 llama.backend = require("_llama")
+Stream = require("stream")
 llama.expects = nil
 llama.modelSize = nil
 llama.onModelLoaded = nil
 
 function llama.info()
-    return "This is an AOS module that implements wrappers around the functionality of llama.c"
+    return "This is an AOS module that implements wrappers around the functionality of llama.c using the stream module to load the model."
 end
 
 function llama.loadModel(id, onModelLoaded)
@@ -30,7 +31,7 @@ function llama.loadModel(id, onModelLoaded)
             if not msg.Next then
                 -- This was the last part, so we should load it as the tokenizer and init the model
                 local tokenizer = require('.base64').decode(msg.Data)
-                llama.backend.load_tokenizer(tokenizer)
+                Stream.load(1,tokenizer, #tokenizer)
                 msg.Data = nil
                 tokenizer = nil
                 collectgarbage("collect")
@@ -44,7 +45,7 @@ function llama.loadModel(id, onModelLoaded)
             else
                 -- This is a model chunk, so we should load it
                 local chunk = require('.base64').decode(msg.Data)
-                llama.backend.load_model(chunk, llama.modelSize)
+                Stream.load(0, chunk, llama.modelSize)
                 chunk = nil
                 msg.Data = nil
                 collectgarbage("collect")

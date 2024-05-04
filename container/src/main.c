@@ -4,9 +4,10 @@
 
 #include "lsqlite3.h"
 #include "llama.h"
+#include "stream.h"
 #include "LuaBase64.h"
 
-extern LUALIB_API int luaopen_LuaBase64_c(Lua* L);
+LUALIB_API int luaopen_LuaBase64_c(Lua* L);
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -142,6 +143,12 @@ int boot_lua(lua_State* L) {
   luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
   lua_pushcfunction(L, luaopen_llama);
   lua_setfield(L, -2, "_llama");
+  lua_pop(L, 1);
+
+  // Preload stream
+  luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
+  lua_pushcfunction(L, luaopen_stream);
+  lua_setfield(L, -2, "stream");
   lua_pop(L, 1);
 
    // Preload LuaBase64
