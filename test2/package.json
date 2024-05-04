@@ -1,0 +1,12 @@
+{
+  "name": "test2",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {
+    "wasi": "^0.0.6"
+  },
+  "engines": {
+    "node": "22"
+  }
+}

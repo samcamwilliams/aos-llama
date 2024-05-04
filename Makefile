@@ -9,15 +9,18 @@ build-test: build test
 .PHONY: build
 build: install AOS.wasm
 
+.PHONY: test2
+test2: 
+	cp build/aos/process/AOS.wasm test2/AOS.wasm
+	cp build/aos/process/AOS.js test2/AOS.js
+
 .PHONY: test
 test:
 	cp AOS.wasm test/AOS.wasm
 	cd test && npm install
 ifeq ($(TEST),inference)
-# ./node_modules/.bin/mocha --grep="TEST_INFERENCE" test/load.test.js
 	npm run test:INFERENCE
 else ifeq ($(TEST),load)
-#	./node_modules/.bin/mocha --grep="TEST_LOAD" test/load.test.js
 	npm run test:LOAD
 else
 	cd test && npm test 

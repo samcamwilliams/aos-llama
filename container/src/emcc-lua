@@ -167,6 +167,7 @@ def main():
     debug_print('Start to compile as WASM')
     cmd = ['emcc', '-O0']
     cmd.extend([
+        '-s', 'ASYNCIFY=1',
         '-s', 'MEMORY64=1',
         '-s', 'STACK_SIZE=20971520',
         '-s', 'ALLOW_MEMORY_GROWTH=1',
@@ -176,7 +177,8 @@ def main():
         '-s', 'MODULARIZE',
         # '-s', 'FILESYSTEM=0',
         '-s', 'DETERMINISTIC=1',
-        '-s', 'NODERAWFS=0'
+        '-s', 'NODERAWFS=0',
+        '-s', 'FORCE_FILESYSTEM=1'
     ])
     cmd.extend(['-s', 'ASSERTIONS=1'])
     cmd.extend(['--pre-js', '/opt/pre.js'])
@@ -199,8 +201,8 @@ def main():
     shell_exec(*cmd)
 
     # add metering library
-    meter_cmd = ['node', '/opt/node/apply-metering.cjs']
-    shell_exec(*meter_cmd)
+    # meter_cmd = ['node', '/opt/node/apply-metering.cjs']
+    # shell_exec(*meter_cmd)
     # shell_exec(*['rm', '/src/process.js'])
 
 if __name__ == '__main__':
