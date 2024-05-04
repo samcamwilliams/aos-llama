@@ -8,7 +8,7 @@ EMCC_CFLAGS=-O3 -msimd128 -fno-rtti -DNDEBUG \
 	-s EXPORT_ES6=1 -s MODULARIZE=1 -s INITIAL_MEMORY=800MB \
 	-s MAXIMUM_MEMORY=4GB -s ALLOW_MEMORY_GROWTH -s FORCE_FILESYSTEM=1 \
 	-s EXPORTED_FUNCTIONS=_main -s EXPORTED_RUNTIME_METHODS=callMain -s \
-	NO_EXIT_RUNTIME=1 -Wunused-command-line-argument
+	NO_EXIT_RUNTIME=1
 
 .PHONY: build-test
 build-test: build test
@@ -55,7 +55,7 @@ build/llama.cpp:
 		git clone https://github.com/ggerganov/llama.cpp.git
 
 build/llama.cpp/libllama.a: build/llama.cpp
-	# docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && export EMCC_CFLAGS='$(EMCC_CFLAGS)' && emcmake cmake"
+	docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && export EMCC_CFLAGS='$(EMCC_CFLAGS)' && emcmake cmake"
 	docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && emmake make main EMCC_CFLAGS='$(EMCC_CFLAGS)'"
 
 .PHONY: container
