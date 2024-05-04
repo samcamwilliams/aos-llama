@@ -10,6 +10,8 @@ EMCC_CFLAGS=-O3 -msimd128 -fno-rtti -DNDEBUG \
 	-s EXPORTED_FUNCTIONS=_main -s EXPORTED_RUNTIME_METHODS=callMain -s \
 	NO_EXIT_RUNTIME=1 -Wno-unused-command-line-argument
 
+ARCH=$(shell uname -m | sed -e 's/x86_64/linux\/amd64/' -e 's/aarch64/linux\/arm64/')
+
 .PHONY: image
 image: install AOS.wasm
 
@@ -51,7 +53,9 @@ build/aos/process/AOS.wasm: libllama.a build/aos/package.json container
 	docker run -v $(PWD)/build/aos/process:/src -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao emcc-lua $(if $(DEBUG),-e DEBUG=TRUE)
 
 build/llama.cpp: build
-	cd build; git clone https://github.com/ggerganov/llama.cpp.git
+	if [ ! -d "build/llama.cpp" ]; then \
+		cd build; git clone https://github.com/ggerganov/llama.cpp.git; \
+	fi
 
 libllama.a: build/llama.cpp container
 	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && export EMCC_CFLAGS='$(EMCC_CFLAGS)' && emcmake cmake -S . -B ."
@@ -59,7 +63,7 @@ libllama.a: build/llama.cpp container
 	cp build/llama.cpp/libllama.a libllama.a
 
 .PHONY: container
-container:
+container: container/Dockerfile
 	docker build . -f container/Dockerfile -t p3rmaw3b/ao
 
 publish-module: AOS.wasm
