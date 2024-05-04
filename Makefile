@@ -13,13 +13,13 @@ EMCC_CFLAGS=-O3 -msimd128 -fno-rtti -DNDEBUG \
 ARCH=$(shell uname -m | sed -e 's/x86_64/linux\/amd64/' -e 's/aarch64/linux\/arm64/')
 
 .PHONY: image
-image: install AOS.wasm
+image: node AOS.wasm
 
 .PHONY: build-test
 build-test: build test
 
 .PHONY: build
-build: install AOS.wasm
+build: node AOS.wasm
 
 .PHONY: test2
 test2: 
@@ -29,19 +29,20 @@ test2:
 
 .PHONY: test
 test: node
+	cp AOS.wasm test/AOS.wasm
 ifeq ($(TEST),inference)
-	npm run test:INFERENCE
+	cd test; npm install; npm run test:INFERENCE
 else ifeq ($(TEST),load)
-	npm run test:LOAD
+	cd test; npm install; npm run test:LOAD
 else
-	cd test && npm test 
+	cd test; npm install; cd test && npm test 
 endif
 
 AOS.wasm: build/aos/process/AOS.wasm
 	cp build/aos/process/AOS.wasm AOS.wasm
 
-.PHONY: install build/aos/package.json
-node: build/aos/package.json
+.PHONY: node
+node:
 	npm install
 
 build:
@@ -66,14 +67,14 @@ build/llama.cpp: build
 		cd build; git clone https://github.com/ggerganov/llama.cpp.git; \
 	fi
 
-libllama.a: build/llama.cpp container
+libllama.a: build/llama.cpp
 	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && export EMCC_CFLAGS='$(EMCC_CFLAGS)' && emcmake cmake -S . -B ."
 	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && emmake make EMCC_CFLAGS='$(EMCC_CFLAGS)'"
 	cp build/llama.cpp/libllama.a libllama.a
 
 .PHONY: container
 container: container/Dockerfile
-	docker build . -f container/Dockerfile -t p3rmaw3b/ao
+	docker build . -f container/Dockerfile -t p3rmaw3b/ao --platform linux/$(ARCH)
 
 publish-module: AOS.wasm
 	npm install

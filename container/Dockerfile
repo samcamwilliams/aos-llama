@@ -104,6 +104,12 @@ COPY container/src/cbase64/LuaBase64.lua /opt/src/LuaBase64.lua
 
 COPY container/src/lunajson/*.lua /opt/src/
 
+COPY container/src/aolibc /opt/aolibc
+
+# Copy the base src
+COPY container/../../src/* /opt/
+COPY container/../../src/*.lua /opt/src/
+
 RUN chmod +x /usr/local/bin/emcc-lua
 
 ENV CC 'emcc -s WASM=1'
@@ -123,3 +129,5 @@ COPY container/src/node /opt/node
 RUN cd /opt/node && \
   npm install --omit="dev" && \
   npm link
+
+RUN cd /opt/aolibc && make CC="emcc -s WASM=1 -s MEMORY64=1 -s SUPPORT_LONGJMP=1"
