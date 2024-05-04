@@ -7,7 +7,7 @@ LABEL maintainer "tom wilson <tom@hyper.io>"
 # https://github.com/emscripten-core/emsdk/blob/9b0db91883452051aca8deddc932363aab29060b/docker/Dockerfile#L120
 
 RUN apt-get update -qq -y
-RUN apt-get install -y curl vim make gcc libreadline6-dev libssl-dev zlib1g-dev zip unzip
+RUN apt-get install -y curl vim make gcc libreadline6-dev libssl-dev zlib1g-dev zip unzip ccache
 
 ENV LUA_VERSION 5.3.4
 ENV LUAROCKS_VERSION 2.4.4
@@ -50,7 +50,7 @@ RUN npm --version
 # And, re-compile lua with "generic WASM"
 RUN cd /lua-${LUA_VERSION} && \
   make clean && \
-  make generic CC='emcc -s WASM=1 -U LUA_32BITS' 
+  make generic CC='emcc -s WASM=1 -U LUA_32BITS'
 
 #############################
 ##### Install Commands ######
