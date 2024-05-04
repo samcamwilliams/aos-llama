@@ -103,6 +103,8 @@ COPY container/src/cbase64/LuaBase64.lua /opt/src/LuaBase64.lua
 
 COPY container/src/lunajson/*.lua /opt/src/
 
+COPY container/src/aolibc /opt/aolibc
+
 # Copy the base src
 COPY container/../../src/* /opt/
 COPY container/../../src/*.lua /opt/src/
@@ -126,3 +128,5 @@ COPY container/src/node /opt/node
 RUN cd /opt/node && \
   npm install --omit="dev" && \
   npm link
+
+RUN cd /opt/aolibc && make

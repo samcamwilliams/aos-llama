@@ -177,6 +177,8 @@ def main():
         '-s', 'DETERMINISTIC=1',
         '-s', 'NODERAWFS=0'
     ])
+    # Add the custom aostdlib directory and the AO libc archive file.
+    cmd.extend(['-L/opt/aolibc', '-l:aolibc.a'])
     cmd.extend(['-s', 'ASSERTIONS=1'])
     cmd.extend(['--pre-js', '/opt/pre.js'])
     cmd.extend(definition.get_extra_args())
