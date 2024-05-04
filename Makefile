@@ -13,6 +13,7 @@ build: install AOS.wasm
 test2: 
 	cp build/aos/process/AOS.wasm test2/AOS.wasm
 	cp build/aos/process/AOS.js test2/AOS.js
+	cd test2 && yarn test
 
 .PHONY: test
 test:

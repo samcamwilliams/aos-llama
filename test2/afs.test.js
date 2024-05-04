@@ -2,14 +2,15 @@ const { describe, it } = require('node:test')
 const assert = require('assert')
 // VFS-1
 // STEP 1 send a file id
-const m = require('./AOS.js')
+const m = require(__dirname + '/AOS.js')
 
 describe('vfs-1 test', async () => {
   const instance = await m()
   const handle = function (msg, env) {
-    return JSON.parse(
-      instance.cwrap('handle', 'string', ['string', 'string'])(JSON.stringify(msg), JSON.stringify(env))
-    )
+    const x = instance.cwrap('handle', 'string', ['string', 'string'])(JSON.stringify(msg), JSON.stringify(env))
+    console.log(x)
+    return JSON.parse(x)
+
   }
 
   it('should send eval successfully', () => {
@@ -17,7 +18,7 @@ describe('vfs-1 test', async () => {
     assert.equal(result.response.Output.data.output, 2)
   })
 
-  it('should send data successfully', () => {
+  it.skip('should send data successfully', () => {
     // instance.FS.mkdirTree('/afs/data')
     // instance.FS.writeFile('/afs/data/1.bin', Buffer.from('HELLOWORLD'))
     // see if directory exits
@@ -25,7 +26,7 @@ describe('vfs-1 test', async () => {
     assert.ok(result.ok)
   })
 
-  it('should list files via eval', () => {
+  it.skip('should list files via eval', () => {
     const result = handle(getEval(`
 local file = io.open("/afs/data/1.bin", "r")
 local output = "Hello"

@@ -8,5 +8,8 @@
   },
   "engines": {
     "node": "22"
+  },
+  "scripts": {
+    "test": "node --test --experimental-wasm-memory64 afs.test.js"
   }
 }
