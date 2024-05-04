@@ -7,7 +7,7 @@
 #include "stream.h"
 #include "LuaBase64.h"
 
-extern LUALIB_API int luaopen_LuaBase64_c(Lua* L);
+LUALIB_API int luaopen_LuaBase64_c(Lua* L);
 
 #include <stdio.h>
 #include <stdlib.h>
