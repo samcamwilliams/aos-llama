@@ -50,7 +50,7 @@ build/aos/package.json: build
 build/aos/process/AOS.wasm: libllama.a build/aos/package.json container 
 	docker run -v $(PWD)/build/aos/process:/src -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao emcc-lua $(if $(DEBUG),-e DEBUG=TRUE)
 
-build/llama.cpp:
+build/llama.cpp: build
 	cd build; git clone https://github.com/ggerganov/llama.cpp.git
 
 libllama.a: build/llama.cpp container
