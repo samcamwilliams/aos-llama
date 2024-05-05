@@ -90,12 +90,12 @@ return llama.info()
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it('Llama loads Phi-2', async () => {
+  it.skip('Llama loads Phi-2', async () => {
     const result = await handle(getEval(`
   local llama = require("llama")
   llama.load('/data/kd34P4974oqZf2Db-hFTUiCipsU6CzbR6t-iJoQhKIo')
   llama.setPrompt([[<|user|>Can you write a HelloWorld function in js<|end|><|assistant|>]])
-  return llama.run(95) 
+  return llama.run(10) 
   `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)
@@ -103,12 +103,12 @@ return llama.info()
 
 
 
-  it.skip('Llama loads Phi-3 Mini 4k Instruct', async () => {
+  it('Llama loads Phi-3 Mini 4k Instruct', async () => {
     const result = await handle(getEval(`
 local llama = require("llama")
 llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
-llama.setPrompt([[<|user|>Write a story about vim<|end|><|assistant|>]])
-return llama.run(10) 
+llama.setPrompt([[<|user|>How are you?<|end|><|assistant|>]])
+return llama.run(40) 
   `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)

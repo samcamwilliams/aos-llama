@@ -75,8 +75,6 @@ int llama_run(char* response, int n_len) {
 
     // print the prompt token-by-token
 
-    fprintf(stderr, "\n");
-
     for (auto id : tokens_list) {
         fprintf(stderr, "%s", llama_token_to_piece(ctx, id).c_str());
     }
@@ -150,8 +148,6 @@ int llama_run(char* response, int n_len) {
             return 1;
         }
     }
-
-    LOG_TEE("\n");
 
     //LOG_TEE("%s: decoded %d tokens in %.2f s, speed: %.2f t/s\n",
     //        __func__, n_decode, (t_main_end - t_main_start) / 1000000.0f, n_decode / ((t_main_end - t_main_start) / 1000000.0f));

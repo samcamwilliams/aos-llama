@@ -5,6 +5,12 @@
 #include <string.h>
 #include <emscripten.h>
 
+#ifdef DEBUG
+#define AO_LOG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define AO_LOG(...)
+#endif
+
 // WeaveDrive file functions
 EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
     try {
@@ -96,42 +102,55 @@ FILE *fallback_fopen(const char *filename, const char *mode) {
 }
 
 FILE* fopen(const char* filename, const char* mode) {
-    fprintf(stderr, "AO: Called fopen: %s, %s\n", filename, mode);
+    AO_LOG(, "AO: Called fopen: %s, %s\n", filename, mode);
     FILE* res = (FILE*) 0;
     if (strncmp(filename, "/data", 5) == 0 || strncmp(filename, "/headers", 8) == 0) {
         int fd = arweave_fopen(filename, mode);
-        fprintf(stderr, "AO: arweave_fopen returned fd: %d\n", fd);
+        AO_LOG(, "AO: arweave_fopen returned fd: %d\n", fd);
         if (fd) {
             res = fdopen(fd, mode);
         }
     }
-    fprintf(stderr, "AO: fopen returned: %p\n", res);
+    AO_LOG(, "AO: fopen returned: %p\n", res);
     return res; 
 }
 
 int fclose(FILE* stream) {
-     fprintf(stderr, "Called fclose\n");
+     AO_LOG(, "Called fclose\n");
      return 0;  // Returning success, adjust as necessary
+}
+
+// Emscripten malloc does not align to 16 bytes correctly, which causes some 
+// programs that use aligned memory (for example, those that use SIMD...) to
+// crash. So we need to use the aligned allocator.
+void* malloc(size_t size) {
+    void* ret = memalign(16, size);
+
+    if(size > 1024 * 1024) {
+        AO_LOG("AOMALLOC: called with size: %zu. Returned: %p\n", size, ret);
+    }
+
+    return ret;
 }
 
 /*
 size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     int fd = fileno(stream);
-    fprintf(stderr, "AO: fread called with: ptr %p, size: %zu, nmemb: %zu, FD: %d.\n", ptr, size, nmemb, fd);
+    AO_LOG(, "AO: fread called with: ptr %p, size: %zu, nmemb: %zu, FD: %d.\n", ptr, size, nmemb, fd);
     size_t bytes_read = arweave_read(ptr, size, nmemb, (unsigned int) fd);
-    fprintf(stderr, "I'M BACK\n");
+    AO_LOG(, "I'M BACK\n");
     fflush(stderr);
-    //fprintf(stderr, "AO: fread returned: %zu. Output: %s\n", bytes_read, ptr);
+    //AO_LOG(, "AO: fread returned: %zu. Output: %s\n", bytes_read, ptr);
     return bytes_read;
 }
 
 int fseek(FILE* stream, long offset, int whence) {
-    fprintf(stderr, "Called fseek with offset: %ld, whence: %d\n", offset, whence);
+    AO_LOG(, "Called fseek with offset: %ld, whence: %d\n", offset, whence);
     return 0;  // Returning success, adjust as necessary
 }
 
 long ftell(FILE* stream) {
-    fprintf(stderr, "Called ftell\n");
+    AO_LOG(, "Called ftell\n");
     return 0;  // Returning 0 as the current position, adjust as necessary
 }
 */
