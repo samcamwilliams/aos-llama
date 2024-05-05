@@ -15,7 +15,7 @@ aolibc.a: $(CUSTOM_LIB_OBJ)
 	emar r aolibc.a $(CUSTOM_LIB_OBJ)
 
 CUSTOM_LIB_OBJ: aostdio.c
-	emcc -s WASM=1 -s MEMORY64=1 -s SUPPORT_LONGJMP=1 -c aostdio.c -o aostdio.o
+	emcc -s -c aostdio.c -o aostdio.o
 
 # Default target
 install: build-patched update-libc

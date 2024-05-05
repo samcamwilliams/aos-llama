@@ -173,6 +173,7 @@ def main():
         '-s', 'ALLOW_MEMORY_GROWTH=1',
         '-s', 'INITIAL_MEMORY=31457280',
         '-s', 'MAXIMUM_MEMORY=4294967296',
+        '-s', 'ASYNCIFY_STACK_SIZE=20971520',
         '-s', 'WASM=1',
         '-s', 'MODULARIZE',
         # '-s', 'FILESYSTEM=0',
@@ -202,7 +203,8 @@ def main():
     cmd.extend(['-lm', '-ldl', '-o', definition.get_output_file(), '-s', 'EXPORTED_RUNTIME_METHODS=["cwrap"]'])
 
     print('Compile command is {}'.format(' '.join(cmd)))
-    shell_exec(*cmd)
+    output, _ = shell_exec(*cmd)
+    print(output)
 
     # add metering library
     # meter_cmd = ['node', '/opt/node/apply-metering.cjs']

@@ -5,31 +5,35 @@ const assert = require('assert')
 const m = require(__dirname + '/AOS.js')
 
 describe('vfs-1 test', async () => {
-  const instance = await m()
-  const handle = function (msg, env) {
-    const x = instance.cwrap('handle', 'string', ['string', 'string'])(JSON.stringify(msg), JSON.stringify(env))
-    console.log(x)
-    return x
+  var instance;
+  const handle = async function (msg, env) {
+    const res = await instance.cwrap('handle', 'string', ['string', 'string'], { async: true })(JSON.stringify(msg), JSON.stringify(env))
+    return JSON.parse(res)
   }
 
-  /*it('should send eval successfully', () => {
-    const result = handle(getEval('1 + 1'), getEnv())
-    assert.equal(result.response.Output.data.output, 2)
-  })*/
-})
-/*
-  it.skip('should send data successfully', () => {
-    // instance.FS.mkdirTree('/afs/data')
-    // instance.FS.writeFile('/afs/data/1.bin', Buffer.from('HELLOWORLD'))
-    // see if directory exits
-    const result = handle(getData(), getEnv())
-    assert.ok(result.ok)
+  it('Create instance', async () => {
+    console.log("Creating instance...")
+    instance = await m()
+    await new Promise((r) => setTimeout(r, 1000));
+    assert.ok(instance)
   })
 
-  it.skip('should list files via eval', () => {
-    const result = handle(getEval(`
-local file = io.open("/afs/data/1.bin", "r")
-local output = "Hello"
+  it('Eval Lua', async () => {
+    const result = await handle(getEval('1 + 1'), getEnv())
+    assert.equal(result.response.Output.data.output, 2)
+  })
+
+  it('Add data to the FS', async () => {
+    await instance['FS_createPath']('/', 'data')
+    await instance['FS_createDataFile']('/', 'data/1', Buffer.from('HELLO WORLD'), true, false, false)
+    // see if directory exists
+    const result = await handle(getEval('return "OK"'), getEnv())
+    ssert.ok(result.response.Output.data.output == "OK")
+  })
+
+  it('Read data from the FS', async () => {
+    const result = await handle(getEval(`
+local file = io.open("/data/1", "r")
 if file then
   local content = file:read("*a")
   output = content
@@ -39,25 +43,9 @@ else
 end
 return output   
     `), getEnv())
-    console.log(result.response.Output.data)
-    assert.ok(true)
+    assert.ok(result.response.Output.data.output == "HELLO WORLD")
   })
 })
-*/
-
-function getData() {
-  return {
-    Id: '1',
-    Owner: 'TOM',
-    Module: 'FOO',
-    'Block-Height': '1001',
-    Timestamp: Date.now(),
-    From: 'foo',
-    Tags: [
-      { name: 'Content-Type', value: 'application/octet-stream' }
-    ]
-  }
-}
 
 function getEval(expr) {
   return {
