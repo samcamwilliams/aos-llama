@@ -28,7 +28,7 @@ describe('vfs-1 test', async () => {
     await instance['FS_createDataFile']('/', 'data/1', Buffer.from('HELLO WORLD'), true, false, false)
     // see if directory exists
     const result = await handle(getEval('return "OK"'), getEnv())
-    ssert.ok(result.response.Output.data.output == "OK")
+    Assert.ok(result.response.Output.data.output == "OK")
   })
 
   it('Read data from the FS', async () => {
