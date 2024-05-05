@@ -3,7 +3,7 @@
 #include <lualib.h>
 
 #include "lsqlite3.h"
-#include "llama.h"
+#include "llama-run.h"
 #include "stream.h"
 #include "LuaBase64.h"
 

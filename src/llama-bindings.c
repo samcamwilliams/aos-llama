@@ -1,12 +1,14 @@
 // llama lua wrappers
 
+#include <stdlib.h>
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
-#include "llama.h"
+#include "llama-run.h"
 
-static int l_llama_init(lua_State *L) {
-  int result = llama_init();
+static int l_llama_load(lua_State *L) {
+  const char* model_path = luaL_checkstring(L, 1);
+  int result = llama_load((char*) model_path);
   lua_pushinteger(L, result);
   return 1;
 }
@@ -19,19 +21,21 @@ static int l_llama_set_prompt(lua_State *L) {
 }
 
 // llama get next token
-static int l_llama_get_next_token(lua_State *L) {
-  char* token = llama_get_next_token();
-  lua_pushstring(L, token);
-
+static int l_llama_run(lua_State *L) {
+  // TODO: Must free this buffer!
+  char* response = malloc(4096);
+  int tokens = luaL_checkinteger(L, 1);
+  int result = llama_run(response, tokens);
+  lua_pushstring(L, response);
   return 1;
 }
 
 // register function
 int luaopen_llama(lua_State *L) {
   static const luaL_Reg llama_funcs[] = {
-      {"init", l_llama_init},
+      {"load", l_llama_load},
       {"set_prompt", l_llama_set_prompt},
-      {"get_next_token", l_llama_get_next_token},
+      {"run", l_llama_run},
       {NULL, NULL}  // Sentinel to indicate end of array
   };
 
