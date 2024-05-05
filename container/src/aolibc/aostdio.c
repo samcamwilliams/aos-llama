@@ -25,8 +25,16 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
                 if (Module.admissableList.includes(id)) {
                     console.log("JS: Getting Arweave ID: ", id);
                     const response = await fetch('https://arweave.net/' + id);
-                    const data = new Int8Array(await response.arrayBuffer());
-                    FS.writeFile('/data/' + id, data);
+                    
+                    // I think we will need to stream download to support larger files
+                    // const data = new Int8Array(await response.arrayBuffer());
+                    // FS.writeFile('/data/' + id, data);
+                    const writer = new WritableStream({
+                      write(chunk) {
+                        FS.writeFile(`/data/${id}`, new Uint8Array(chunk), { flags: 'a' }); 
+                      }
+                    });
+                    await response.body.pipeTo(writer);
                     console.log("JS: File written!");
                     const file = FS.open("/data/" + id, "r");
                     return Promise.resolve(file.fd);

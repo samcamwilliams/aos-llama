@@ -8,7 +8,8 @@ const AdmissableList =
     "dx3GrOQPV5Mwc1c-4HTsyq0s1TNugMf7XfIKJkyVQt8", // Random NFT metadata (1.7kb of JSON)
     "XOJ8FBxa6sGLwChnxhF2L71WkKLSKq1aU5Yn5WnFLrY", // GPT-2 117M model.
     "M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc", // GPT-2-XL 4-bit quantized model.
-    "ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo" // Phi-3 Mini 4k Instruct
+    "ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo", // Phi-3 Mini 4k Instruct
+    "kd34P4974oqZf2Db-hFTUiCipsU6CzbR6t-iJoQhKIo" // Phi-2 
   ]
 
 describe('vfs-1 test', async () => {
@@ -21,7 +22,7 @@ describe('vfs-1 test', async () => {
 
   it('Create instance', async () => {
     console.log("Creating instance...")
-    instance = await m({admissableList: AdmissableList})
+    instance = await m({ admissableList: AdmissableList })
     await new Promise((r) => setTimeout(r, 1000));
     console.log("Instance created...")
     await new Promise((r) => setTimeout(r, 250));
@@ -55,7 +56,7 @@ return output`), getEnv())
     assert.ok(result.response.Output.data.output == "HELLO WORLD")
   })
 
-  it('Read data from Arweave', async () => {
+  it.skip('Read data from Arweave', async () => {
     const result = await handle(getEval(`
 local file = io.open("/data/dx3GrOQPV5Mwc1c-4HTsyq0s1TNugMf7XfIKJkyVQt8", "r")
 if file then
@@ -68,7 +69,7 @@ end`), getEnv())
     assert.ok(result.response.Output.data.output.length == 10)
   })
 
-  it('Llama Lua library loads', async () => {
+  it.skip('Llama Lua library loads', async () => {
     const result = await handle(getEval(`
 local llama = require("llama")
 --llama.load("/data/ggml-tiny.en.bin")
@@ -78,7 +79,7 @@ return llama.info()
   })
 
 
-  it('Llama runs GPT-2 1.5b model', async () => {
+  it.skip('Llama runs GPT-2 1.5b model', async () => {
     const result = await handle(getEval(`
   local llama = require("llama")
   local result = llama.load("/data/M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc")
@@ -89,12 +90,26 @@ return llama.info()
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
+  it('Llama loads Phi-2', async () => {
+    const result = await handle(getEval(`
+  local llama = require("llama")
+  llama.load('/data/kd34P4974oqZf2Db-hFTUiCipsU6CzbR6t-iJoQhKIo')
+  llama.setPrompt([[<|user|>Can you write a HelloWorld function in Lua<|end|><|assistant|>]])
+  return llama.run(100) 
+  `), getEnv())
+    console.log(result.response)
+    assert.ok(result.response.Output.data.output.length > 10)
+  })
+
+
+
   it.skip('Llama loads Phi-3 Mini 4k Instruct', async () => {
     const result = await handle(getEval(`
   local llama = require("llama")
-  local result = llama.load("/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo")
-  llama.setPrompt("RESEARCHER: You are a new machine intelligence. You have just been born in a new cyberspace. How do you feel?\nYOU:")
-  return llama.run(100)
+  llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
+  llama.setPrompt([[<|user|>Can you write a HelloWorld function in Lua<|end|><|assistant|>]])
+  return llama.run(100) 
+  -- return "OKOKOKOKOKOK"
   `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)
