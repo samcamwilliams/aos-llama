@@ -6,12 +6,10 @@
 #include <emscripten.h>
 
 // WeaveDrive file functions
-EM_ASYNC_JS(int, arweave_fopen, (const char* filename_c, const char* mode), {
+EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
     try {
-        const filename = UTF8ToString(Number(filename_c));
+        const filename = UTF8ToString(Number(c_filename));
         
-        await new Promise((r) => setTimeout(r, 1000));
-
         const pathCategory = filename.split('/')[1];
         const id = filename.split('/')[2];
         console.log("JS: Opening file: ", filename);
@@ -24,8 +22,19 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* filename_c, const char* mode), {
                 return Promise.resolve(file.fd);
             }
             else {
-                console.log("JS: File does not exist: ", filename);
-                return Promise.resolve(0);
+                if (Module.admissableList.includes(id)) {
+                    console.log("JS: Getting Arweave ID: ", id);
+                    const response = await fetch('https://arweave.net/' + id);
+                    const data = new Int8Array(await response.arrayBuffer());
+                    FS.writeFile('/data/' + id, data);
+                    console.log("JS: File written!");
+                    const file = FS.open("/data/" + id, UTF8ToString(Number(mode)));
+                    return Promise.resolve(file.fd);
+                }
+                else {
+                    console.log("JS: Arweave ID is not admissable! ", id);
+                    return Promise.resolve(0);
+                }
             }
         }
         else if (pathCategory === 'headers') {
@@ -39,15 +48,20 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* filename_c, const char* mode), {
   }
 });
 
-EM_ASYNC_JS(size_t, afs_fread, (void* fd, size_t buffer, size_t size), {
-  try {
-    console.log('PATH: ', FS.streams[fd].path);
-    const data = FS.read(FS.streams[fd], HEAPU8, buffer, size, 0);
-    return data;
-  } catch (err) {
-    console.error('Error reading file: ', err);
-    return -1;
-  }
+// NOTE: Currently unused, but this is the start of how we would do it.
+EM_ASYNC_JS(size_t, arweave_read, (void *buffer, size_t size, size_t nmemb, int fd), {
+    try {
+        console.log('JS: Reading requested data... ', buffer, size, nmemb, fd);
+        console.log("Sending args:", HEAP8, Number(buffer), Number(size) * Number(nmemb), 0);
+        const bytes_read = FS.streams[fd].stream_ops.read(FS.streams[fd], HEAP8, Number(buffer), Number(Number(size) * Number(nmemb)), 0);
+        console.log('JS: Read data: ', bytes_read);
+        await new Promise((r) => setTimeout(r, 1000));
+        console.log('Resolving...');
+        return Promise.resolve(bytes_read);
+    } catch (err) {
+        console.error('JS: Error reading file: ', err);
+        return Promise.resolve(-1);
+    }
 });
 
 // NOTE: This may not actually be necessary. But if it is, here is how we would
@@ -94,9 +108,13 @@ int fclose(FILE* stream) {
 
 /*
 size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
-  printf("read file\n");
-    //afs_fread(ptr, size, nmemb);
-    return 0;
+    int fd = fileno(stream);
+    fprintf(stderr, "AO: fread called with: ptr %p, size: %zu, nmemb: %zu, FD: %d.\n", ptr, size, nmemb, fd);
+    size_t bytes_read = arweave_read(ptr, size, nmemb, (unsigned int) fd);
+    fprintf(stderr, "I'M BACK\n");
+    fflush(stderr);
+    //fprintf(stderr, "AO: fread returned: %zu. Output: %s\n", bytes_read, ptr);
+    return bytes_read;
 }
 
 int fseek(FILE* stream, long offset, int whence) {
