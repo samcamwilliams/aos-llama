@@ -51,7 +51,7 @@ clean:
 	rm -f AOS.wasm libllama.a test/AOS.wasm build/aos/process/AOS.wasm
 	rm -f package-lock.json
 	rm -rf node_modules
-	# docker rmi -f p3rmaw3b/ao || true
+	docker rmi -f p3rmaw3b/ao || true
 
 build/aos/package.json: build
 	cd build; git submodule init; git submodule update --remote
@@ -64,15 +64,7 @@ build/llama.cpp: build
 		cd build; git clone https://github.com/ggerganov/llama.cpp.git; \
 	fi
 
-build/llama.cpp/patched: build/llama.cpp
-	if [ ! -f "build/llama.cpp/patched" ]; then \
-		echo "\nadd_subdirectory(examples/main)" >> build/llama.cpp/CMakeLists.txt; \
-		sed -i '' 's/int main(/int llama_main(/' build/llama.cpp/examples/main/main.cpp; \
-		sed -i '' 's/add_executable/add_library/' build/llama.cpp/examples/main/CMakeLists.txt; \
-		touch build/llama.cpp/patched; \
-	fi
-
-libllama.a: build/llama.cpp/patched
+libllama.a: build/llama.cpp
 	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && emcmake cmake -DCMAKE_CXX_FLAGS='$(EMXX_CFLAGS)' -S . -B . -DLLAMA_BUILD_EXAMPLES=OFF"
 	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && emmake make EMCC_CFLAGS='$(EMXX_CFLAGS)'"
 	cp build/llama.cpp/libllama.a libllama.a
