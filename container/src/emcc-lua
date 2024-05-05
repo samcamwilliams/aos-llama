@@ -167,6 +167,7 @@ def main():
     debug_print('Start to compile as WASM')
     cmd = ['emcc', '-O0']
     cmd.extend([
+        '-g2',
         '-s', 'ASYNCIFY=1',
         '-s', 'MEMORY64=1',
         '-s', 'STACK_SIZE=20971520',
