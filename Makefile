@@ -10,7 +10,7 @@ EMXX_CFLAGS=-s MEMORY64=1 -O3 -msimd128 -fno-rtti -DNDEBUG \
 	-s EXPORTED_FUNCTIONS=_main -s EXPORTED_RUNTIME_METHODS=callMain -s \
 	NO_EXIT_RUNTIME=1 -Wno-unused-command-line-argument -Wno-experimental
 
-ARCH=$(shell uname -m | sed -e 's/x86_64/linux\/amd64/' -e 's/aarch64/linux\/arm64/')
+ARCH=$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
 
 .PHONY: image
 image: node AOS.wasm
@@ -74,7 +74,7 @@ build/llama.cpp/llama-run.o: libllama.a src/llama-run.cpp container
 
 .PHONY: container
 container: container/Dockerfile
-	docker build . -f container/Dockerfile -t p3rmaw3b/ao --platform linux/$(ARCH)
+	docker build . -f container/Dockerfile -t p3rmaw3b/ao --build-arg ARCH=$(ARCH)
 
 publish-module: AOS.wasm
 	npm install
