@@ -41,6 +41,7 @@ int llama_load(char* model_path) {
 
 extern "C" int llama_run(char* response, int n_len);
 int llama_run(char* response, int n_len) {
+    char* start_of_response = response;
     // initialize the context
     llama_context_params ctx_params = llama_context_default_params();
 
@@ -74,7 +75,7 @@ int llama_run(char* response, int n_len) {
 
     // print the prompt token-by-token
 
-    //fprintf(stderr, "\n");
+    fprintf(stderr, "\n");
 
     for (auto id : tokens_list) {
         fprintf(stderr, "%s", llama_token_to_piece(ctx, id).c_str());
@@ -127,7 +128,9 @@ int llama_run(char* response, int n_len) {
                 break;
             }
 
-            LOG_TEE("%s", llama_token_to_piece(ctx, new_token_id).c_str());
+            std::string token_str = llama_token_to_piece(ctx, new_token_id);
+            LOG_TEE("%s", token_str.c_str());
+            strcat(response, token_str.c_str());
             fflush(stdout);
 
             // prepare the next batch
