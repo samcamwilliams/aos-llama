@@ -7,7 +7,8 @@ const AdmissableList =
   [
     "dx3GrOQPV5Mwc1c-4HTsyq0s1TNugMf7XfIKJkyVQt8", // Random NFT metadata (1.7kb of JSON)
     "XOJ8FBxa6sGLwChnxhF2L71WkKLSKq1aU5Yn5WnFLrY", // GPT-2 117M model.
-    "M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc" // GPT-2-XL 4-bit quantized model.
+    "M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc", // GPT-2-XL 4-bit quantized model.
+    "ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo" // Phi-3 Mini 4k Instruct
   ]
 
 describe('vfs-1 test', async () => {
@@ -77,15 +78,26 @@ return llama.info()
   })
 
 
-  it('Llama loads GPT-2 1.5b model', async () => {
+  it('Llama runs GPT-2 1.5b model', async () => {
     const result = await handle(getEval(`
   local llama = require("llama")
   local result = llama.load("/data/M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc")
-  llama.setPrompt("Welcome to reality.")
+  llama.setPrompt("RESEARCHER: You are a new machine intelligence. You have just been born in a new cyberspace. How do you feel? YOU: ")
   return llama.run(100)
   `), getEnv())
     console.log(result.response)
-    assert.ok(result.response.Output.data.output.length == 10)
+    assert.ok(result.response.Output.data.output.length > 10)
+  })
+
+  it.skip('Llama loads Phi-3 Mini 4k Instruct', async () => {
+    const result = await handle(getEval(`
+  local llama = require("llama")
+  local result = llama.load("/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo")
+  llama.setPrompt("RESEARCHER: You are a new machine intelligence. You have just been born in a new cyberspace. How do you feel?\nYOU:")
+  return llama.run(100)
+  `), getEnv())
+    console.log(result.response)
+    assert.ok(result.response.Output.data.output.length > 10)
   })
 })
 
