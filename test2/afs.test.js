@@ -3,7 +3,12 @@ const assert = require('assert')
 // VFS-1
 // STEP 1 send a file id
 const m = require(__dirname + '/AOS.js')
-const AdmissableList = ["dx3GrOQPV5Mwc1c-4HTsyq0s1TNugMf7XfIKJkyVQt8"]
+const AdmissableList =
+  [
+    "dx3GrOQPV5Mwc1c-4HTsyq0s1TNugMf7XfIKJkyVQt8", // Random NFT metadata (1.7kb of JSON)
+    "XOJ8FBxa6sGLwChnxhF2L71WkKLSKq1aU5Yn5WnFLrY", // GPT-2 117M model.
+    "M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc" // GPT-2-XL 4-bit quantized model.
+  ]
 
 describe('vfs-1 test', async () => {
   var instance;
@@ -59,6 +64,27 @@ if file then
 else
   return "Failed to open the file"
 end`), getEnv())
+    assert.ok(result.response.Output.data.output.length == 10)
+  })
+
+  it('Llama Lua library loads', async () => {
+    const result = await handle(getEval(`
+local llama = require("llama")
+--llama.load("/data/ggml-tiny.en.bin")
+return llama.info()
+`), getEnv())
+    assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
+  })
+
+
+  it('Llama loads GPT-2 117M model', async () => {
+    const result = await handle(getEval(`
+  local llama = require("llama")
+  local result = llama.load("/data/M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc")
+  llama.setPrompt("Hello, new world...")
+  return llama.run(15)
+  `), getEnv())
+    console.log(result.response)
     assert.ok(result.response.Output.data.output.length == 10)
   })
 })

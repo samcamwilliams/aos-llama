@@ -5,7 +5,7 @@ function llama.info()
     return "Decentralized llama.cpp."
 end
 
-function llama.loadModel(id, onModelLoaded)
+function llama.load(id)
     llama.backend.load(id)
 end
 
