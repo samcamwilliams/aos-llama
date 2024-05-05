@@ -17,7 +17,7 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
         if (pathCategory === 'data') {
             if(FS.analyzePath(filename).exists) {
                 console.log("JS: File exists: ", filename);
-                const file = FS.open("/data/" + id, UTF8ToString(Number(mode)));
+                const file = FS.open("/data/" + id, "r");
                 console.log("JS: File opened: ", file.fd);
                 return Promise.resolve(file.fd);
             }
@@ -28,7 +28,7 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
                     const data = new Int8Array(await response.arrayBuffer());
                     FS.writeFile('/data/' + id, data);
                     console.log("JS: File written!");
-                    const file = FS.open("/data/" + id, UTF8ToString(Number(mode)));
+                    const file = FS.open("/data/" + id, "r");
                     return Promise.resolve(file.fd);
                 }
                 else {
