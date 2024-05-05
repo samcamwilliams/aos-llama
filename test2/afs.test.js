@@ -77,12 +77,12 @@ return llama.info()
   })
 
 
-  it('Llama loads GPT-2 117M model', async () => {
+  it('Llama loads GPT-2 1.5b model', async () => {
     const result = await handle(getEval(`
   local llama = require("llama")
   local result = llama.load("/data/M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc")
-  llama.setPrompt("Hello, new world...")
-  return llama.run(15)
+  llama.setPrompt("Welcome to reality.")
+  return llama.run(100)
   `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length == 10)
