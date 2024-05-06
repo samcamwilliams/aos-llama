@@ -2,7 +2,7 @@ local llama = {}
 llama.backend = require("_llama")
 
 function llama.info()
-    return "Decentralized llama.cpp."
+    return "A decentralized LLM inference engine, built on top of llama.cpp."
 end
 
 function llama.load(id)
@@ -10,12 +10,15 @@ function llama.load(id)
 end
 
 function llama.setPrompt(prompt)
-    -- Proxy the new prompt to the backend
     llama.backend.set_prompt(prompt)
 end
 
 function llama.run(count)
     return llama.backend.run(count)
+end
+
+function llama.next()
+    return llama.backend.next()
 end
 
 return llama

@@ -20,13 +20,20 @@ static int l_llama_set_prompt(lua_State *L) {
   return 0;
 }
 
-// llama get next token
+// Get a series of tokens as a string
 static int l_llama_run(lua_State *L) {
-  // TODO: Must free this buffer!
-  char* response = malloc(4096);
   int tokens = luaL_checkinteger(L, 1);
-  int result = llama_run(response, tokens);
-  lua_pushstring(L, response);
+  char* result = llama_run(tokens);
+  lua_pushstring(L, result);
+  free(result);
+  return 1;
+}
+
+// Get the next token
+static int l_llama_next(lua_State *L) {
+  char* result = llama_next();
+  lua_pushstring(L, result);
+  free(result);
   return 1;
 }
 
@@ -36,6 +43,7 @@ int luaopen_llama(lua_State *L) {
       {"load", l_llama_load},
       {"set_prompt", l_llama_set_prompt},
       {"run", l_llama_run},
+      {"next", l_llama_next},
       {NULL, NULL}  // Sentinel to indicate end of array
   };
 
