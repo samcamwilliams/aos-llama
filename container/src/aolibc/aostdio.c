@@ -30,16 +30,19 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
             else {
                 if (Module.admissableList.includes(id)) {
                     console.log("JS: Getting Arweave ID: ", id);
-                    const response = await fetch('https://arweave.net/' + id);
+                    const response = await fetch('https://g8way.io/' + id);
                     
                     // I think we will need to stream download to support larger files
                     // const data = new Int8Array(await response.arrayBuffer());
                     // FS.writeFile('/data/' + id, data);
+                    let bytes = 0;
                     const writer = new WritableStream({
                       write(chunk) {
+                        bytes += chunk.length;
                         FS.writeFile(`/data/${id}`, new Uint8Array(chunk), { flags: 'a' }); 
+                        console.log("JS: Bytes written: ", bytes);
                       }
-                    });
+                    }, new CountQueuingStrategy({ highWaterMark: 10 }));
                     await response.body.pipeTo(writer);
                     console.log("JS: File written!");
                     const file = FS.open("/data/" + id, "r");

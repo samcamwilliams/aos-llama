@@ -10,6 +10,6 @@
     "node": "22"
   },
   "scripts": {
-    "test": "node --test --experimental-wasm-memory64 afs.test.js"
+    "test": "node --test --test-timeout=100000000 --experimental-wasm-memory64 afs.test.js"
   }
 }
