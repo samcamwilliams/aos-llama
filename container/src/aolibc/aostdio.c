@@ -102,22 +102,30 @@ FILE *fallback_fopen(const char *filename, const char *mode) {
 }
 
 FILE* fopen(const char* filename, const char* mode) {
-    AO_LOG(, "AO: Called fopen: %s, %s\n", filename, mode);
+    AO_LOG( "AO: Called fopen: %s, %s\n", filename, mode);
     FILE* res = (FILE*) 0;
     if (strncmp(filename, "/data", 5) == 0 || strncmp(filename, "/headers", 8) == 0) {
         int fd = arweave_fopen(filename, mode);
-        AO_LOG(, "AO: arweave_fopen returned fd: %d\n", fd);
+        AO_LOG( "AO: arweave_fopen returned fd: %d\n", fd);
         if (fd) {
             res = fdopen(fd, mode);
         }
     }
-    AO_LOG(, "AO: fopen returned: %p\n", res);
+    AO_LOG( "AO: fopen returned: %p\n", res);
     return res; 
 }
 
 int fclose(FILE* stream) {
-     AO_LOG(, "Called fclose\n");
+     AO_LOG( "Called fclose\n");
      return 0;  // Returning success, adjust as necessary
+}
+
+void* realloc(void* ptr, size_t size) {
+    void* new_ptr = memalign(16, size);
+    memcpy(new_ptr, ptr, size);
+    free(ptr);
+    AO_LOG("DBG: Realloc called: %p -> %p, size: %zu\n", ptr, new_ptr, size);
+    return new_ptr;
 }
 
 // Emscripten malloc does not align to 16 bytes correctly, which causes some 
@@ -132,25 +140,24 @@ void* malloc(size_t size) {
 
     return ret;
 }
-
 /*
 size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     int fd = fileno(stream);
-    AO_LOG(, "AO: fread called with: ptr %p, size: %zu, nmemb: %zu, FD: %d.\n", ptr, size, nmemb, fd);
+    AO_LOG( "AO: fread called with: ptr %p, size: %zu, nmemb: %zu, FD: %d.\n", ptr, size, nmemb, fd);
     size_t bytes_read = arweave_read(ptr, size, nmemb, (unsigned int) fd);
-    AO_LOG(, "I'M BACK\n");
+    AO_LOG( "I'M BACK\n");
     fflush(stderr);
-    //AO_LOG(, "AO: fread returned: %zu. Output: %s\n", bytes_read, ptr);
+    //AO_LOG( "AO: fread returned: %zu. Output: %s\n", bytes_read, ptr);
     return bytes_read;
 }
 
 int fseek(FILE* stream, long offset, int whence) {
-    AO_LOG(, "Called fseek with offset: %ld, whence: %d\n", offset, whence);
+    AO_LOG( "Called fseek with offset: %ld, whence: %d\n", offset, whence);
     return 0;  // Returning success, adjust as necessary
 }
 
 long ftell(FILE* stream) {
-    AO_LOG(, "Called ftell\n");
+    AO_LOG( "Called ftell\n");
     return 0;  // Returning 0 as the current position, adjust as necessary
 }
 */
