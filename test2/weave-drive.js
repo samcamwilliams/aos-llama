@@ -1,5 +1,23 @@
-var XMLHttpRequest = require("node-xmlhttprequest").XMLHttpRequest;
+//var XMLHttpRequest = require("node-xmlhttprequest").XMLHttpRequest;
+var loop = require('deasync').runLoopOnce
 var assert = require('assert')
+
+function awaitSync(p) {
+  var done = false;
+  var result = null;
+  p().then((r) => {
+    done = true;
+    result = r;
+  }).catch(e => {
+    console.log(e);
+    done = true;
+  });
+  while (!done) {
+    console.log("isDone?", done)
+    loop()
+  }
+  return result
+}
 
 module.exports = function weaveDrive(FS) {
   return {
@@ -23,15 +41,18 @@ module.exports = function weaveDrive(FS) {
           this.getter = getter;
         }
         cacheLength() {
+          console.log("URL:", url);
           // Find length
-          var xhr = new XMLHttpRequest();
-          xhr.open('HEAD', url, false);
-          xhr.send(null);
+          var headers = awaitSync(() => fetch(url, {
+            method: 'HEAD'
+          }).then(res => res.headers).catch(e => ({ e })))
+          console.log("Headers: ", headers);
           // if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
-          var datalength = Number(xhr.getResponseHeader("Content-length"));
+          var datalength = Number(headers.get('Content-Length'));
+
           var header;
-          var hasByteServing = (header = xhr.getResponseHeader("Accept-Ranges")) && header === "bytes";
-          var usesGzip = (header = xhr.getResponseHeader("Content-Encoding")) && header === "gzip";
+          var hasByteServing = (header = headers.get("Accept-Ranges")) && header === "bytes";
+          var usesGzip = (header = headers.get("Content-Encoding")) && header === "gzip";
 
           var chunkSize = 1024 * 1024; // Chunk size in bytes
 
@@ -41,24 +62,29 @@ module.exports = function weaveDrive(FS) {
           var doXHR = (from, to) => {
             if (from > to) throw new Error("invalid range (" + from + ", " + to + ") or no bytes requested!");
             if (to > datalength - 1) throw new Error("only " + datalength + " bytes available! programmer error!");
+            return new Uint8Array(deasyncPromise(fetch(url, {
+              headers: {
+                Range: `bytes=${from}-${to}`
+              }
+            }).then(res => res.arrayBuffer())))
 
-            // TODO: Use mozResponseArrayBuffer, responseStream, etc. if available.
-            var xhr = new XMLHttpRequest();
-            xhr.open('GET', url, false);
-            if (datalength !== chunkSize) xhr.setRequestHeader("Range", "bytes=" + from + "-" + to);
+            // var xhr = new XMLHttpRequest();
+            // xhr.open('GET', url, false);
+            // if (datalength !== chunkSize) xhr.setRequestHeader("Range", "bytes=" + from + "-" + to);
 
-            // Some hints to the browser that we want binary data.
-            xhr.responseType = 'arraybuffer';
-            if (xhr.overrideMimeType) {
-              xhr.overrideMimeType('text/plain; charset=x-user-defined');
-            }
+            // // Some hints to the browser that we want binary data.
+            // xhr.responseType = 'arraybuffer';
+            // if (xhr.overrideMimeType) {
+            //   xhr.overrideMimeType('text/plain; charset=x-user-defined');
+            // }
 
-            xhr.send(null);
-            if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
-            if (xhr.response !== undefined) {
-              return new Uint8Array(/** @type{Array<number>} */(xhr.response || []));
-            }
-            return intArrayFromString(xhr.responseText || '', true);
+            // xhr.send(null);
+
+            // if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
+            // if (xhr.response !== undefined) {
+            //   return new Uint8Array(/** @type{Array<number>} */(xhr.response || []));
+            // }
+            // return intArrayFromString(xhr.responseText || '', true);
           };
           var lazyArray = this;
           lazyArray.setDataGetter((chunkNum) => {
@@ -99,14 +125,9 @@ module.exports = function weaveDrive(FS) {
       }
 
       console.log('CREATE FILE: ', url);
-      if (typeof XMLHttpRequest != 'undefined') {
-        // if (!ENVIRONMENT_IS_WORKER) throw 'Cannot do synchronous binary XHRs outside webworkers in modern browsers. Use --embed-file or --preload-file in emcc';
-        var lazyArray = new LazyUint8Array();
-        console.log('lazyArray: ', lazyArray);
-        var properties = { isDevice: false, contents: lazyArray };
-      } else {
-        var properties = { isDevice: false, url: url };
-      }
+      var lazyArray = new LazyUint8Array();
+      //console.log('lazyArray: ', lazyArray.cacheLength());
+      var properties = { isDevice: false, contents: lazyArray };
       console.log('Properties: ', properties);
       var node = FS.createFile(parent, name, properties, canRead, canWrite);
       // This is a total hack, but I want to get this lazy file code out of the

@@ -4,10 +4,7 @@
   "main": "index.js",
   "license": "MIT",
   "dependencies": {
-    "node-xmlhttprequest": "^1.0.6",
-    "wasi": "^0.0.6",
-    "xhr2": "^0.2.1",
-    "xmlhttprequest": "^1.8.0"
+    "deasync": "^0.1.29"
   },
   "engines": {
     "node": "22"

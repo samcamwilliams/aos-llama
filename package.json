@@ -11,6 +11,7 @@
   "dependencies": {
     "@ardrive/turbo-sdk": "^1.5.0",
     "@irys/sdk": "0.1.16",
+    "@kaciras/deasync": "^1.0.4",
     "xhr2": "^0.2.1"
   },
   "devDependencies": {

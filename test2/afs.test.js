@@ -25,7 +25,6 @@ describe('AOS-Llama+VFS Tests', async () => {
 
   it('Create instance', async () => {
     console.log("Creating instance...")
-
     instance = await m({ admissableList: AdmissableList, WeaveDrive: weaveDrive })
     await new Promise((r) => setTimeout(r, 1000));
     console.log("Instance created.")
