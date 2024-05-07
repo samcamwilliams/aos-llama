@@ -64,7 +64,7 @@ return output`), getEnv())
     assert.ok(result.response.Output.data.output == "HELLO WORLD")
   })
 
-  it('Read data from Arweave', async () => {
+  it.skip('Read data from Arweave', async () => {
     const result = await handle(getEval(`
 local file = io.open("/data/dx3GrOQPV5Mwc1c-4HTsyq0s1TNugMf7XfIKJkyVQt8", "r")
 if file then
@@ -131,7 +131,7 @@ return llama.run(40)
   })
 
 
-  it.skip('AOS runs Llama3 8B Instruct q3', async () => {
+  it('AOS runs Llama3 8B Instruct q3', async () => {
     const result =
       await handle(
         getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',

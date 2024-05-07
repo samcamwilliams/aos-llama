@@ -1,26 +1,49 @@
 //var XMLHttpRequest = require("node-xmlhttprequest").XMLHttpRequest;
-var loop = require('deasync').runLoopOnce
 var assert = require('assert')
-
-function awaitSync(p) {
-  var done = false;
-  var result = null;
-  p().then((r) => {
-    done = true;
-    result = r;
-  }).catch(e => {
-    console.log(e);
-    done = true;
-  });
-  while (!done) {
-    console.log("isDone?", done)
-    loop()
-  }
-  return result
-}
+const MB = (1024 * 1024)
+const GB = 1000 * MB
 
 module.exports = function weaveDrive(FS) {
+  var bytes = 0;
+  const writer = (filePath) => new WritableStream({
+    write(chunk) {
+      bytes += chunk.length;
+      FS.writeFile(filePath, new Uint8Array(chunk), { flags: 'a' });
+      console.log("File:" + filePath + " JS: Bytes written: ", bytes);
+    }
+  }, new CountQueuingStrategy({ highWaterMark: 10000 }));
+  const fetchRange = (url, from, to) => fetch(url, {
+    headers: {
+      Connection: 'keep-alive',
+      Range: `bytes=${from}-${to}`
+    }
+  })
+
   return {
+    async downloadFiles(url, filePath) {
+      var bytesLength = await fetch(url, { method: 'HEAD' }).then(res => res.headers.get('Content-Length'))
+      console.log('bytes: ', bytesLength)
+      var offset = bytesLength > (4 * GB) ? Math.floor(bytesLength / 4) : bytesLength
+      console.log('offset: ', offset)
+      if (offset === bytesLength) {
+        const response = await fetch(url);
+        await response.body.pipeTo(writer(filePath));
+      } else {
+        console.log('GET FILEs: please!');
+        await fetchRange(url, 0, offset).then(response => response.body.pipeTo(writer(filePath + '.1')));
+        await fetchRange(url, offset, offset * 2).then(response => response.body.pipeTo(writer(filePath + '.2')));
+        await fetchRange(url, offset * 2 + 1, offset * 3).then(response => response.body.pipeTo(writer(filePath + '.3')));
+        await fetchRange(url, offset * 3 + 1, bytesLength - 1).then(response => response.body.pipeTo(writer(filePath + '.4')));
+
+        // await Promise.all([
+        //   () => fetchRange(url, 0, offset).then(response => response.body.pipeTo(writer(filePath + '.1'))),
+        //   //() => fetchRange(url, offset, offset * 2).then(response => response.body.pipeTo(writer(filePath + '.2'))),
+        //   //() => fetchRange(url, offset * 2 + 1, offset * 3).then(response => response.body.pipeTo(writer(filePath + '.3'))),
+        //   //() => fetchRange(url, offset * 3 + 1, offset * 4).then(response => response.body.pipeTo(writer(filePath + '.4')))
+        // ])
+      }
+      return Promise.resolve("OK")
+    },
     createLazyFile(parent, name, url, canRead, canWrite) {
       // Lazy chunked Uint8Array (implements get and length from Uint8Array).
       // Actual getting is abstracted away for eventual reuse.
