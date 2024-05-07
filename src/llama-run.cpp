@@ -62,7 +62,7 @@ int llama_set_prompt(char* prompt) {
     ctx = llama_new_context_with_model(model, ctx_params);
 
     if (ctx == NULL) {
-        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "error: failed to create the llama_context\n", NULL);
         return 1;
     }
 
@@ -72,7 +72,7 @@ int llama_set_prompt(char* prompt) {
 
     // make sure the KV cache is big enough to hold all the prompt and generated tokens
     if (isCtxFull()) {
-        LOG_TEE("%s: error: n_kv_req > n_ctx, the required KV cache size is not big enough\n", __func__);
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "error: n_kv_req > n_ctx, the required KV cache size is not big enough\n", NULL);
         return 1;
     }
 
@@ -90,11 +90,9 @@ int llama_set_prompt(char* prompt) {
     batch.logits[batch.n_tokens - 1] = true;
 
     if (llama_decode(ctx, batch) != 0) {
-        LOG_TEE("%s: llama_decode() failed\n", __func__);
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Failed to eval, return code %d\n", NULL);
         return 1;
     }
-
-    int n_cur = batch.n_tokens;
 
     return 0;
 }
@@ -133,7 +131,7 @@ char* llama_next() {
 
     // evaluate the current batch with the transformer model
     if (llama_decode(ctx, batch)) {
-        fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Failed to eval, return code %d\n", NULL);
         return 0;
     }
 
