@@ -165,7 +165,7 @@ def main():
 
     # Finally, compile to wasm
     debug_print('Start to compile as WASM')
-    cmd = ['emcc', '-O0']
+    cmd = ['emcc', '-O3']
     cmd.extend([
         '-g2',
         '-s', 'ASYNCIFY=1',
@@ -180,7 +180,8 @@ def main():
         # '-s', 'FILESYSTEM=0',
         '-s', 'DETERMINISTIC=1',
         '-s', 'NODERAWFS=0',
-        '-s', 'FORCE_FILESYSTEM=1'
+        '-s', 'FORCE_FILESYSTEM=1',
+        '-msimd128'
     ])
     # Add the custom aostdlib directory and the AO libc archive file.
     cmd.extend(['-L/opt/aolibc', '-l:aolibc.a'])
