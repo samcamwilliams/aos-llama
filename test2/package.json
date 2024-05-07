@@ -4,12 +4,13 @@
   "main": "index.js",
   "license": "MIT",
   "dependencies": {
-    "wasi": "^0.0.6"
+    "wasi": "^0.0.6",
+    "xmlhttprequest": "^1.8.0"
   },
   "engines": {
     "node": "22"
   },
   "scripts": {
-    "test": "node --test --test-timeout=100000000 --experimental-wasm-memory64 afs.test.js"
+    "test": "node --test --test-timeout=100000000 --expose-gc --experimental-wasm-memory64  --max-old-space-size=16384 afs.test.js"
   }
 }

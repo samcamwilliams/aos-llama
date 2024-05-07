@@ -1,5 +1,7 @@
 const { describe, it } = require('node:test')
 const assert = require('assert')
+const weaveDrive = require('./weave-drive.js')
+
 // VFS-1
 // STEP 1 send a file id
 const m = require(__dirname + '/AOS.js')
@@ -23,7 +25,8 @@ describe('AOS-Llama+VFS Tests', async () => {
 
   it('Create instance', async () => {
     console.log("Creating instance...")
-    instance = await m({ admissableList: AdmissableList })
+
+    instance = await m({ admissableList: AdmissableList, WeaveDrive: weaveDrive })
     await new Promise((r) => setTimeout(r, 1000));
     console.log("Instance created.")
     await new Promise((r) => setTimeout(r, 250));
@@ -39,7 +42,10 @@ describe('AOS-Llama+VFS Tests', async () => {
   it('Add data to the VFS', async () => {
     await instance['FS_createPath']('/', 'data')
     await instance['FS_createDataFile']('/', 'data/1', Buffer.from('HELLO WORLD'), true, false, false)
-    // see if directory exists
+    //console.log(instance.WeaveDrive)
+    // const foo = await instance['FS_createLazyFile']('/', 'data/foo', 'https://arweave.net/Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA', true, false);
+    // console.log(foo)
+    // // see if directory exists
     const result = await handle(getEval('return "OK"'), getEnv())
     assert.ok(result.response.Output.data.output == "OK")
   })
@@ -55,10 +61,11 @@ else
   return "Failed to open the file"
 end
 return output`), getEnv())
+    console.log(result.response.Output)
     assert.ok(result.response.Output.data.output == "HELLO WORLD")
   })
 
-  it.skip('Read data from Arweave', async () => {
+  it('Read data from Arweave', async () => {
     const result = await handle(getEval(`
 local file = io.open("/data/dx3GrOQPV5Mwc1c-4HTsyq0s1TNugMf7XfIKJkyVQt8", "r")
 if file then
@@ -106,8 +113,8 @@ return llama.info()
     const result = await handle(getEval(`
   local llama = require("llama")
   llama.load('/data/kd34P4974oqZf2Db-hFTUiCipsU6CzbR6t-iJoQhKIo')
-  llama.setPrompt([[<|user|>Can you write a HelloWorld function in js<|end|><|assistant|>]])
-  return llama.run(10) 
+  llama.setPrompt([[<|user|>Can you write an html contact page for Tom Wilson whose email is t@foo.com<|end|><|assistant|>]])
+  return llama.run(100) 
   `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)
@@ -124,12 +131,25 @@ return llama.run(40)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it('AOS runs Llama3 8B Instruct q4', async () => {
+
+  it.skip('AOS runs Llama3 8B Instruct q3', async () => {
     const result =
       await handle(
         getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
-        30,
-        "<|user|>Tell me a story.<|end|><|assistant|>"),
+          30,
+          "<|user|>Tell me a story.<|end|><|assistant|>"),
+        getEnv()
+      )
+    console.log(result.response)
+    assert.ok(result.response.Output.data.output.length > 10)
+  })
+
+  it.skip('AOS runs Llama3 8B Instruct q4', async () => {
+    const result =
+      await handle(
+        getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
+          30,
+          "<|user|>Tell me a story.<|end|><|assistant|>"),
         getEnv()
       )
     console.log(result.response)

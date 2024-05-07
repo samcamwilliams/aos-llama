@@ -10,7 +10,7 @@ EMXX_CFLAGS=-s MEMORY64=1 -O3 -msimd128 -fno-rtti -DNDEBUG \
 	-s EXPORTED_FUNCTIONS=_main -s EXPORTED_RUNTIME_METHODS=callMain -s \
 	NO_EXIT_RUNTIME=1 -Wno-unused-command-line-argument -Wno-experimental
 
-ARCH=$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+ARCH=$(shell uname -m | sed -e 's/x86_64//' -e 's/aarch64/arm64/')
 
 .PHONY: image
 image: node AOS.wasm
