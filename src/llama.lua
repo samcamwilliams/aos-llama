@@ -21,6 +21,14 @@ function Llama.next()
     return Llama.backend.next()
 end
 
+function Llama.add(str)
+    Llama.backend.add(str)
+end
+
+function Llama.stop()
+    Llama.backend.stop()
+end
+
 -- Callback handling functions
 
 Llama.logLevels = {

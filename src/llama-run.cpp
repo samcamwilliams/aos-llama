@@ -152,6 +152,30 @@ char* llama_run(int len) {
     return response;
 }
 
+extern "C" int llama_add(char* new_string);
+int llama_add(char* new_string) {
+    std::vector<llama_token> new_tokens_list = ::llama_tokenize(ctx, new_string, true);
+
+    if (isCtxFull()) {
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Context full, cannot add more tokens\n", NULL);
+        return 1;
+    }
+
+    // Add new tokens to the batch
+    for (size_t i = 0; i < new_tokens_list.size(); i++) {
+        llama_batch_add(batch, new_tokens_list[i], tks_processed + i, {0}, false);
+        tks_processed++;
+    }
+
+    batch.logits[batch.n_tokens - 1] = true;
+    if (llama_decode(ctx, batch) != 0) {
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "llama_decode() failed with new tokens\n", NULL);
+        return 1;
+    }
+
+    return 0;
+}
+
 extern "C" void llama_stop();
 void llama_stop() {
     llama_batch_free(batch);
