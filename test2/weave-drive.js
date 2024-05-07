@@ -1,4 +1,4 @@
-var XMLHttpRequest = require("xmlhttprequest").XMLHttpRequest;
+var XMLHttpRequest = require("node-xmlhttprequest").XMLHttpRequest;
 var assert = require('assert')
 
 module.exports = function weaveDrive(FS) {

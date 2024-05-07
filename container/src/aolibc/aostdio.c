@@ -31,7 +31,7 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
                 if (Module.admissableList.includes(id)) {
                   var node = Module
                     .WeaveDrive(FS)
-                    .createLazyFile('/', 'data/' + id, 'https://o4o4nlheb5lzgmdtk47oa5hmzkwszvjtn2amp6256ifcmtevilpq.arweave.net/' + id, true, false); 
+                    .createLazyFile('/', 'data/' + id, 'https://arweave.net/' + id, true, false); 
                    const file = FS.open('/data/' + id, "r");
                    return Promise.resolve(file.fd);
                 }
