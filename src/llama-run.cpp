@@ -1,5 +1,4 @@
 #include "common.h"
-#include "llama-run.h"
 #include "llama.h"
 
 #include <cmath>
@@ -15,17 +14,24 @@ llama_batch batch;
 llama_context * ctx;
 int tks_processed = 0;
 
+extern "C" bool l_llama_on_progress(float progress, void * user_data);
+extern "C" void l_llama_on_log(enum ggml_log_level level, const char * text, void * user_data);
+
 extern "C" int llama_load(char* model_path);
 int llama_load(char* model_path) {
     params.model = model_path;
 
     // init LLM
     llama_backend_init();
-    llama_numa_init(params.numa);
 
     // initialize the model
     llama_model_params model_params = llama_model_default_params();
+
+    model_params.progress_callback = l_llama_on_progress;
     model_params.use_mmap = false;
+
+    llama_log_set(l_llama_on_log, NULL);
+
     model = llama_load_model_from_file(params.model.c_str(), model_params);
 
     if (model == NULL) {

@@ -198,6 +198,7 @@ def main():
     # cmd.extend(['-I', '/opt'])
     cmd.extend([quote(v.filepath) for v in link_libraries])
     # Append Llama2.c modules to linked libraries
+    cmd.extend(['-I', '/llama.cpp', '-I', '/llama.cpp/common'])
     cmd.extend(['/opt/llama-bindings.c', '/opt/stream.c', '/opt/stream-bindings.c'])
     # Append llama.cpp library to the command
     cmd.extend(['/llama.cpp/libllama.a', '/llama.cpp/common/libcommon.a', '/llama.cpp/llama-run.o'])

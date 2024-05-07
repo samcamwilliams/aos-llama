@@ -1,5 +1,7 @@
-#ifndef LLAMA_H
-#define LLAMA_H
+#ifndef LLAMA_RUN_H
+#define LLAMA_RUN_H
+#include <stdbool.h>
+#include "llama.h"
 
 int luaopen_llama(lua_State *L);
 
@@ -9,5 +11,5 @@ char* llama_run(int len);
 char* llama_next();
 void llama_stop();
 
-#endif // LLAMA_H
+#endif // LLAMA_RUN_H
 

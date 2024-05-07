@@ -5,6 +5,9 @@
 #include <lualib.h>
 #include <lauxlib.h>
 #include "llama-run.h"
+#include "llama.h"
+
+extern lua_State *wasm_lua_state;
 
 static int l_llama_load(lua_State *L) {
   const char* model_path = luaL_checkstring(L, 1);
@@ -40,7 +43,7 @@ static int l_llama_next(lua_State *L) {
 // register function
 int luaopen_llama(lua_State *L) {
   static const luaL_Reg llama_funcs[] = {
-      {"load", l_llama_load},
+	  {"load", l_llama_load},
       {"set_prompt", l_llama_set_prompt},
       {"run", l_llama_run},
       {"next", l_llama_next},
@@ -49,4 +52,31 @@ int luaopen_llama(lua_State *L) {
 
   luaL_newlib(L, llama_funcs); // Create a new table and push the library function
   return 1;
+}
+
+// Handle callbacks in Lua
+void l_llama_on_log(enum ggml_log_level level, const char * str, void* userdata) {
+  lua_State *L = wasm_lua_state;
+
+  lua_getglobal(L, "Llama");
+  lua_getfield(L, -1, "onLog");
+  lua_remove(L, -2); // Remove the llama table from the stack
+
+  lua_pushinteger(L, level);
+  lua_pushstring(L, str);
+  lua_call(L, 2, 0);
+
+  fflush(stderr);
+}
+
+bool l_llama_on_progress(float progress, void * user_data) {
+  lua_State *L = wasm_lua_state;
+
+  lua_getglobal(L, "Llama");
+  lua_getfield(L, -1, "onProgress");
+  lua_remove(L, -2); // Remove the llama table from the stack
+
+  lua_pushnumber(L, progress);
+  lua_call(L, 1, 0);
+  return true;
 }
