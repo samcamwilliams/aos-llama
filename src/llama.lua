@@ -30,13 +30,20 @@ Llama.logLevels = {
     [5] = "debug",
 }
 
-Llama.logLevel = 3
+Llama.logLevel = 5
 Llama.logToStderr = true
+Llama.log = {}
 
 function Llama.onLog(level, str)
     if level <= Llama.logLevel then
-        io.stderr:write(Llama.logLevels[level] .. ": " .. str)
-        io.stderr:flush()
+        if Llama.logToStderr then
+            io.stderr:write(Llama.logLevels[level] .. ": " .. str)
+            io.stderr:flush()
+        end
+        if not Llama.log[Llama.logLevels[level]] then
+            Llama.log[Llama.logLevels[level]] = {}
+        end
+        table.insert(Llama.log[Llama.logLevels[level]], str)
     end
 end
 
