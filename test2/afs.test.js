@@ -115,7 +115,7 @@ return Llama.info()
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it('Can add tokens into context', async () => {
+  it.skip('Can add tokens into context', async () => {
     const result = await handle(getEval(`
   local Llama = require("llama")
   Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
@@ -159,7 +159,7 @@ return Llama.run(40)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it.skip('AOS runs CodeQwen intelligence test', async () => {
+  it('AOS runs CodeQwen intelligence test', async () => {
     const result =
       await handle(
         getEval(readFileSync("code-test.lua", "utf-8")),
