@@ -71,38 +71,94 @@ module.exports = function weaveDrive(FS) {
           return fn(...args);
         };
       });
-      function writeChunks(stream, buffer, offset, length, position) {
+      function writeChunks(stream, heap, mem_ptr, length, file_ptr) {
         //console.log('Result from Promise: ', deasyncPromise(fetch('https://example.com').then(res => res.text())))
-        console.log({ offset, length, position })
-        console.log('buffer size: ', buffer.length)
+        console.log({ offset: mem_ptr, read_len: length, position: file_ptr })
+        console.log('buffer size: ', heap.length)
         console.log('file size: ', stream.node.usedBytes)
-        if (position >= stream.node.usedBytes) return 0;
-        // get file1 and append to buffer
-        var s = FS.open(parent + name + '.1', "r");
-        buffer.set(s.node.contents, offset)
-        FS.close(s);
+        if (file_ptr >= stream.node.usedBytes) return 0;
 
-        // get file2 and append to buffer
-        var size1 = s.node.contents.length
-        s = FS.open(parent + name + '.2', "r");
-        buffer.set(s.node.contents, offset + size1)
-        FS.close(s);
+        // Start of target zone:
+        // HEAP8[offset] = FILE[position]
+        // HEAP8[offset + length] = FILE[position + length]
 
-        var size2 = s.node.contents.length
-        // get file3 and append to buffer
-        s = FS.open(parent + name + '.3', "r");
-        buffer.set(s.node.contents, offset + size1 + size2)
-        FS.close(s);
-        var size3 = s.node.contents.length
+        var curr_file_pos = 0
+        var bytes_read = 0
+        for (var chunk = 0; chunk < 8; chunk++) {
+          console.log("Handling chunk...", {
+            file_ptr: file_ptr,
+            mem_ptr: mem_ptr,
+            current_pos: curr_file_pos,
+            chunk_len: length
+          })
+          if (file_ptr >= curr_file_pos && file_ptr <= curr_file_pos + length) {
+            console.log("alive")
+            //var chunk_stream = FS.open(parent + name + '.' + chunk.toString(), "r")
+            var chunk = new Uint8Array(256 * 1024 * 1024)
+            console.log("alive2")
+            //var chunk_len = chunk_stream.node.contents.length
+            var chunk_len = chunk.length
+            var chunk_read_offset = file_ptr - curr_file_pos
+            var chunk_read_len = Math.min(length, chunk_len - chunk_read_offset)
+            var chunk =
+              //chunk_stream.node.contents.subarray(
+              chunk.subarray(
+                chunk_read_offset,
+                Math.min(chunk_read_len, length)
+              )
+            console.log("alive3")
+            //FS.close(chunk_stream)
 
-        // get file4 and append to buffer
-        s = FS.open(parent + name + '.4', "r");
-        buffer.set(s.node.contents, offset + size1 + size2 + size3)
-        FS.close(s);
-        var size4 = s.node.contents.length;
-        console.log('size: ', size1 + size2 + size3 + size4)
-        // return 0 bytes to signal no need to call read chunk again.
-        return size1 + size2 + size3 + size4;
+            console.log("Reading bytes as follows:")
+            console.log("Start of chunk offset in file", curr_file_pos)
+            console.log("Offset of chunk in file:", chunk_read_offset)
+            console.log("Write pointer:", mem_ptr)
+            console.log("File offset:", file_ptr)
+            console.log("Length:", chunk_read_len)
+
+            heap.set(chunk, mem_ptr)
+
+            console.log("Wrote data to RAM!")
+
+            mem_ptr += chunk_read_len
+            file_ptr += chunk_read_len
+            bytes_read += chunk_read_len
+            length -= chunk_read_len
+          }
+
+          curr_file_pos += chunk_len
+        }
+
+        console.log("Finished. Number of bytes read:", bytes_read)
+        return bytes_read
+        /*
+                // get file1 and append to buffer
+                var s = FS.open(parent + name + '.1', "r");
+                heap.set(s.node.contents, mem_ptr)
+                FS.close(s);
+        
+                // get file2 and append to buffer
+                var size1 = s.node.contents.length
+                s = FS.open(parent + name + '.2', "r");
+                heap.set(s.node.contents, mem_ptr + size1)
+                FS.close(s);
+        
+                var size2 = s.node.contents.length
+                // get file3 and append to buffer
+                s = FS.open(parent + name + '.3', "r");
+                heap.set(s.node.contents, mem_ptr + size1 + size2)
+                FS.close(s);
+                var size3 = s.node.contents.length
+        
+                // get file4 and append to buffer
+                s = FS.open(parent + name + '.4', "r");
+                heap.set(s.node.contents, mem_ptr + size1 + size2 + size3)
+                FS.close(s);
+                var size4 = s.node.contents.length;
+                console.log('size: ', size1 + size2 + size3 + size4)
+                // return 0 bytes to signal no need to call read chunk again.
+                return size1 + size2 + size3 + size4;
+        */
       }
       // use a custom read function
       stream_ops.read = (stream, buffer, offset, length, position) => {

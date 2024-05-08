@@ -13,6 +13,7 @@ LUALIB_API int luaopen_LuaBase64_c(Lua* L);
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <emscripten.h>
 
@@ -117,6 +118,12 @@ int main(void) {
   if (wasm_lua_state != NULL) {
     return 0;
   }
+
+  FILE* f = fopen("/data/XOJ8FBxa6sGLwChnxhF2L71WkKLSKq1aU5Yn5WnFLrY", "r");
+  char mem[16] = {1};
+  fprintf("Opened file...\n")
+
+
 
   wasm_lua_state = luaL_newstate();
 
