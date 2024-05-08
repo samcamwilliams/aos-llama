@@ -42,10 +42,12 @@ module.exports = function weaveDrive(FS) {
         //   //() => fetchRange(url, offset * 3 + 1, offset * 4).then(response => response.body.pipeTo(writer(filePath + '.4')))
         // ])
       }
-      return Promise.resolve("OK")
+      return Promise.resolve(bytesLength)
     },
-    createLazyFile(parent, name, url, canRead, canWrite) {
-      // Lazy chunked Uint8Array (implements get and length from Uint8Array).
+    createLinkFile(parent, name, bytes) {
+      // This file request needs to look for the file in the VFS
+      // if found then return it, if not 
+      // use read to get .1,.2,.3,.4 
       // Actual getting is abstracted away for eventual reuse.
       class LazyUint8Array {
         constructor() {
@@ -64,70 +66,23 @@ module.exports = function weaveDrive(FS) {
           this.getter = getter;
         }
         cacheLength() {
-          console.log("URL:", url);
-          // Find length
-          var headers = awaitSync(() => fetch(url, {
-            method: 'HEAD'
-          }).then(res => res.headers).catch(e => ({ e })))
-          console.log("Headers: ", headers);
-          // if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
-          var datalength = Number(headers.get('Content-Length'));
-
-          var header;
-          var hasByteServing = (header = headers.get("Accept-Ranges")) && header === "bytes";
-          var usesGzip = (header = headers.get("Content-Encoding")) && header === "gzip";
-
+          var datalength = Number(bytes);
           var chunkSize = 1024 * 1024; // Chunk size in bytes
-
-          if (!hasByteServing) chunkSize = datalength;
-
-          // Function to get a range from the remote URL.
-          var doXHR = (from, to) => {
-            if (from > to) throw new Error("invalid range (" + from + ", " + to + ") or no bytes requested!");
-            if (to > datalength - 1) throw new Error("only " + datalength + " bytes available! programmer error!");
-            return new Uint8Array(deasyncPromise(fetch(url, {
-              headers: {
-                Range: `bytes=${from}-${to}`
-              }
-            }).then(res => res.arrayBuffer())))
-
-            // var xhr = new XMLHttpRequest();
-            // xhr.open('GET', url, false);
-            // if (datalength !== chunkSize) xhr.setRequestHeader("Range", "bytes=" + from + "-" + to);
-
-            // // Some hints to the browser that we want binary data.
-            // xhr.responseType = 'arraybuffer';
-            // if (xhr.overrideMimeType) {
-            //   xhr.overrideMimeType('text/plain; charset=x-user-defined');
-            // }
-
-            // xhr.send(null);
-
-            // if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
-            // if (xhr.response !== undefined) {
-            //   return new Uint8Array(/** @type{Array<number>} */(xhr.response || []));
-            // }
-            // return intArrayFromString(xhr.responseText || '', true);
-          };
           var lazyArray = this;
           lazyArray.setDataGetter((chunkNum) => {
             var start = chunkNum * chunkSize;
             var end = (chunkNum + 1) * chunkSize - 1; // including this byte
             end = Math.min(end, datalength - 1); // if datalength-1 is selected, this is the last block
-            if (typeof lazyArray.chunks[chunkNum] == 'undefined') {
-              lazyArray.chunks[chunkNum] = doXHR(start, end);
-            }
-            if (typeof lazyArray.chunks[chunkNum] == 'undefined') throw new Error('doXHR failed!');
-            return lazyArray.chunks[chunkNum];
-          });
 
-          if (usesGzip || !datalength) {
-            // if the server uses gzip or doesn't supply the length, we have to download the whole file to get the (uncompressed) length
-            chunkSize = datalength = 1; // this will force getter(0)/doXHR do download the whole file
-            datalength = this.getter(0).length;
-            chunkSize = datalength;
-            out("LazyFiles on gzip forces download of the whole file when length is accessed");
-          }
+            // 
+            console.log({ chunkNum, start, end });
+            var stream = FS.open(parent + name + '.1', "r");
+            var buf = new Uint8Array(chunkSize);
+            FS.read(stream, buf, start, end, 0);
+            FS.close(stream);
+            console.log(buf);
+            return buf;
+          });
 
           this._length = datalength;
           this._chunkSize = chunkSize;
@@ -146,22 +101,22 @@ module.exports = function weaveDrive(FS) {
           return this._chunkSize;
         }
       }
-
-      console.log('CREATE FILE: ', url);
       var lazyArray = new LazyUint8Array();
       //console.log('lazyArray: ', lazyArray.cacheLength());
       var properties = { isDevice: false, contents: lazyArray };
-      console.log('Properties: ', properties);
-      var node = FS.createFile(parent, name, properties, canRead, canWrite);
-      // This is a total hack, but I want to get this lazy file code out of the
-      // core of MEMFS. If we want to keep this lazy file concept I feel it should
-      // be its own thin LAZYFS proxying calls to MEMFS.
-      if (properties.contents) {
-        node.contents = properties.contents;
-      } else if (properties.url) {
-        node.contents = null;
-        node.url = properties.url;
+
+      try {
+        FS.stat(parent + name);
+        return
+      } catch (e) {
+        console.log('File does not exist!')
       }
+
+      var node = FS.createFile(parent, name, properties, true, false);
+
+      node.contents = lazyArray;
+      node.link = true;
+
       // Add a function that defers querying the file size until it is asked the first time.
       Object.defineProperties(node, {
         usedBytes: {
@@ -179,26 +134,31 @@ module.exports = function weaveDrive(FS) {
         };
       });
       function writeChunks(stream, buffer, offset, length, position) {
-        console.log('WRITE_CHUNKS: ', { offset, length, position })
+        console.log({ offset, length, position })
         var contents = stream.node.contents;
-        if (position >= contents.length)
-          return 0;
         var size = Math.min(contents.length - position, length);
         assert(size >= 0);
-        if (contents.slice) { // normal array
-          for (var i = 0; i < size; i++) {
-            buffer[offset + i] = contents[position + i];
-          }
-        } else {
-          for (var i = 0; i < size; i++) { // LazyUint8Array from sync binary XHR
-            buffer[offset + i] = contents.get(position + i);
-          }
-        }
-        return size;
+
+        var s = FS.open(parent + name + '.1', "r");
+        buffer.set(s.node.contents.subarray(0, s.node.contents.length))
+        FS.close(s);
+
+        s = FS.open(parent + name + '.2', "r");
+        buffer.set(s.node.contents.subarray(buffer.length, buffer.length + s.node.contents.length))
+        FS.close(s);
+
+        s = FS.open(parent + name + '.3', "r");
+        buffer.set(s.node.contents.subarray(buffer.length, buffer.length + s.node.contents.length))
+        FS.close(s);
+
+        s = FS.open(parent + name + '.4', "r");
+        buffer.set(s.node.contents.subarray(buffer.length, buffer.length + s.node.contents.length))
+        FS.close(s);
+
+        return 0;
       }
       // use a custom read function
       stream_ops.read = (stream, buffer, offset, length, position) => {
-        console.log('LAZY_READ!');
         FS.forceLoadFile(node);
         return writeChunks(stream, buffer, offset, length, position)
       };

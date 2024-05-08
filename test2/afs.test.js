@@ -131,7 +131,7 @@ return llama.run(40)
   })
 
 
-  it('AOS runs Llama3 8B Instruct q3', async () => {
+  it.skip('AOS runs Llama3 8B Instruct q3', async () => {
     const result =
       await handle(
         getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
@@ -143,7 +143,7 @@ return llama.run(40)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it.skip('AOS runs Llama3 8B Instruct q4', async () => {
+  it('AOS runs Llama3 8B Instruct q4', async () => {
     const result =
       await handle(
         getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',

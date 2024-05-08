@@ -30,10 +30,8 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
             else {
                 if (Module.admissableList.includes(id)) {
                   const drive = Module.WeaveDrive(FS);
-                  console.log('start downloading files...');
-                  const result = await drive.downloadFiles('https://arweave.net/' + id, '/data/' + id);
-                  console.log('result: ', result); 
-                   console.log('File Downloaded.');
+                  const bytes = await drive.downloadFiles('https://arweave.net/' + id, '/data/' + id);
+                  const linkFile = await drive.createLinkFile('/','data/' + id, bytes);
                    // createLazyFile if split. 
                    const file = FS.open('/data/' + id, "r");
                    return Promise.resolve(file.fd);
