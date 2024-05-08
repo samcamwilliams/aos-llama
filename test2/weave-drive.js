@@ -1,4 +1,4 @@
-//var XMLHttpRequest = require("node-xmlhttprequest").XMLHttpRequest;
+var deasyncPromise = require('deasync-promise')
 var assert = require('assert')
 const MB = (1024 * 1024)
 const GB = 1000 * MB
@@ -67,12 +67,15 @@ module.exports = function weaveDrive(FS) {
       keys.forEach((key) => {
         var fn = node.stream_ops[key];
         stream_ops[key] = (...args) => {
-          FS.forceLoadFile(node);
+          //FS.forceLoadFile(node);
           return fn(...args);
         };
       });
       function writeChunks(stream, buffer, offset, length, position) {
+        //console.log('Result from Promise: ', deasyncPromise(fetch('https://example.com').then(res => res.text())))
         console.log({ offset, length, position })
+        console.log('buffer size: ', buffer.length)
+        console.log('file size: ', stream.node.usedBytes)
         if (position >= stream.node.usedBytes) return 0;
         // get file1 and append to buffer
         var s = FS.open(parent + name + '.1', "r");
@@ -103,13 +106,13 @@ module.exports = function weaveDrive(FS) {
       }
       // use a custom read function
       stream_ops.read = (stream, buffer, offset, length, position) => {
-        FS.forceLoadFile(node);
+        // FS.forceLoadFile(node);
         return writeChunks(stream, buffer, offset, length, position)
       };
       // use a custom mmap function
       stream_ops.mmap = (stream, length, position, prot, flags) => {
         console.log('LAZY_MMAP!');
-        FS.forceLoadFile(node);
+        // FS.forceLoadFile(node);
         var ptr = mmapAlloc(length);
         if (!ptr) {
           throw new FS.ErrnoError(48);

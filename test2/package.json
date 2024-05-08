@@ -4,7 +4,8 @@
   "main": "index.js",
   "license": "MIT",
   "dependencies": {
-    "deasync": "^0.1.29"
+    "deasync": "^0.1.29",
+    "deasync-promise": "^1.0.1"
   },
   "engines": {
     "node": "22"
