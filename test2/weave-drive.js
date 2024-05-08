@@ -23,8 +23,10 @@ module.exports = function weaveDrive(FS) {
     async downloadFiles(url, filePath) {
       var bytesLength = await fetch(url, { method: 'HEAD' }).then(res => res.headers.get('Content-Length'))
       console.log('bytes: ', bytesLength)
-      var offset = bytesLength > (4 * GB) ? Math.floor(bytesLength / 4) : bytesLength
+      // var offset = bytesLength > (4 * GB) ? Math.floor(bytesLength / 4) : bytesLength
+      var offset = Math.floor(bytesLength / 4)
       console.log('offset: ', offset)
+
       if (offset === bytesLength) {
         const response = await fetch(url);
         await response.body.pipeTo(writer(filePath));
@@ -35,92 +37,28 @@ module.exports = function weaveDrive(FS) {
         await fetchRange(url, offset * 2 + 1, offset * 3).then(response => response.body.pipeTo(writer(filePath + '.3')));
         await fetchRange(url, offset * 3 + 1, bytesLength - 1).then(response => response.body.pipeTo(writer(filePath + '.4')));
 
-        // await Promise.all([
-        //   () => fetchRange(url, 0, offset).then(response => response.body.pipeTo(writer(filePath + '.1'))),
-        //   //() => fetchRange(url, offset, offset * 2).then(response => response.body.pipeTo(writer(filePath + '.2'))),
-        //   //() => fetchRange(url, offset * 2 + 1, offset * 3).then(response => response.body.pipeTo(writer(filePath + '.3'))),
-        //   //() => fetchRange(url, offset * 3 + 1, offset * 4).then(response => response.body.pipeTo(writer(filePath + '.4')))
-        // ])
       }
       return Promise.resolve(bytesLength)
     },
     createLinkFile(parent, name, bytes) {
-      // This file request needs to look for the file in the VFS
-      // if found then return it, if not 
-      // use read to get .1,.2,.3,.4 
-      // Actual getting is abstracted away for eventual reuse.
-      class LazyUint8Array {
-        constructor() {
-          this.lengthKnown = false;
-          this.chunks = []; // Loaded chunks. Index is the chunk number
-        }
-        get(idx) {
-          if (idx > this.length - 1 || idx < 0) {
-            return undefined;
-          }
-          var chunkOffset = idx % this.chunkSize;
-          var chunkNum = (idx / this.chunkSize) | 0;
-          return this.getter(chunkNum)[chunkOffset];
-        }
-        setDataGetter(getter) {
-          this.getter = getter;
-        }
-        cacheLength() {
-          var datalength = Number(bytes);
-          var chunkSize = 1024 * 1024; // Chunk size in bytes
-          var lazyArray = this;
-          lazyArray.setDataGetter((chunkNum) => {
-            var start = chunkNum * chunkSize;
-            var end = (chunkNum + 1) * chunkSize - 1; // including this byte
-            end = Math.min(end, datalength - 1); // if datalength-1 is selected, this is the last block
 
-            // 
-            console.log({ chunkNum, start, end });
-            var stream = FS.open(parent + name + '.1', "r");
-            var buf = new Uint8Array(chunkSize);
-            FS.read(stream, buf, start, end, 0);
-            FS.close(stream);
-            console.log(buf);
-            return buf;
-          });
-
-          this._length = datalength;
-          this._chunkSize = chunkSize;
-          this.lengthKnown = true;
-        }
-        get length() {
-          if (!this.lengthKnown) {
-            this.cacheLength();
-          }
-          return this._length;
-        }
-        get chunkSize() {
-          if (!this.lengthKnown) {
-            this.cacheLength();
-          }
-          return this._chunkSize;
-        }
-      }
-      var lazyArray = new LazyUint8Array();
       //console.log('lazyArray: ', lazyArray.cacheLength());
-      var properties = { isDevice: false, contents: lazyArray };
+      var properties = { isDevice: false, contents: null };
 
       try {
         FS.stat(parent + name);
         return
       } catch (e) {
-        console.log('File does not exist!')
+        console.log('Creating LinkFile')
       }
 
       var node = FS.createFile(parent, name, properties, true, false);
-
-      node.contents = lazyArray;
       node.link = true;
 
       // Add a function that defers querying the file size until it is asked the first time.
       Object.defineProperties(node, {
         usedBytes: {
-          get: function () { return this.contents.length; }
+          get: function () { return bytes; }
         }
       });
       // override each stream op with one that tries to force load the lazy file first
@@ -135,27 +73,33 @@ module.exports = function weaveDrive(FS) {
       });
       function writeChunks(stream, buffer, offset, length, position) {
         console.log({ offset, length, position })
-        var contents = stream.node.contents;
-        var size = Math.min(contents.length - position, length);
-        assert(size >= 0);
-
+        if (position >= stream.node.usedBytes) return 0;
+        // get file1 and append to buffer
         var s = FS.open(parent + name + '.1', "r");
-        buffer.set(s.node.contents.subarray(0, s.node.contents.length))
+        buffer.set(s.node.contents, offset)
         FS.close(s);
 
+        // get file2 and append to buffer
+        var size1 = s.node.contents.length
         s = FS.open(parent + name + '.2', "r");
-        buffer.set(s.node.contents.subarray(buffer.length, buffer.length + s.node.contents.length))
+        buffer.set(s.node.contents, offset + size1)
         FS.close(s);
 
+        var size2 = s.node.contents.length
+        // get file3 and append to buffer
         s = FS.open(parent + name + '.3', "r");
-        buffer.set(s.node.contents.subarray(buffer.length, buffer.length + s.node.contents.length))
+        buffer.set(s.node.contents, offset + size1 + size2)
         FS.close(s);
+        var size3 = s.node.contents.length
 
+        // get file4 and append to buffer
         s = FS.open(parent + name + '.4', "r");
-        buffer.set(s.node.contents.subarray(buffer.length, buffer.length + s.node.contents.length))
+        buffer.set(s.node.contents, offset + size1 + size2 + size3)
         FS.close(s);
-
-        return 0;
+        var size4 = s.node.contents.length;
+        console.log('size: ', size1 + size2 + size3 + size4)
+        // return 0 bytes to signal no need to call read chunk again.
+        return size1 + size2 + size3 + size4;
       }
       // use a custom read function
       stream_ops.read = (stream, buffer, offset, length, position) => {
