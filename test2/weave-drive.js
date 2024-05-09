@@ -5,7 +5,6 @@ const GB = 1000 * MB
 const CHUNK_SZ = 100 * MB
 
 module.exports = function weaveDrive(mod, FS) {
-  var bytes = 0;
   const createWriter = (v, ptr) => {
     return {
       write(chunk) {
