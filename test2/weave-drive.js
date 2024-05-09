@@ -1,4 +1,3 @@
-var deasyncPromise = require('deasync-promise')
 var assert = require('assert')
 const MB = (1024 * 1024)
 const GB = 1000 * MB
