@@ -18,10 +18,14 @@ image: node AOS.wasm
 .PHONY: build-test
 build-test: build test
 
-.PHONY: test2
-test2: 
+.PHONY: install-llm
+install-llm:
+	mkdir -p test2
 	cp build/aos/process/AOS.wasm test2/AOS.wasm
 	cp build/aos/process/AOS.js test2/AOS.js
+
+.PHONY: test-llm
+test-llm:
 	cd test2 && yarn test
 
 .PHONY: test
