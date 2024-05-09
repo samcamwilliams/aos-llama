@@ -153,6 +153,17 @@ return llama.run(40)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
+  it('AOS runs Phi-3 Mini 4k Instruct', async () => {
+    const result = await handle(getEval(`
+local Llama = require("llama")
+Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
+Llama.setPrompt([[<|user|>Tell me a story.<|end|><|assistant|>]])
+return Llama.run(80) 
+  `), getEnv())
+    console.log(result.response)
+    assert.ok(result.response.Output.data.output.length > 10)
+  })
+
   it.skip('AOS runs Llama3 8B Instruct q4', async () => {
     const result =
       await handle(
@@ -165,7 +176,7 @@ return llama.run(40)
     assert.ok(result.response.Output.data.output.length >= 100)
   })
 
-  it('AOS runs Llama3 8B Instruct q8', async () => {
+  it('AOS runs CodeQwen intelligence test', async () => {
     const result =
       await handle(
         getLua('jbx-H6aq7b3BbNCHlK50Jz9L-6pz9qmldrYXMwjqQVI',
