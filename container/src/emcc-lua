@@ -173,7 +173,7 @@ def main():
         '-s', 'STACK_SIZE=41943040',
         '-s', 'ALLOW_MEMORY_GROWTH=1',
         '-s', 'INITIAL_MEMORY=8589934592',
-        '-s', 'MAXIMUM_MEMORY=34359738368',
+        '-s', 'MAXIMUM_MEMORY=17179869184',
         '-s', 'ASYNCIFY_STACK_SIZE=41943040',
         '-s', 'WASM=1',
         '-s', 'MODULARIZE',

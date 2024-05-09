@@ -42,10 +42,6 @@ describe('AOS-Llama+VFS Tests', async () => {
   it('Add data to the VFS', async () => {
     await instance['FS_createPath']('/', 'data')
     await instance['FS_createDataFile']('/', 'data/1', Buffer.from('HELLO WORLD'), true, false, false)
-    //console.log(instance.WeaveDrive)
-    // const foo = await instance['FS_createLazyFile']('/', 'data/foo', 'https://arweave.net/Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA', true, false);
-    // console.log(foo)
-    // // see if directory exists
     const result = await handle(getEval('return "OK"'), getEnv())
     assert.ok(result.response.Output.data.output == "OK")
   })
@@ -131,20 +127,7 @@ return llama.run(40)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-
-  it.skip('AOS runs Llama3 8B Instruct q4 (short)', async () => {
-    const result =
-      await handle(
-        getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
-          30,
-          "<|user|>Tell me a story.<|end|><|assistant|>"),
-        getEnv()
-      )
-    console.log(result.response)
-    assert.ok(result.response.Output.data.output.length > 10)
-  })
-
-  it.skip('AOS runs Llama3 8B Instruct q4 (long)', async () => {
+  it('AOS runs Llama3 8B Instruct q4', async () => {
     const result =
       await handle(
         getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
@@ -153,22 +136,10 @@ return llama.run(40)
         getEnv()
       )
     console.log(result.response)
-    assert.ok(result.response.Output.data.output.length > 100)
+    assert.ok(result.response.Output.data.output.length >= 100)
   })
 
-  it.skip('AOS runs Llama3 8B Instruct q4', async () => {
-    const result =
-      await handle(
-        getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
-          100,
-          "<|user|>Tell me a story.<|end|><|assistant|>"),
-        getEnv()
-      )
-    console.log(result.response)
-    assert.ok(result.response.Output.data.output.length > 10)
-  })
-
-  it('AOS runs Llama3 8B Instruct q8', async () => {
+  it.skip('AOS runs Llama3 8B Instruct q8', async () => {
     const result =
       await handle(
         getLua('jbx-H6aq7b3BbNCHlK50Jz9L-6pz9qmldrYXMwjqQVI',

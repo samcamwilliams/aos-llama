@@ -29,15 +29,10 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
             }
             else {
                 if (Module.admissableList.includes(id)) {
-                  Module.files = Module.files ? Module.files : {};
                   const drive = Module.WeaveDrive(Module, FS);
-                  console.log("Calling downloadFiles");
-                  const bytes = await drive.downloadFiles('https://arweave.net/' + id, '/data/' + id);
-                  console.log("Calling createLinkFile");
-                  const linkFile = await drive.createLinkFile('/','data/' + id, bytes);
-                   // createLazyFile if split. 
-                   const file = FS.open('/data/' + id, "r");
-                   return Promise.resolve(file.fd);
+                  const linkFile = await drive.createLinkFile(id);
+                  const file = FS.open('/data/' + id, "r");
+                  return Promise.resolve(file.fd);
                 }
                 else {
                     console.log("JS: Arweave ID is not admissable! ", id);
