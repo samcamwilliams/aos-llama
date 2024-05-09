@@ -35,15 +35,14 @@ module.exports = function weaveDrive(mod, FS) {
       const response = await fetch(url);
       // console.log("Starting to pipe...")
       await response.body.pipeTo(writer(ptr))
-      return Promise.resolve({ srcPtr: ptr, bytes: bytesLength })
+      return Promise.resolve({ ptr, bytes: bytesLength })
     },
     async createLinkFile(id) {
-      var { srcPtr, bytes } = await this.downloadFiles(`https://arweave.net/${id}`)
+      var { ptr, bytes } = await this.downloadFiles(`${mod.ARWEAVE}/${id}`)
       var properties = { isDevice: false, contents: null };
       // TODO: might make sense to create the `data` folder here if does not exist
       var node = FS.createFile('/', 'data/' + id, properties, true, false);
-      //node.link = true;
-
+      node.ptr = ptr;
       // Add a function that defers querying the file size until it is asked the first time.
       Object.defineProperties(node, {
         usedBytes: {
@@ -51,6 +50,7 @@ module.exports = function weaveDrive(mod, FS) {
         }
       });
       function readData(stream, heap, dst_ptr, length, file_ptr) {
+        var srcPtr = stream.node.ptr;
         var chunkBytes = heap.subarray(srcPtr + file_ptr, srcPtr + length + file_ptr)
         heap.set(chunkBytes, dst_ptr)
         return chunkBytes.length
