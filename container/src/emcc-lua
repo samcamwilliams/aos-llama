@@ -201,6 +201,7 @@ def main():
     cmd.extend(['/opt/llama-bindings.c', '/opt/stream.c', '/opt/stream-bindings.c'])
     # Append llama.cpp library to the command
     cmd.extend(['/llama.cpp/libllama.a', '/llama.cpp/common/libcommon.a', '/llama.cpp/llama-run.o'])
+    cmd.extend(['-s', 'EXPORTED_FUNCTIONS=["_malloc"]'])
     cmd.extend(['-lm', '-ldl', '-o', definition.get_output_file(), '-s', 'EXPORTED_RUNTIME_METHODS=["cwrap"]'])
 
     print('Compile command is {}'.format(' '.join(cmd)))

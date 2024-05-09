@@ -119,11 +119,7 @@ int main(void) {
     return 0;
   }
 
-  FILE* f = fopen("/data/XOJ8FBxa6sGLwChnxhF2L71WkKLSKq1aU5Yn5WnFLrY", "r");
-  char mem[16] = {1};
-  fprintf("Opened file...\n")
-
-
+  return 0;
 
   wasm_lua_state = luaL_newstate();
 

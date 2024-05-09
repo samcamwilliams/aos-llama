@@ -2,14 +2,15 @@ var deasyncPromise = require('deasync-promise')
 var assert = require('assert')
 const MB = (1024 * 1024)
 const GB = 1000 * MB
+const CHUNK_SZ = 100 * MB
 
-module.exports = function weaveDrive(FS) {
+module.exports = function weaveDrive(mod, FS) {
   var bytes = 0;
-  const writer = (filePath) => new WritableStream({
+  const writer = (ptr) => new WritableStream({
     write(chunk) {
-      bytes += chunk.length;
-      FS.writeFile(filePath, new Uint8Array(chunk), { flags: 'a' });
-      console.log("File:" + filePath + " JS: Bytes written: ", bytes);
+      mod.HEAP8.set(new Uint8Array(chunk), ptr)
+      ptr += chunk.length;
+      console.log("Chunk recv Bytes written: ", chunk.length, "New ptr:", ptr / (1024 * 1024));
     }
   }, new CountQueuingStrategy({ highWaterMark: 10000 }));
   const fetchRange = (url, from, to) => fetch(url, {
@@ -21,24 +22,47 @@ module.exports = function weaveDrive(FS) {
 
   return {
     async downloadFiles(url, filePath) {
+      mod.files = mod.files ? mod.files : []
       var bytesLength = await fetch(url, { method: 'HEAD' }).then(res => res.headers.get('Content-Length'))
-      console.log('bytes: ', bytesLength)
       // var offset = bytesLength > (4 * GB) ? Math.floor(bytesLength / 4) : bytesLength
-      var offset = Math.floor(bytesLength / 4)
-      console.log('offset: ', offset)
+      // var offset = Math.floor(bytesLength / 4)
 
-      if (offset === bytesLength) {
-        const response = await fetch(url);
-        await response.body.pipeTo(writer(filePath));
-      } else {
-        console.log('GET FILEs: please!');
-        await fetchRange(url, 0, offset).then(response => response.body.pipeTo(writer(filePath + '.1')));
-        await fetchRange(url, offset, offset * 2).then(response => response.body.pipeTo(writer(filePath + '.2')));
-        await fetchRange(url, offset * 2 + 1, offset * 3).then(response => response.body.pipeTo(writer(filePath + '.3')));
-        await fetchRange(url, offset * 3 + 1, bytesLength - 1).then(response => response.body.pipeTo(writer(filePath + '.4')));
-
-      }
+      console.log("Allocating bytes for file", bytesLength)
+      var ptr = mod._malloc(bytesLength)
+      console.log("Got ptr for file at:", ptr)
+      mod.files[filePath] = ptr
+      const response = await fetch(url);
+      console.log("Starting to pipe...")
+      await response.body.pipeTo(writer(ptr))
       return Promise.resolve(bytesLength)
+      /*
+            if (offset === bytesLength) {
+              
+      
+            } else {
+              console.log('GET FILEs: please!');
+      
+              var offset = 0
+              var chunk = 0
+              var length = bytesLength
+              while (length > 0) {
+                console.log("Getting chunk ", chunk)
+                console.log("Offset: ", offset)
+                var chunkLength = Math.min(CHUNK_SZ, length)
+                var arraybuf = await fetchRange(url, offset, chunkLength).then(response => response.arrayBuffer())
+                var array = new Uint8Array(arraybuf)
+                console.log("Getting pointer...")
+                var ptr = mod._malloc(chunkLength)
+                console.log("Got pointer:", ptr)
+                mod.HEAP8.set(array, ptr)
+                mod.files[filePath].push(ptr)
+                offset += chunkLength
+                length -= chunkLength
+                chunk++
+              }
+            }
+            console.log("Binaries for file: ", mod.files[filePath].length)
+            */
     },
     createLinkFile(parent, name, bytes) {
 
@@ -71,67 +95,70 @@ module.exports = function weaveDrive(FS) {
           return fn(...args);
         };
       });
-      function writeChunks(stream, heap, mem_ptr, length, file_ptr) {
+      function readData(stream, heap, dst_ptr, length, file_ptr) {
         //console.log('Result from Promise: ', deasyncPromise(fetch('https://example.com').then(res => res.text())))
-        console.log({ offset: mem_ptr, read_len: length, position: file_ptr })
-        console.log('buffer size: ', heap.length)
-        console.log('file size: ', stream.node.usedBytes)
-        if (file_ptr >= stream.node.usedBytes) return 0;
+        //console.log("Reading from file", parent + name)
+        //console.log({ src_ptr: mod.files[parent + name], dst_ptr: dst_ptr, read_len: length, position: file_ptr })
+        //console.log('buffer size: ', mod.HEAP8.length)
+        // console.log('file size: ', stream.node.usedBytes)
+        // if (file_ptr >= stream.node.usedBytes) return 0;
 
         // Start of target zone:
         // HEAP8[offset] = FILE[position]
         // HEAP8[offset + length] = FILE[position + length]
 
-        var curr_file_pos = 0
-        var bytes_read = 0
-        for (var chunk = 0; chunk < 8; chunk++) {
-          console.log("Handling chunk...", {
-            file_ptr: file_ptr,
-            mem_ptr: mem_ptr,
-            current_pos: curr_file_pos,
-            chunk_len: length
-          })
-          if (file_ptr >= curr_file_pos && file_ptr <= curr_file_pos + length) {
-            console.log("alive")
-            //var chunk_stream = FS.open(parent + name + '.' + chunk.toString(), "r")
-            var chunk = new Uint8Array(256 * 1024 * 1024)
-            console.log("alive2")
-            //var chunk_len = chunk_stream.node.contents.length
-            var chunk_len = chunk.length
-            var chunk_read_offset = file_ptr - curr_file_pos
-            var chunk_read_len = Math.min(length, chunk_len - chunk_read_offset)
-            var chunk =
-              //chunk_stream.node.contents.subarray(
-              chunk.subarray(
-                chunk_read_offset,
-                Math.min(chunk_read_len, length)
-              )
-            console.log("alive3")
-            //FS.close(chunk_stream)
+        var bytes = mod.HEAP8.subarray(mod.files[parent + name] + file_ptr, mod.files[parent + name] + length + file_ptr)
+        //console.log("Got bytes:", bytes)
+        mod.HEAP8.set(bytes, dst_ptr)
 
-            console.log("Reading bytes as follows:")
-            console.log("Start of chunk offset in file", curr_file_pos)
-            console.log("Offset of chunk in file:", chunk_read_offset)
-            console.log("Write pointer:", mem_ptr)
-            console.log("File offset:", file_ptr)
-            console.log("Length:", chunk_read_len)
-
-            heap.set(chunk, mem_ptr)
-
-            console.log("Wrote data to RAM!")
-
-            mem_ptr += chunk_read_len
-            file_ptr += chunk_read_len
-            bytes_read += chunk_read_len
-            length -= chunk_read_len
-          }
-
-          curr_file_pos += chunk_len
-        }
-
-        console.log("Finished. Number of bytes read:", bytes_read)
-        return bytes_read
+        //console.log("Finished. Number of bytes read:", bytes.length)
+        return bytes.length
         /*
+                var curr_file_pos = 0
+                var bytes_read = 0
+                for (var chunk_num = 0; chunk_num < mod.files[parent + name].length; chunk_num++) {
+                  console.log("Handling chunk...", {
+                    file_ptr: file_ptr,
+                    mem_ptr: mem_ptr,
+                    current_pos: curr_file_pos,
+                    chunk_len: length
+                  })
+                  if (file_ptr >= curr_file_pos && file_ptr <= curr_file_pos + length) {
+                    console.log("alive")
+                    //var chunk_stream = FS.open(parent + name + '.' + chunk.toString(), "r")
+                    var chunk_ptr = mod.files[parent + name][chunk_num]
+                    console.log("alive2")
+                    var chunk_len = CHUNK_SZ
+                    var chunk_read_offset = file_ptr - curr_file_pos
+                    var chunk_read_len = Math.min(length, chunk_len - chunk_read_offset)
+                    var chunk =
+                      //chunk_stream.node.contents.subarray(
+                      heap.subarray(
+                        chunk_read_offset,
+                        Math.min(chunk_read_len, length)
+                      )
+                    console.log("alive3")
+                    //FS.close(chunk_stream)
+        
+                    console.log("Reading bytes as follows:")
+                    console.log("Start of chunk offset in file", curr_file_pos)
+                    console.log("Offset of chunk in file:", chunk_read_offset)
+                    console.log("Write pointer:", mem_ptr)
+                    console.log("File offset:", file_ptr)
+                    console.log("Length:", chunk_read_len)
+        
+                    heap.set(chunk, mem_ptr)
+        
+                    console.log("Wrote data to RAM!")
+        
+                    mem_ptr += chunk_read_len
+                    file_ptr += chunk_read_len
+                    bytes_read += chunk_read_len
+                    length -= chunk_read_len
+                  }
+        
+                  curr_file_pos += chunk_len
+                }
                 // get file1 and append to buffer
                 var s = FS.open(parent + name + '.1', "r");
                 heap.set(s.node.contents, mem_ptr)
@@ -163,7 +190,7 @@ module.exports = function weaveDrive(FS) {
       // use a custom read function
       stream_ops.read = (stream, buffer, offset, length, position) => {
         // FS.forceLoadFile(node);
-        return writeChunks(stream, buffer, offset, length, position)
+        return readData(stream, buffer, offset, length, position)
       };
       // use a custom mmap function
       stream_ops.mmap = (stream, length, position, prot, flags) => {
@@ -173,7 +200,7 @@ module.exports = function weaveDrive(FS) {
         if (!ptr) {
           throw new FS.ErrnoError(48);
         }
-        writeChunks(stream, HEAP8, ptr, length, position);
+        readData(stream, HEAP8, ptr, length, position);
         return { ptr, allocated: true };
       };
       node.stream_ops = stream_ops;

@@ -86,7 +86,7 @@ return llama.info()
     assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
   })
 
-  it('AOS runs GPT-2 117m model', async () => {
+  it.skip('AOS runs GPT-2 117m model', async () => {
     const result = await handle(getEval(`
   local llama = require("llama")
   io.stderr:write([[Loading model...\n]])
@@ -131,7 +131,7 @@ return llama.run(40)
   })
 
 
-  it.skip('AOS runs Llama3 8B Instruct q3', async () => {
+  it('AOS runs Llama3 8B Instruct q3', async () => {
     const result =
       await handle(
         getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
