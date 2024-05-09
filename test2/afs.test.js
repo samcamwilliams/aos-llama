@@ -1,7 +1,8 @@
 const { describe, it } = require('node:test')
 const assert = require('assert')
 const weaveDrive = require('./weave-drive.js')
-
+const fs = require('fs')
+const wasm = fs.readFileSync('./AOS.wasm')
 // VFS-1
 // STEP 1 send a file id
 const m = require(__dirname + '/AOS.js')
@@ -19,14 +20,37 @@ const AdmissableList =
 describe('AOS-Llama+VFS Tests', async () => {
   var instance;
   const handle = async function (msg, env) {
+    console.log('handle start')
     const res = await instance.cwrap('handle', 'string', ['string', 'string'], { async: true })(JSON.stringify(msg), JSON.stringify(env))
-
+    console.log('handle stop')
     return JSON.parse(res)
   }
 
   it('Create instance', async () => {
     console.log("Creating instance...")
-    instance = await m({ admissableList: AdmissableList, WeaveDrive: weaveDrive, ARWEAVE: 'https://arweave.net' })
+    var instantiateWasm = function (imports, cb) {
+
+      // merge imports argument
+      const customImports = {
+        env: {
+          memory: new WebAssembly.Memory({ initial: 8589934592 / 65536, maximum: 17179869184 / 65536, index: 'i64' })
+        }
+      }
+      //imports.env = Object.assign({}, imports.env, customImports.env)
+
+      WebAssembly.instantiate(wasm, imports).then(result =>
+
+        cb(result.instance)
+      )
+      return {}
+    }
+
+    instance = await m({
+      admissableList: AdmissableList,
+      WeaveDrive: weaveDrive,
+      ARWEAVE: 'https://arweave.net',
+      instantiateWasm
+    })
     await new Promise((r) => setTimeout(r, 1000));
     console.log("Instance created.")
     await new Promise((r) => setTimeout(r, 250));
@@ -35,7 +59,9 @@ describe('AOS-Llama+VFS Tests', async () => {
   })
 
   it('Eval Lua', async () => {
+    console.log("Running eval")
     const result = await handle(getEval('1 + 1'), getEnv())
+    console.log("Eval complete")
     assert.equal(result.response.Output.data.output, 2)
   })
 
