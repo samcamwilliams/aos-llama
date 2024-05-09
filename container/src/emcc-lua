@@ -165,15 +165,15 @@ def main():
 
     # Finally, compile to wasm
     debug_print('Start to compile as WASM')
-    cmd = ['emcc', '-O0']
+    cmd = ['emcc', '-O3']
     cmd.extend([
         '-g2',
         '-s', 'ASYNCIFY=1',
         '-s', 'MEMORY64=1',
-        '-s', 'STACK_SIZE=419430400',
+        '-s', 'STACK_SIZE=41943040',
         '-s', 'ALLOW_MEMORY_GROWTH=1',
         '-s', 'INITIAL_MEMORY=8589934592',
-        '-s', 'MAXIMUM_MEMORY=17179869184',
+        '-s', 'MAXIMUM_MEMORY=34359738368',
         '-s', 'ASYNCIFY_STACK_SIZE=41943040',
         '-s', 'WASM=1',
         '-s', 'MODULARIZE',

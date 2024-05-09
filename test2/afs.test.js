@@ -12,7 +12,8 @@ const AdmissableList =
     "M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc", // GPT-2-XL 4-bit quantized model.
     "kd34P4974oqZf2Db-hFTUiCipsU6CzbR6t-iJoQhKIo", // Phi-2 
     "ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo", // Phi-3 Mini 4k Instruct
-    "Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA"  // Llama3 8B Instruct q4
+    "Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA", // Llama3 8B Instruct q4
+    "jbx-H6aq7b3BbNCHlK50Jz9L-6pz9qmldrYXMwjqQVI"  // Llama3 8B Instruct q8
   ]
 
 describe('AOS-Llama+VFS Tests', async () => {
@@ -131,7 +132,7 @@ return llama.run(40)
   })
 
 
-  it('AOS runs Llama3 8B Instruct q3', async () => {
+  it.skip('AOS runs Llama3 8B Instruct q4 (short)', async () => {
     const result =
       await handle(
         getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
@@ -143,11 +144,35 @@ return llama.run(40)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
+  it.skip('AOS runs Llama3 8B Instruct q4 (long)', async () => {
+    const result =
+      await handle(
+        getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
+          100,
+          "<|user|>Tell me a story.<|end|><|assistant|>"),
+        getEnv()
+      )
+    console.log(result.response)
+    assert.ok(result.response.Output.data.output.length > 100)
+  })
+
   it.skip('AOS runs Llama3 8B Instruct q4', async () => {
     const result =
       await handle(
         getLua('Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA',
-          30,
+          100,
+          "<|user|>Tell me a story.<|end|><|assistant|>"),
+        getEnv()
+      )
+    console.log(result.response)
+    assert.ok(result.response.Output.data.output.length > 10)
+  })
+
+  it('AOS runs Llama3 8B Instruct q8', async () => {
+    const result =
+      await handle(
+        getLua('jbx-H6aq7b3BbNCHlK50Jz9L-6pz9qmldrYXMwjqQVI',
+          100,
           "<|user|>Tell me a story.<|end|><|assistant|>"),
         getEnv()
       )
