@@ -71,15 +71,20 @@ build/llama.cpp: build
 	fi
 
 libllama.a: build/llama.cpp container
+	@echo "Patching llama.cpp alignment asserts..."
 	sed -i.bak 's/#define ggml_assert_aligned.*/#define ggml_assert_aligned\(ptr\)/g' build/llama.cpp/ggml.c
 	sed -i.bak '/.*GGML_ASSERT.*GGML_MEM_ALIGN == 0.*/d' build/llama.cpp/ggml.c
-
-	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && emcmake cmake -DCMAKE_CXX_FLAGS='$(EMXX_CFLAGS)' -S . -B . -DLLAMA_BUILD_EXAMPLES=OFF"
-	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /llama.cpp && emmake make llama common EMCC_CFLAGS='$(EMXX_CFLAGS)'"
+	@echo "Building llama.cpp..."
+	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c \
+		"cd /llama.cpp && emcmake cmake -DCMAKE_CXX_FLAGS='$(EMXX_CFLAGS)' -S . -B . -DLLAMA_BUILD_EXAMPLES=OFF"
+	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao \
+		sh -c "cd /llama.cpp && emmake make llama common EMCC_CFLAGS='$(EMXX_CFLAGS)'"
 	cp build/llama.cpp/libllama.a libllama.a
 
 build/llama.cpp/llama-run.o: libllama.a src/llama-run.cpp container
-	docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c "cd /src && em++ -s MEMORY64=1 -c /opt/llama-run.cpp -o /llama.cpp/llama-run.o -I /llama.cpp -I /llama.cpp/common"
+	@echo "Building llama-run.cpp..."
+	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao \
+		sh -c "cd /src && em++ -s MEMORY64=1 -Wno-experimental -c /opt/llama-run.cpp -o /llama.cpp/llama-run.o -I /llama.cpp -I /llama.cpp/common"
 
 .PHONY: container
 container: container/Dockerfile

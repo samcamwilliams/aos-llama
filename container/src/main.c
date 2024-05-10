@@ -18,7 +18,7 @@ LUALIB_API int luaopen_LuaBase64_c(Lua* L);
 #include <emscripten.h>
 
 int boot_lua(lua_State* L);
-static lua_State *wasm_lua_state = NULL;
+lua_State *wasm_lua_state = NULL;
 
 // Pre-compiled lua loader program
 static const unsigned char program[] = {__LUA_BASE__};
@@ -128,7 +128,6 @@ int main(void) {
     lua_close(wasm_lua_state);
     return 1;
   }
-  //printf("Boot Lua Webassembly!\n");
   return 0;
 }
 

@@ -180,7 +180,8 @@ def main():
         # '-s', 'FILESYSTEM=0',
         '-s', 'DETERMINISTIC=1',
         '-s', 'NODERAWFS=0',
-        '-s', 'FORCE_FILESYSTEM=1'
+        '-s', 'FORCE_FILESYSTEM=1',
+        '-msimd128'
     ])
     # Add the custom aostdlib directory and the AO libc archive file.
     cmd.extend(['-L/opt/aolibc', '-l:aolibc.a'])
@@ -198,6 +199,7 @@ def main():
     # cmd.extend(['-I', '/opt'])
     cmd.extend([quote(v.filepath) for v in link_libraries])
     # Append Llama2.c modules to linked libraries
+    cmd.extend(['-I', '/llama.cpp', '-I', '/llama.cpp/common'])
     cmd.extend(['/opt/llama-bindings.c', '/opt/stream.c', '/opt/stream-bindings.c'])
     # Append llama.cpp library to the command
     cmd.extend(['/llama.cpp/libllama.a', '/llama.cpp/common/libcommon.a', '/llama.cpp/llama-run.o'])

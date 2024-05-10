@@ -1,5 +1,4 @@
 #include "common.h"
-#include "llama-run.h"
 #include "llama.h"
 
 #include <cmath>
@@ -15,13 +14,15 @@ llama_batch batch;
 llama_context * ctx;
 int tks_processed = 0;
 
+extern "C" bool l_llama_on_progress(float progress, void * user_data);
+extern "C" void l_llama_on_log(enum ggml_log_level level, const char * text, void * user_data);
+
 extern "C" int llama_load(char* model_path);
 int llama_load(char* model_path) {
     params.model = model_path;
 
     // init LLM
     llama_backend_init();
-    llama_numa_init(params.numa);
 
     // initialize the model
     llama_model_params model_params = llama_model_default_params();
@@ -56,7 +57,7 @@ int llama_set_prompt(char* prompt) {
     ctx = llama_new_context_with_model(model, ctx_params);
 
     if (ctx == NULL) {
-        fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "error: failed to create the llama_context\n", NULL);
         return 1;
     }
 
@@ -66,7 +67,7 @@ int llama_set_prompt(char* prompt) {
 
     // make sure the KV cache is big enough to hold all the prompt and generated tokens
     if (isCtxFull()) {
-        LOG_TEE("%s: error: n_kv_req > n_ctx, the required KV cache size is not big enough\n", __func__);
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "error: n_kv_req > n_ctx, the required KV cache size is not big enough\n", NULL);
         return 1;
     }
 
@@ -84,11 +85,9 @@ int llama_set_prompt(char* prompt) {
     batch.logits[batch.n_tokens - 1] = true;
 
     if (llama_decode(ctx, batch) != 0) {
-        LOG_TEE("%s: llama_decode() failed\n", __func__);
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Failed to eval, return code %d\n", NULL);
         return 1;
     }
-
-    int n_cur = batch.n_tokens;
 
     return 0;
 }
@@ -127,7 +126,7 @@ char* llama_next() {
 
     // evaluate the current batch with the transformer model
     if (llama_decode(ctx, batch)) {
-        fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Failed to eval, return code %d\n", NULL);
         return 0;
     }
 
@@ -146,6 +145,30 @@ char* llama_run(int len) {
     }
 
     return response;
+}
+
+extern "C" int llama_add(char* new_string);
+int llama_add(char* new_string) {
+    std::vector<llama_token> new_tokens_list = ::llama_tokenize(ctx, new_string, true);
+
+    if (isCtxFull()) {
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Context full, cannot add more tokens\n", NULL);
+        return 1;
+    }
+
+    // Add new tokens to the batch
+    for (size_t i = 0; i < new_tokens_list.size(); i++) {
+        llama_batch_add(batch, new_tokens_list[i], tks_processed + i, {0}, false);
+        tks_processed++;
+    }
+
+    batch.logits[batch.n_tokens - 1] = true;
+    if (llama_decode(ctx, batch) != 0) {
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "llama_decode() failed with new tokens\n", NULL);
+        return 1;
+    }
+
+    return 0;
 }
 
 extern "C" void llama_stop();

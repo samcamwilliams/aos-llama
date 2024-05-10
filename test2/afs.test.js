@@ -13,6 +13,7 @@ const AdmissableList =
     "M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc", // GPT-2-XL 4-bit quantized model.
     "kd34P4974oqZf2Db-hFTUiCipsU6CzbR6t-iJoQhKIo", // Phi-2 
     "ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo", // Phi-3 Mini 4k Instruct
+    "sKqjvBbhqKvgzZT4ojP1FNvt4r_30cqjuIIQIr-3088", // CodeQwen 1.5 7B Chat q3
     "Pr2YVrxd7VwNdg6ekC0NXWNKXxJbfTlHhhlrKbAd1dA", // Llama3 8B Instruct q4
     "jbx-H6aq7b3BbNCHlK50Jz9L-6pz9qmldrYXMwjqQVI"  // Llama3 8B Instruct q8
   ]
@@ -101,22 +102,22 @@ end`), getEnv())
 
   it.skip('Llama Lua library loads', async () => {
     const result = await handle(getEval(`
-local llama = require("llama")
+local Llama = require("llama")
 --llama.load("/data/ggml-tiny.en.bin")
-return llama.info()
+return Llama.info()
 `), getEnv())
     assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
   })
 
   it.skip('AOS runs GPT-2 117m model', async () => {
     const result = await handle(getEval(`
-  local llama = require("llama")
+  local Llama = require("llama")
   io.stderr:write([[Loading model...\n]])
-  local result = llama.load("/data/XOJ8FBxa6sGLwChnxhF2L71WkKLSKq1aU5Yn5WnFLrY")
+  local result = Llama.load("/data/XOJ8FBxa6sGLwChnxhF2L71WkKLSKq1aU5Yn5WnFLrY")
   io.stderr:write([[Loaded! Setting prompt...\n]])
   llama.setPrompt("RESEARCHER: You are a new machine intelligence. You have just been born in a new cyberspace. How do you feel? YOU: ")
   io.stderr:write([[Prompt set! Running...\n]])
-  return llama.run(100)
+  return Llama.run(100)
   `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)
@@ -133,21 +134,31 @@ return llama.info()
 
   it.skip('AOS loads Phi-2', async () => {
     const result = await handle(getEval(`
-  local llama = require("llama")
-  llama.load('/data/kd34P4974oqZf2Db-hFTUiCipsU6CzbR6t-iJoQhKIo')
-  llama.setPrompt([[<|user|>Can you write an html contact page for Tom Wilson whose email is t@foo.com<|end|><|assistant|>]])
-  return llama.run(100) 
+  local Llama = require("llama")
+  Llama.load('/data/kd34P4974oqZf2Db-hFTUiCipsU6CzbR6t-iJoQhKIo')
+  Llama.setPrompt([[<|user|>Can you write a HelloWorld function in js<|end|><|assistant|>]])
+  return Llama.run(10)
   `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it.skip('AOS loads Phi-3 Mini 4k Instruct', async () => {
+  it.skip('Can add tokens into context', async () => {
     const result = await handle(getEval(`
-local llama = require("llama")
-llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
-llama.setPrompt([[<|user|>Tell me a story.<|end|><|assistant|>]])
-return llama.run(40) 
+  local Llama = require("llama")
+  Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
+  Llama.setPrompt([[<|user|>Tell me a great story<|assistant|>]])
+  local str = ""
+  for i = 0, 100, 1 do
+    str = str .. Llama.next()
+    io.stderr:write([[Str: ]] .. str .. [[\n]])
+    io.stderr:flush()
+    if i % 30 == 0 then
+      Llama.add("dog")
+      str = str .. "dog"
+    end
+  end
+  return str
   `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)
@@ -187,6 +198,16 @@ return Llama.run(80)
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)
   })
+
+  it('AOS runs CodeQwen intelligence test', async () => {
+    const result =
+      await handle(
+        getEval(readFileSync("code-test.lua", "utf-8")),
+        getEnv()
+      )
+    console.log(result.response)
+    assert.ok(result.response.Output.data.output.includes("<|im_end|>"))
+  })
 })
 
 function getLua(model, len, prompt) {
@@ -194,15 +215,15 @@ function getLua(model, len, prompt) {
     prompt = "Tell me a story."
   }
   return getEval(`
-  local llama = require("llama")
+  local Llama = require("llama")
   io.stderr:write([[Loading model...\n]])
-  llama.load('/data/${model}')
+  Llama.load('/data/${model}')
   io.stderr:write([[Loaded! Setting prompt...\n]])
-  llama.setPrompt([[${prompt}]])
+  Llama.setPrompt([[${prompt}]])
   local result = ""
   io.stderr:write([[Running...\n]])
   for i = 0, ${len.toString()}, 1 do
-    local token = llama.next()
+    local token = Llama.next()
     result = result .. token
     io.stderr:write([[Got token: ]] .. token .. [[\n\n]])
   end
