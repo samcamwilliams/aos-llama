@@ -28,7 +28,7 @@ module.exports = function weaveDrive(mod, FS) {
   return {
     async downloadFile(url, filePath) {
       var bytesLength = await fetch(url, { method: 'HEAD' }).then(res => res.headers.get('Content-Length'))
-      var ptr = mod._emscripten_builtin_memalign(16, bytesLength)
+      var ptr = mod._malloc(bytesLength)
       // console.log("Got ptr for file at:", ptr)
       const response = await fetch(url);
       // console.log("Starting to pipe...")
