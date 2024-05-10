@@ -57,49 +57,39 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
   }
 });
 
-// NOTE: Currently unused, but this is the start of how we would do it.
-EM_ASYNC_JS(size_t, arweave_read, (void *buffer, size_t size, size_t nmemb, int fd), {
+EM_ASYNC_JS(int, arweave_download, (int c_fd, int *dst_ptr, int length, int file_offset), {
     try {
-        console.log('JS: Reading requested data... ', buffer, size, nmemb, fd);
-        console.log("Sending args:", HEAP8, Number(buffer), Number(size) * Number(nmemb), 0);
-        const bytes_read = FS.streams[fd].stream_ops.read(FS.streams[fd], HEAP8, Number(buffer), Number(Number(size) * Number(nmemb)), 0);
-        console.log('JS: Read data: ', bytes_read);
-        await new Promise((r) => setTimeout(r, 1000));
-        console.log('Resolving...');
-        return Promise.resolve(bytes_read);
-    } catch (err) {
-        console.error('JS: Error reading file: ', err);
-        return Promise.resolve(-1);
-    }
+        //console.log("JSARWEAVE DOWNLOAD: Opening file to dst: ", c_fd, dst_ptr, length, file_offset);
+        const drive = Module.WeaveDrive(Module, FS);
+        const bytes_read = await drive.downloadToMem(c_fd, dst_ptr, length, file_offset);
+        //console.log("JSARWEAVE DOWNLOAD: Done ", bytes_read);
+        return Promise.resolve(0);
+  } catch (err) {
+    console.error('Error opening file:', err);
+    return Promise.resolve(0);
+  }
 });
 
-// NOTE: This may not actually be necessary. But if it is, here is how we would
-// emulate the 'native' emscripten fopen.
-FILE *fallback_fopen(const char *filename, const char *mode) {
-    int fd;
-    int flags;
-
-    // Basic mode to flags translation
-    if (strcmp(mode, "r") == 0) {
-        flags = O_RDONLY;
-    } else if (strcmp(mode, "w") == 0) {
-        flags = O_WRONLY | O_CREAT | O_TRUNC;
-    } else if (strcmp(mode, "a") == 0) {
-        flags = O_WRONLY | O_CREAT | O_APPEND;
+EM_ASYNC_JS(size_t, arweave_download_to_mem, (int fd, void *dst_ptr, size_t length, size_t file_offset), {
+    try {
+        console.log('JS: Reading requested data... ');
+        //console.log("Sending args:", HEAP8, Number(buffer), Number(size) * Number(nmemb), 0);
+        //const bytes_read = FS.streams[fd].stream_ops.read(FS.streams[fd], HEAP8, Number(buffer), Number(Number(size) * Number(nmemb)), 0);
+        //console.log('JS: Read data: ', bytes_read);
+        //await new Promise((r) => setTimeout(r, 1000));
+        console.log('JS Resolving...');
+        return Promise.resolve(0);
+    } catch (err) {
+        console.error('JS: Error reading file: ', err);
+        return Promise.resolve(0);
     }
-
-    // Open file and convert to FILE*
-    fd = open(filename, flags, 0666); // Using default permissions directly
-    if (fd == -1) { // If fd is -1, return NULL as if the fopen failed
-        return NULL;
-    }
-    return fdopen(fd, mode);
-}
+});
 
 FILE* fopen(const char* filename, const char* mode) {
     AO_LOG( "AO: Called fopen: %s, %s\n", filename, mode);
     FILE* res = (FILE*) 0;
     if (strncmp(filename, "/data", 5) == 0 || strncmp(filename, "/headers", 8) == 0) {
+        AO_LOG("AO: arweave_fopen called\n");
         int fd = arweave_fopen(filename, mode);
         AO_LOG( "AO: arweave_fopen returned fd: %d\n", fd);
         if (fd) {
@@ -141,25 +131,25 @@ int madvise(void* addr, size_t length, int advice) {
     return 0;
 }
 
-
 /*
 int munmap(void* addr, size_t length) {
     AO_LOG("AO: munmap called with addr: %p, length: %zu\n", addr, length);
     return 0;
 }
 */
-
-/*
 size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     int fd = fileno(stream);
+    long offset = ftell(stream);
+    size_t total_size = size * nmemb;
     AO_LOG( "AO: fread called with: ptr %p, size: %zu, nmemb: %zu, FD: %d.\n", ptr, size, nmemb, fd);
-    size_t bytes_read = arweave_read(ptr, size, nmemb, (unsigned int) fd);
-    AO_LOG( "I'M BACK\n");
-    fflush(stderr);
-    //AO_LOG( "AO: fread returned: %zu. Output: %s\n", bytes_read, ptr);
-    return bytes_read;
+    //size_t bytes_read = arweave_download_to_mem(fd, ptr, size, nmemb);
+    arweave_download(3, ptr, size * nmemb, offset);
+    AO_LOG( "AO: fread returned\n");
+    fseek(stream, offset + total_size, SEEK_SET);
+    return total_size;
 }
 
+/*
 int fseek(FILE* stream, long offset, int whence) {
     AO_LOG( "Called fseek with offset: %ld, whence: %d\n", offset, whence);
     return 0;  // Returning success, adjust as necessary
