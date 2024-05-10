@@ -25,7 +25,7 @@ int llama_load(char* model_path) {
 
     // initialize the model
     llama_model_params model_params = llama_model_default_params();
-    model_params.use_mmap = false;
+    model_params.use_mmap = true;
     model = llama_load_model_from_file(params.model.c_str(), model_params);
 
     if (model == NULL) {

@@ -26,9 +26,9 @@ module.exports = function weaveDrive(mod, FS) {
   })
 
   return {
-    async downloadFiles(url, filePath) {
+    async downloadFile(url, filePath) {
       var bytesLength = await fetch(url, { method: 'HEAD' }).then(res => res.headers.get('Content-Length'))
-      var ptr = mod._malloc(bytesLength)
+      var ptr = mod._emscripten_builtin_memalign(16, bytesLength)
       // console.log("Got ptr for file at:", ptr)
       const response = await fetch(url);
       // console.log("Starting to pipe...")
@@ -36,7 +36,7 @@ module.exports = function weaveDrive(mod, FS) {
       return Promise.resolve({ ptr, bytes: bytesLength })
     },
     async createLinkFile(id) {
-      var { ptr, bytes } = await this.downloadFiles(`${mod.ARWEAVE}/${id}`)
+      var { ptr, bytes } = await this.downloadFile(`${mod.ARWEAVE}/${id}`)
       var properties = { isDevice: false, contents: null };
       // TODO: might make sense to create the `data` folder here if does not exist
       var node = FS.createFile('/', 'data/' + id, properties, true, false);
@@ -47,6 +47,7 @@ module.exports = function weaveDrive(mod, FS) {
           get: function () { return bytes; }
         }
       });
+      // console.log("NODE stream ops:", Object.keys(node.stream_ops))
       function readData(stream, heap, dst_ptr, length, file_ptr) {
         var srcPtr = stream.node.ptr;
         var chunkBytes = heap.subarray(srcPtr + file_ptr, srcPtr + length + file_ptr)
@@ -59,12 +60,12 @@ module.exports = function weaveDrive(mod, FS) {
       };
       // use a custom mmap function
       node.stream_ops.mmap = (stream, length, position, prot, flags) => {
-        var ptr = mmapAlloc(length);
-        if (!ptr) {
-          throw new FS.ErrnoError(48);
+        if(!stream.node.ptr) {
+          console.log("ERR: MMAP WITHOUT DOWNLOAD. Name:", stream.node.name, " FD:", stream.node.fd)
+          return 0;
         }
-        readData(stream, HEAP8, ptr, length, position);
-        return { ptr, allocated: true };
+        var mmap_ptr = stream.node.ptr + position
+        return { ptr: mmap_ptr, allocated: true };
       };
       return Promise.resolve(node);
     }

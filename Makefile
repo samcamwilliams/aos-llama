@@ -24,8 +24,10 @@ install-llm:
 	cp build/aos/process/AOS.wasm test2/AOS.wasm
 	cp build/aos/process/AOS.js test2/AOS.js
 
-.PHONY: test-llm
+.PHONY: test2
 test-llm:
+	# cp build/aos/process/AOS.wasm test2/AOS.wasm
+	# cp build/aos/process/AOS.js test2/AOS.js
 	cd test2 && yarn test
 
 .PHONY: test

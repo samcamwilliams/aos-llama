@@ -5,7 +5,7 @@
 #include <string.h>
 #include <emscripten.h>
 
-#ifdef DEBUG
+#if 1
 #define AO_LOG(...) fprintf(stderr, __VA_ARGS__)
 #else
 #define AO_LOG(...)
@@ -23,15 +23,21 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
         if (pathCategory === 'data') {
             if(FS.analyzePath(filename).exists) {
                 console.log("JS: File exists: ", filename);
-                const file = FS.open("/data/" + id, "r");
-                console.log("JS: File opened: ", file.fd);
-                return Promise.resolve(file.fd);
+                for(var i = 0; i < FS.streams.length; i++) {
+                    if(FS.streams[i].node.name === id) {
+                        console.log("JS: Found file: ", filename, " fd: ", FS.streams[i].fd);
+                        return Promise.resolve(FS.streams[i].fd);
+                    }
+                }
+                console.log("JS: File not found: ", filename);
+                return Promise.resolve(0);
             }
             else {
                 if (Module.admissableList.includes(id)) {
                   const drive = Module.WeaveDrive(Module, FS);
                   const linkFile = await drive.createLinkFile(id);
                   const file = FS.open('/data/' + id, "r");
+                  console.log("JS: File opened: ", file.fd);
                   return Promise.resolve(file.fd);
                 }
                 else {
@@ -113,7 +119,7 @@ void* realloc(void* ptr, size_t size) {
     void* new_ptr = memalign(16, size);
     memcpy(new_ptr, ptr, size);
     free(ptr);
-    AO_LOG("DBG: Realloc called: %p -> %p, size: %zu\n", ptr, new_ptr, size);
+    //AO_LOG("DBG: Realloc called: %p -> %p, size: %zu\n", ptr, new_ptr, size);
     return new_ptr;
 }
 
@@ -124,11 +130,25 @@ void* malloc(size_t size) {
     void* ret = memalign(16, size);
 
     if(size > 1024 * 1024) {
-        AO_LOG("AOMALLOC: called with size: %zu. Returned: %p\n", size, ret);
+        //AO_LOG("AOMALLOC: called with size: %zu. Returned: %p\n", size, ret);
     }
 
     return ret;
 }
+
+int madvise(void* addr, size_t length, int advice) {
+    AO_LOG("AO: madvise called with addr: %p, length: %zu, advice: %d\n", addr, length, advice);
+    return 0;
+}
+
+
+/*
+int munmap(void* addr, size_t length) {
+    AO_LOG("AO: munmap called with addr: %p, length: %zu\n", addr, length);
+    return 0;
+}
+*/
+
 /*
 size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     int fd = fileno(stream);

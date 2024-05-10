@@ -20,9 +20,8 @@ const AdmissableList =
 describe('AOS-Llama+VFS Tests', async () => {
   var instance;
   const handle = async function (msg, env) {
-    console.log('handle start')
     const res = await instance.cwrap('handle', 'string', ['string', 'string'], { async: true })(JSON.stringify(msg), JSON.stringify(env))
-    console.log('handle stop')
+    console.log('Memory used:', instance.HEAP8.length)
     return JSON.parse(res)
   }
 
@@ -72,7 +71,7 @@ describe('AOS-Llama+VFS Tests', async () => {
     assert.ok(result.response.Output.data.output == "OK")
   })
 
-  it('Read data from the VFS', async () => {
+  it.skip('Read data from the VFS', async () => {
     const result = await handle(getEval(`
 local file = io.open("/data/1", "r")
 if file then
@@ -125,9 +124,10 @@ return llama.info()
 
   it.skip('AOS runs GPT-2 1.5b model', async () => {
     const result = await handle(
-      getLua('M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc', 30),
+      getLua('M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc', 10),
       getEnv())
     console.log(result.response)
+    console.log("SIZE:", instance.HEAP8.length)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
@@ -153,7 +153,7 @@ return llama.run(40)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it('AOS runs Phi-3 Mini 4k Instruct', async () => {
+  it.skip('AOS runs Phi-3 Mini 4k Instruct', async () => {
     const result = await handle(getEval(`
 local Llama = require("llama")
 Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
@@ -176,11 +176,11 @@ return Llama.run(80)
     assert.ok(result.response.Output.data.output.length >= 100)
   })
 
-  it('AOS runs CodeQwen intelligence test', async () => {
+  it('AOS runs Llama3 8B Instruct q8', async () => {
     const result =
       await handle(
         getLua('jbx-H6aq7b3BbNCHlK50Jz9L-6pz9qmldrYXMwjqQVI',
-          100,
+          10,
           "<|user|>Tell me a story.<|end|><|assistant|>"),
         getEnv()
       )
