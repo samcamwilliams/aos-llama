@@ -141,12 +141,11 @@ size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     int fd = fileno(stream);
     long offset = ftell(stream);
     size_t total_size = size * nmemb;
-    AO_LOG( "AO: fread called with: ptr %p, size: %zu, nmemb: %zu, FD: %d.\n", ptr, size, nmemb, fd);
-    //size_t bytes_read = arweave_download_to_mem(fd, ptr, size, nmemb);
-    arweave_download(3, ptr, size * nmemb, offset);
-    AO_LOG( "AO: fread returned\n");
+    //AO_LOG( "AO: fread called with: ptr %p, size: %zu, nmemb: %zu, FD: %d.\n", ptr, size, nmemb, fd);
+    arweave_download(fd, ptr, size * nmemb, offset);
+    //AO_LOG( "AO: fread returned\n");
     fseek(stream, offset + total_size, SEEK_SET);
-    return total_size;
+    return nmemb;
 }
 
 /*

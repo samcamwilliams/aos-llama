@@ -1,39 +1,78 @@
 var assert = require('assert')
-const MB = (1024 * 1024)
-const GB = 1000 * MB
-const CHUNK_SZ = 100 * MB
+const KB = 1024
+const MB = KB * 1024
+const GB = MB * 1024
+const CACHE_SZ = 128 * MB
 
 module.exports = function weaveDrive(mod, FS) {
-  const createWriter = (v, ptr) => {
+  const createWriter = (v, stream, ptr, length) => {
     return {
       write(chunk) {
-        mod.HEAP8.set(new Uint8Array(chunk), ptr)
-        ptr += chunk.length;
+        // Calculate the chunk to write to the memory provided
+        var write_chunk = chunk.subarray(0, Math.min(chunk.length, length))
+        // Write it into memory (even if length is zero) and update pointers
+        //console.log("WEAVE_DRIVE WRITER: Writing chunk: ", write_chunk.length, " to ptr: ", ptr, " Remaining to write: ", length)
+        mod.HEAP8.set(new Uint8Array(write_chunk), ptr)
+        ptr += write_chunk.length;
+        length -= write_chunk.length
         v++
-        //console.log(v, ": Downloaded ", chunk.length, " bytes. Ptr: ", ptr / MB, "CHUNK: ", chunk);
+        if(length === 0) {
+          // Store the rest of the request into the cache
+          var cache_chunk = chunk.subarray(write_chunk.length)
+          console.log("WEAVE_DRIVE WRITER: Caching bytes: ", cache_chunk.length)
+          // Create a new Uint8Array with the size of the existing cache plus the new chunk
+          var new_cache = new Uint8Array(stream.node.cache.length + cache_chunk.length)
+          // Set the existing cache into the new array
+          new_cache.set(stream.node.cache)
+          new_cache.set(cache_chunk, stream.node.cache.length)
+          // Replace the old cache with the new cache
+          stream.node.cache = new_cache
+        }
       }
     }
   }
-  const writer = (ptr) => new WritableStream(createWriter(0, ptr), new CountQueuingStrategy({ highWaterMark: 10000 }));
+  const writer = (stream, ptr, length) =>
+    new WritableStream(createWriter(0, stream, ptr, length), new CountQueuingStrategy({ highWaterMark: 1 }));
 
 
 
   return {
-    async downloadToMem(fd, dst_ptr, length, file_offset) {
-      //console.log("JS WEAVE_DRIVE: Downloading to mem: ", fd, dst_ptr, length, file_offset)
+    async downloadToMem(fd, raw_dst_ptr, raw_length, file_offset) {
+      var length = Number(raw_length)
+      var dst_ptr = Number(raw_dst_ptr)
+      //console.log("WEAVE_DRIVE: Downloading to mem: ", fd, dst_ptr, length, file_offset)
 
       var stream = 0;
-
       for(var i = 0; i < FS.streams.length; i++) {
         if(FS.streams[i].fd === fd) {
           stream = FS.streams[i]
         }
       }
 
+      // Take bytes from the cache first, if we can
+      var cache_part_length = Math.min(length, stream.node.cache.length)
+      var cache_part = stream.node.cache.subarray(0, cache_part_length)
+      mod.HEAP8.set(cache_part, Number(dst_ptr))
+      // Set the new cache to the rest of the cache and update pointers
+      stream.node.cache = stream.node.cache.subarray(cache_part_length)
+      dst_ptr += cache_part_length
+      file_offset += cache_part_length
+      length -= cache_part_length
+
+      //console.log("WEAVE_DRIVE: Got bytes from cache: ", cache_part_length, " Remaining to get: ", length, "Current cache size: ", stream.node.cache.length)
+
+      // Return if we have satisfied the request
+      if(length === 0) {
+        //console.log("WEAVE_DRIVE: Satisfied request with cache. Returning...")
+        return length
+      }
+
+      // If we have no cache, or we have not satisfied the full request, we need to download the rest
       const url = `${mod.ARWEAVE}/${stream.node.name}`
       const from = file_offset
-      const to = file_offset + Number(length)
-      //console.log("URL: ", url, " FROM: ", from, " TO: ", to)
+      const chunk_download_sz = Math.max(length, CACHE_SZ)
+      const to = Math.min(stream.node.total_size, file_offset + chunk_download_sz - 1);
+      console.log("WEAVE_DRIVE: Downloading: ", url, " From: ", from, " To: ", to, " Read length: ", length, " Readahead cache length:", to - length - file_offset)
       var res = await fetch(url, {
         method: "GET",
         redirect: "follow",
@@ -42,8 +81,26 @@ module.exports = function weaveDrive(mod, FS) {
           Range: `bytes=${from}-${to}`
         }
       })
-      await res.body.pipeTo(writer(Number(dst_ptr)))
-      //console.log("Downloaded.")
+
+      // Create a readable stream from the response with a higher highWaterMark
+      const reader = res.body.getReader();
+      const readStream = new ReadableStream({
+        async pull(controller) {
+          const { done, value } = await reader.read();
+          console.log("WEAVE_DRIVE: Read " + value.length + " bytes.")
+          if (done) {
+            controller.close();
+          } else {
+            controller.enqueue(value);
+          }
+        }
+      }, { highWaterMark: 10 * 1024 * 1024 }); // Set to 10MB, adjust as needed
+
+      // Pipe the new stream to the writer
+      await readStream.pipeTo(writer(stream, Number(dst_ptr), length));
+
+      //await res.body.pipeTo(writer(stream, Number(dst_ptr), length))
+      console.log("WEAVE_DRIVE: Downloaded " + length + " bytes. Cache length: " + stream.node.cache.length)
       return length
     },
 
@@ -62,11 +119,15 @@ module.exports = function weaveDrive(mod, FS) {
       var properties = { isDevice: false, contents: null };
       // TODO: might make sense to create the `data` folder here if does not exist
       var node = FS.createFile('/', 'data/' + id, properties, true, false);
+      var bytesLength = await fetch(`${mod.ARWEAVE}/${id}`, { method: 'HEAD' }).then(res => res.headers.get('Content-Length'))
+      node.total_size = Number(bytesLength)
+      node.cache = new Uint8Array(0)
       //node.ptr = ptr;
       // Add a function that defers querying the file size until it is asked the first time.
       Object.defineProperties(node, {
         usedBytes: {
-          get: function () { return bytes; }
+          get: function () { return bytesLength; },
+
         }
       });
       // console.log("NODE stream ops:", Object.keys(node.stream_ops))
