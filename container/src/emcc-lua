@@ -165,18 +165,26 @@ def main():
 
     # Finally, compile to wasm
     debug_print('Start to compile as WASM')
-    cmd = ['emcc', '-O0']
+    cmd = ['emcc', '-O3']
     cmd.extend([
-        '-s', 'STACK_SIZE=20971520',
+        '-g2',
+        '-s', 'ASYNCIFY=1',
+        '-s', 'MEMORY64=1',
+        '-s', 'STACK_SIZE=41943040',
+        '-s', 'ASYNCIFY_STACK_SIZE=41943040',
         '-s', 'ALLOW_MEMORY_GROWTH=1',
-        '-s', 'INITIAL_MEMORY=31457280',
-        '-s', 'MAXIMUM_MEMORY=4294967296',
+        '-s', 'INITIAL_MEMORY=83886080',
+        '-s', 'MAXIMUM_MEMORY=17179869184',
         '-s', 'WASM=1',
         '-s', 'MODULARIZE',
         # '-s', 'FILESYSTEM=0',
         '-s', 'DETERMINISTIC=1',
-        '-s', 'NODERAWFS=0'
+        '-s', 'NODERAWFS=0',
+        '-s', 'FORCE_FILESYSTEM=1',
+        '-msimd128'
     ])
+    # Add the custom aostdlib directory and the AO libc archive file.
+    cmd.extend(['-L/opt/aolibc', '-l:aolibc.a'])
     cmd.extend(['-s', 'ASSERTIONS=1'])
     cmd.extend(['--pre-js', '/opt/pre.js'])
     cmd.extend(definition.get_extra_args())
@@ -191,15 +199,20 @@ def main():
     # cmd.extend(['-I', '/opt'])
     cmd.extend([quote(v.filepath) for v in link_libraries])
     # Append Llama2.c modules to linked libraries
-    cmd.extend(['/opt/llama.c', '/opt/llama-bindings.c', '/opt/stream.c', '/opt/stream-bindings.c'])
+    cmd.extend(['-I', '/llama.cpp', '-I', '/llama.cpp/common'])
+    cmd.extend(['/opt/llama-bindings.c', '/opt/stream.c', '/opt/stream-bindings.c'])
+    # Append llama.cpp library to the command
+    cmd.extend(['/llama.cpp/libllama.a', '/llama.cpp/common/libcommon.a', '/llama.cpp/llama-run.o'])
+    cmd.extend(['-s', 'EXPORTED_FUNCTIONS=["_malloc"]'])
     cmd.extend(['-lm', '-ldl', '-o', definition.get_output_file(), '-s', 'EXPORTED_RUNTIME_METHODS=["cwrap"]'])
 
     print('Compile command is {}'.format(' '.join(cmd)))
-    shell_exec(*cmd)
+    output, _ = shell_exec(*cmd)
+    print(output)
 
     # add metering library
-    meter_cmd = ['node', '/opt/node/apply-metering.cjs']
-    shell_exec(*meter_cmd)
+    # meter_cmd = ['node', '/opt/node/apply-metering.cjs']
+    # shell_exec(*meter_cmd)
     # shell_exec(*['rm', '/src/process.js'])
 
 if __name__ == '__main__':

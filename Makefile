@@ -3,50 +3,98 @@ WALLET_LOC ?= key.json
 # Set to 1 to enable debugging
 DEBUG ?=
 
+EMXX_CFLAGS=-s MEMORY64=1 -O3 -msimd128 -fno-rtti -DNDEBUG \
+	-flto=full -s BUILD_AS_WORKER=1 -s EXPORT_ALL=1 \
+	-s EXPORT_ES6=1 -s MODULARIZE=1 -s INITIAL_MEMORY=800MB \
+	-s MAXIMUM_MEMORY=4GB -s ALLOW_MEMORY_GROWTH -s FORCE_FILESYSTEM=1 \
+	-s EXPORTED_FUNCTIONS=_main -s EXPORTED_RUNTIME_METHODS=callMain -s \
+	NO_EXIT_RUNTIME=1 -Wno-unused-command-line-argument -Wno-experimental
+
+ARCH=$(shell uname -m | sed -e 's/x86_64//' -e 's/aarch64/arm64/')
+
+.PHONY: image
+image: node AOS.wasm
+
 .PHONY: build-test
 build-test: build test
 
-.PHONY: build
-build: install AOS.wasm
+.PHONY: install-llm
+install-llm:
+	mkdir -p test2
+	cp build/aos/process/AOS.wasm test2/AOS.wasm
+	cp build/aos/process/AOS.js test2/AOS.js
+
+.PHONY: test-llm
+test-llm:
+	# cp build/aos/process/AOS.wasm test2/AOS.wasm
+	# cp build/aos/process/AOS.js test2/AOS.js
+	cd test2 && yarn test
 
 .PHONY: test
-test:
+test: node
 	cp AOS.wasm test/AOS.wasm
-	npm install
 ifeq ($(TEST),inference)
-	./node_modules/.bin/mocha --grep="TEST_INFERENCE" test/load.test.js
+	cd test; npm install; npm run test:INFERENCE
 else ifeq ($(TEST),load)
-	./node_modules/.bin/mocha --grep="TEST_LOAD" test/load.test.js
+	cd test; npm install; npm run test:LOAD
 else
-	./node_modules/.bin/mocha test/load.test.js
+	cd test; npm install; cd test && npm test 
 endif
 
 AOS.wasm: build/aos/process/AOS.wasm
 	cp build/aos/process/AOS.wasm AOS.wasm
 
-.PHONY: install build/aos/package.json
-install: build/aos/package.json
+.PHONY: node
+node:
 	npm install
+
+build:
+	mkdir -p build
 
 .PHONY: clean
 clean:
-	rm AOS.wasm test/AOS.wasm build/aos/process/AOS.wasm
-	rm package-lock.json
+	rm -rf build
+	rm -f AOS.wasm libllama.a test/AOS.wasm build/aos/process/AOS.wasm
+	rm -f package-lock.json
 	rm -rf node_modules
-	docker rmi p3rmaw3b/ao || true
+	# docker rmi -f p3rmaw3b/ao || true
 
-build/aos/package.json:
-	cd build; \
-		git submodule init; \
-		git submodule update --remote
+build/aos/package.json: build
+	cd build; git submodule init; git submodule update --remote
 
-build/aos/process/AOS.wasm: build/aos/package.json container
-	docker run -v $(PWD)/build/aos/process:/src p3rmaw3b/ao emcc-lua $(if $(DEBUG),-e DEBUG=TRUE)
+build/aos/process/AOS.wasm: libllama.a build/llama.cpp/llama-run.o build/aos/package.json container 
+	docker run -v $(PWD)/build/aos/process:/src -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao emcc-lua $(if $(DEBUG),-e DEBUG=TRUE)
+
+build/llama.cpp: build
+	if [ ! -d "build/llama.cpp" ]; then \
+		cd build; git clone https://github.com/ggerganov/llama.cpp.git; \
+	fi
+
+libllama.a: build/llama.cpp container
+	@echo "Patching llama.cpp alignment asserts..."
+	sed -i.bak 's/#define ggml_assert_aligned.*/#define ggml_assert_aligned\(ptr\)/g' build/llama.cpp/ggml.c
+	sed -i.bak '/.*GGML_ASSERT.*GGML_MEM_ALIGN == 0.*/d' build/llama.cpp/ggml.c
+	@echo "Building llama.cpp..."
+	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao sh -c \
+		"cd /llama.cpp && emcmake cmake -DCMAKE_CXX_FLAGS='$(EMXX_CFLAGS)' -S . -B . -DLLAMA_BUILD_EXAMPLES=OFF"
+	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao \
+		sh -c "cd /llama.cpp && emmake make llama common EMCC_CFLAGS='$(EMXX_CFLAGS)'"
+	cp build/llama.cpp/libllama.a libllama.a
+
+build/llama.cpp/llama-run.o: libllama.a src/llama-run.cpp container
+	@echo "Building llama-run.cpp..."
+	@docker run -v $(PWD)/build/llama.cpp:/llama.cpp p3rmaw3b/ao \
+		sh -c "cd /src && em++ -s MEMORY64=1 -Wno-experimental -c /opt/llama-run.cpp -o /llama.cpp/llama-run.o -I /llama.cpp -I /llama.cpp/common"
 
 .PHONY: container
-container:
-	docker build . -f container/Dockerfile -t p3rmaw3b/ao
+container: container/Dockerfile
+	docker build . -f container/Dockerfile -t p3rmaw3b/ao --build-arg ARCH=$(ARCH)
 
 publish-module: AOS.wasm
 	npm install
 	WALLET=$(WALLET_LOC) scripts/publish-module
+
+.PHONY: dockersh
+dockersh:
+	# docker run -v $(PWD)/build/aos/process:/src -v $(PWD)/build/llama.cpp:/llama.cpp -it p3rmaw3b/ao /bin/bash
+	docker run -v .:/src -it p3rmaw3b/ao /bin/bash

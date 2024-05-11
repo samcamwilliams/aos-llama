@@ -1,0 +1,13 @@
+{
+  "name": "test2",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "dependencies": {},
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "test": "node --test --test-timeout=100000000 --expose-gc --experimental-wasm-memory64  --max-old-space-size=32768 afs.test.js"
+  }
+}
