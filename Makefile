@@ -16,19 +16,13 @@ ARCH=$(shell uname -m | sed -e 's/x86_64//' -e 's/aarch64/arm64/')
 image: node AOS.wasm
 
 .PHONY: build-test
-build-test: build test
-
-.PHONY: install-llm
-install-llm:
-	mkdir -p test2
-	cp build/aos/process/AOS.wasm test2/AOS.wasm
-	cp build/aos/process/AOS.js test2/AOS.js
+build-test: build test-llm
 
 .PHONY: test-llm
 test-llm:
-	# cp build/aos/process/AOS.wasm test2/AOS.wasm
-	# cp build/aos/process/AOS.js test2/AOS.js
-	cd test2 && yarn test
+	cp build/aos/process/AOS.wasm test-llm/AOS.wasm
+	cp build/aos/process/AOS.js test-llm/AOS.js
+	cd test-llm && yarn test
 
 .PHONY: test
 test: node
