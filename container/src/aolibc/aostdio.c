@@ -60,7 +60,7 @@ EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
 EM_ASYNC_JS(int, arweave_read, (int c_fd, int *dst_ptr, size_t length), {
     try {
         const drive = Module.WeaveDrive(Module, FS);
-        console.log("JS: arweave_read called with fd: ", c_fd, " dst_ptr: ", dst_ptr, " length: ", length);
+        //console.log("JS: arweave_read called with fd: ", c_fd, " dst_ptr: ", dst_ptr, " length: ", length);
         const bytes_read = await drive.downloadToMem(c_fd, dst_ptr, length);
         return Promise.resolve(bytes_read);
   } catch (err) {
