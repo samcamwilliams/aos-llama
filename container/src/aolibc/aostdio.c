@@ -21,7 +21,7 @@ EM_ASYNC_JS(int, weavedrive_open, (const char* c_filename, const char* mode), {
 
 EM_ASYNC_JS(int, weavedrive_read, (int fd, int *dst_ptr, size_t length), {
     const drive = Module.WeaveDrive(Module, FS);
-    return Promise.resolve(await drive.readToMemory(fd, dst_ptr, length));
+    return Promise.resolve(await drive.read(fd, dst_ptr, length));
 });
 
 FILE* fopen(const char* filename, const char* mode) {

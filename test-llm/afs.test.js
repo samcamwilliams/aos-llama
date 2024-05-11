@@ -3,7 +3,6 @@ const assert = require('assert')
 const weaveDrive = require('./weave-drive.js')
 const fs = require('fs')
 const wasm = fs.readFileSync('./AOS.wasm')
-// VFS-1
 // STEP 1 send a file id
 const m = require(__dirname + '/AOS.js')
 const AdmissableList =
@@ -49,6 +48,18 @@ describe('AOS-Llama+VFS Tests', async () => {
       admissableList: AdmissableList,
       WeaveDrive: weaveDrive,
       ARWEAVE: 'https://arweave.net',
+      mode: "test",
+      blockHeight: 100,
+      spawn: {
+        "Scheduler": "TEST_SCHED_ADDR"
+      },
+      process: {
+        id: "TEST_PROCESS_ID",
+        owner: "TEST_PROCESS_OWNER",
+        tags: [
+          { name: "Extension", value: "Weave-Drive" }
+        ]
+      }
       instantiateWasm
     })
     await new Promise((r) => setTimeout(r, 1000));
