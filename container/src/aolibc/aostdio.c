@@ -122,6 +122,18 @@ int madvise(void* addr, size_t length, int advice) {
     return 0;
 }
 
+void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    AO_LOG("AO: mmap called with addr: %p, length: %zu, prot: %d, flags: %d, fd: %d, offset: %d\n", addr, length, prot, flags, fd, offset);
+    // Allocate a buffer that fits with emscripten's normal allignments 
+    void* buffer = memalign(65536, length);
+
+    AO_LOG("AO: mmap: Reading from arweave to: %p, length: %zu\n", buffer, length);
+    arweave_read(fd, buffer, length);
+
+    AO_LOG("AO: mmap returned: %p\n", buffer);
+    return buffer;
+}
+
 /*
 int munmap(void* addr, size_t length) {
     AO_LOG("AO: munmap called with addr: %p, length: %zu\n", addr, length);
