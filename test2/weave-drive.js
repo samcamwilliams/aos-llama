@@ -8,7 +8,7 @@ const NOTIFY_SZ = 512 * MB
 module.exports = function weaveDrive(mod, FS) {
   return {
     reset(fd) {
-      console.log("WEAVE_DRIVE: Resetting fd: ", fd)
+      //console.log("WEAVE_DRIVE: Resetting fd: ", fd)
       FS.streams[fd].node.position = 0
       FS.streams[fd].node.cache = new Uint8Array(0)
     },
@@ -16,7 +16,7 @@ module.exports = function weaveDrive(mod, FS) {
     readFromCache(stream, dst_ptr, length) {
       // Check if the cache has been invalidated by a seek
       if(stream.lastReadPosition !== stream.position) {
-        console.log("WEAVE_DRIVE: Invalidating cache for fd: ", stream.fd, " Current pos: ", stream.position, " Last read pos: ", stream.lastReadPosition)
+        //console.log("WEAVE_DRIVE: Invalidating cache for fd: ", stream.fd, " Current pos: ", stream.position, " Last read pos: ", stream.lastReadPosition)
         stream.node.cache = new Uint8Array(0)
         return 0
       }
@@ -47,7 +47,7 @@ module.exports = function weaveDrive(mod, FS) {
       return new_cache
     },
 
-    async downloadToMem(fd, raw_dst_ptr, raw_length) {
+    async readToMemory(fd, raw_dst_ptr, raw_length) {
       // Note: The length and dst_ptr are 53 bit integers in JS, so this _should_ be ok into a large memspace.
       var to_read = Number(raw_length)
       var dst_ptr = Number(raw_dst_ptr)
@@ -71,11 +71,11 @@ module.exports = function weaveDrive(mod, FS) {
         //console.log("WEAVE_DRIVE: Satisfied request with cache. Returning...")
         return bytes_read
       }
-      console.log("WEAVE_DRIVE: Read from cache: ", bytes_read, " Remaining to read: ", to_read)
+      //console.log("WEAVE_DRIVE: Read from cache: ", bytes_read, " Remaining to read: ", to_read)
 
       const chunk_download_sz = Math.max(to_read, CACHE_SZ)
       const to = Math.min(stream.node.total_size, stream.position + chunk_download_sz);
-      console.log("WEAVE_DRIVE: fd: ", fd, " Read length: ", to_read, " Reading ahead:", to - to_read - stream.position)
+      //console.log("WEAVE_DRIVE: fd: ", fd, " Read length: ", to_read, " Reading ahead:", to - to_read - stream.position)
 
       // Fetch with streaming
       const response = await fetch(`${mod.ARWEAVE}/${stream.node.name}`, { 
@@ -142,10 +142,52 @@ module.exports = function weaveDrive(mod, FS) {
       stream.lastReadPosition = stream.position
       return bytes_read
     },
-    async createLinkFile(id) {
+
+    async open(filename) {
+      const pathCategory = filename.split('/')[1];
+      const id = filename.split('/')[2];
+      console.log("JS: Opening ID: ", id);
+  
+      if (pathCategory === 'data') {
+          if(FS.analyzePath(filename).exists) {
+              for(var i = 0; i < FS.streams.length; i++) {
+                  if(FS.streams[i].node.name === id) {
+                      //console.log("JS: Found file: ", filename, " fd: ", FS.streams[i].fd);
+                      return Promise.resolve(FS.streams[i].fd);
+                  }
+              }
+              console.log("JS: File not found: ", filename);
+              return 0;
+          }
+          else {
+              //console.log("JS: Open => Creating file: ", id);
+              const stream = await this.createFile(id);
+              //console.log("JS: Open => Created file: ", id, " fd: ", stream.fd);
+              return stream.fd;
+          }
+      }
+      else if (pathCategory === 'headers') {
+          console.log("Header access not implemented yet.");
+          return 0;
+      }
+      else {
+          console.log("JS: Invalid path category: ", pathCategory);
+          return 0;
+      }
+    },
+
+    async createFile(id) {
       var properties = { isDevice: false, contents: null };
+
+      if (!mod.admissableList.includes(id)) {
+        console.log("JS: Arweave ID is not admissable! ", id);
+        return 0;
+      }
+
+      // Create the file in the emscripten FS
       // TODO: might make sense to create the `data` folder here if does not exist
       var node = FS.createFile('/', 'data/' + id, properties, true, false);
+      // Set initial parameters
       var bytesLength = await fetch(`${mod.ARWEAVE}/${id}`, { method: 'HEAD' }).then(res => res.headers.get('Content-Length'))
       node.total_size = Number(bytesLength)
       node.cache = new Uint8Array(0)
@@ -153,11 +195,12 @@ module.exports = function weaveDrive(mod, FS) {
 
       // Add a function that defers querying the file size until it is asked the first time.
       Object.defineProperties(node, { usedBytes: { get: function () { return bytesLength; } } });
-      node.stream_ops.mmap = (stream, length, position, prot, flags) => {
-        console.log("ERR: MMAP WITHOUT DOWNLOAD. Name:", stream.node.name, " FD:", stream.node.fd)
-        return { ptr: 0, allocated: true };
-      };
-      return Promise.resolve(node);
+
+      // Now we have created the file in the emscripten FS, we can open it as a stream
+      var stream = FS.open('/data/' + id, "r")
+
+      //console.log("JS: Created file: ", id, " fd: ", stream.fd);
+      return stream;
     }
   }
 }

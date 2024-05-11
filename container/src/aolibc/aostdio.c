@@ -5,90 +5,39 @@
 #include <string.h>
 #include <emscripten.h>
 
-#if 1
+#if 0
 #define AO_LOG(...) fprintf(stderr, __VA_ARGS__)
 #else
 #define AO_LOG(...)
 #endif
 
-// WeaveDrive file functions
-EM_ASYNC_JS(int, arweave_fopen, (const char* c_filename, const char* mode), {
-    try {
-        const filename = UTF8ToString(Number(c_filename));
-        
-        const pathCategory = filename.split('/')[1];
-        const id = filename.split('/')[2];
-        console.log("JS: Opening file: ", filename);
-
-        if (pathCategory === 'data') {
-            if(FS.analyzePath(filename).exists) {
-                for(var i = 0; i < FS.streams.length; i++) {
-                    if(FS.streams[i].node.name === id) {
-                        console.log("JS: Found file: ", filename, " fd: ", FS.streams[i].fd);
-                        return Promise.resolve(FS.streams[i].fd);
-                    }
-                }
-                console.log("JS: File not found: ", filename);
-                return Promise.resolve(0);
-            }
-            else {
-                if (Module.admissableList.includes(id)) {
-                  const drive = Module.WeaveDrive(Module, FS);
-                  const linkFile = await drive.createLinkFile(id);
-                  const file = FS.open('/data/' + id, "r");
-                  //drive.reset(file.fd);
-                  console.log("JS: File opened: ", file.fd);
-                  return Promise.resolve(file.fd);
-                }
-                else {
-                    console.log("JS: Arweave ID is not admissable! ", id);
-                    return Promise.resolve(0);
-                }
-            }
-        }
-        else if (pathCategory === 'headers') {
-            console.log("Header access not implemented yet.");
-            return Promise.resolve(0);
-        }
-        return Promise.resolve(0);
-  } catch (err) {
-    console.error('Error opening file:', err);
-    return Promise.resolve(0);
-  }
+// WeaveDrive async wrapper functions. These allow us to call the WeaveDrive
+// async JS code from C.
+EM_ASYNC_JS(int, weavedrive_open, (const char* c_filename, const char* mode), {
+    const filename = UTF8ToString(Number(c_filename));
+    const drive = Module.WeaveDrive(Module, FS);
+    return await drive.open(filename);
 });
 
-EM_ASYNC_JS(int, arweave_read, (int c_fd, int *dst_ptr, size_t length), {
-    try {
-        const drive = Module.WeaveDrive(Module, FS);
-        //console.log("JS: arweave_read called with fd: ", c_fd, " dst_ptr: ", dst_ptr, " length: ", length);
-        const bytes_read = await drive.downloadToMem(c_fd, dst_ptr, length);
-        return Promise.resolve(bytes_read);
-  } catch (err) {
-    console.error('Error reading file:', err);
-    return Promise.resolve(0);
-  }
+EM_ASYNC_JS(int, weavedrive_read, (int fd, int *dst_ptr, size_t length), {
+    const drive = Module.WeaveDrive(Module, FS);
+    return Promise.resolve(await drive.readToMemory(fd, dst_ptr, length));
 });
 
 FILE* fopen(const char* filename, const char* mode) {
     AO_LOG( "AO: Called fopen: %s, %s\n", filename, mode);
-    FILE* res = (FILE*) 0;
-    if (strncmp(filename, "/data", 5) == 0 || strncmp(filename, "/headers", 8) == 0) {
-        AO_LOG("AO: arweave_fopen called\n");
-        int fd = arweave_fopen(filename, mode);
-        AO_LOG( "AO: arweave_fopen returned fd: %d\n", fd);
-        if (fd) {
-            res = fdopen(fd, mode);
-        }
+    int fd = weavedrive_open(filename, mode);
+    AO_LOG( "AO: weavedrive_open returned fd: %d\n", fd);
+    // If we get a file desciptor, we return a FILE*, else 0.
+    if (!fd) {
+        return 0;
     }
-    AO_LOG( "AO: fopen returned: %p\n", res);
-    return res; 
+    return fdopen(fd, mode);
 }
 
 size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     int fd = fileno(stream);
-    //AO_LOG( "AO: fread called with: ptr %p, size: %zu, nmemb: %zu, FD: %d.\n", ptr, size, nmemb, fd);
-    arweave_read(fd, ptr, size * nmemb);
-    //AO_LOG( "AO: fread returned\n");
+    weavedrive_read(fd, ptr, size * nmemb);
     return nmemb;
 }
 
@@ -109,13 +58,7 @@ void* realloc(void* ptr, size_t size) {
 // programs that use aligned memory (for example, those that use SIMD...) to
 // crash. So we need to use the aligned allocator.
 void* malloc(size_t size) {
-    void* ret = memalign(16, size);
-
-    if(size > 1024 * 1024) {
-        //AO_LOG("AOMALLOC: called with size: %zu. Returned: %p\n", size, ret);
-    }
-
-    return ret;
+    return memalign(16, size);
 }
 
 int madvise(void* addr, size_t length, int advice) {
@@ -127,10 +70,8 @@ void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset)
     AO_LOG("AO: mmap called with addr: %p, length: %zu, prot: %d, flags: %d, fd: %d, offset: %d\n", addr, length, prot, flags, fd, offset);
     // Allocate a buffer that fits with emscripten's normal allignments 
     void* buffer = memalign(65536, length);
-
     AO_LOG("AO: mmap: Reading from arweave to: %p, length: %zu\n", buffer, length);
-    arweave_read(fd, buffer, length);
-
+    weavedrive_read(fd, buffer, length);
     AO_LOG("AO: mmap returned: %p\n", buffer);
     return buffer;
 }
