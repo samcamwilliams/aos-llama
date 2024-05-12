@@ -1,6 +1,6 @@
 const { describe, it } = require('node:test')
 const assert = require('assert')
-const weaveDrive = require('./weave-drive.js')
+const weaveDrive = require('./weavedrive.js')
 const fs = require('fs')
 const wasm = fs.readFileSync('./AOS.wasm')
 // STEP 1 send a file id
@@ -59,7 +59,7 @@ describe('AOS-Llama+VFS Tests', async () => {
         tags: [
           { name: "Extension", value: "Weave-Drive" }
         ]
-      }
+      },
       instantiateWasm
     })
     await new Promise((r) => setTimeout(r, 1000));
