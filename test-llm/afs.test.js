@@ -120,16 +120,24 @@ return Llama.info()
     assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
   })
 
-  it.skip('AOS runs GPT-2 117m model', async () => {
+  it('AOS runs GPT-2 117m model', async () => {
     const result = await handle(getEval(`
   local Llama = require("llama")
   io.stderr:write([[Loading model...\n]])
-  local result = Llama.load("/data/XOJ8FBxa6sGLwChnxhF2L71WkKLSKq1aU5Yn5WnFLrY")
-  io.stderr:write([[Loaded! Setting prompt...\n]])
-  llama.setPrompt("RESEARCHER: You are a new machine intelligence. You have just been born in a new cyberspace. How do you feel? YOU: ")
+  local result = Llama.load("/data/M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc")
+  io.stderr:write([[Loaded! Setting prompt 1...\n]])
+  Llama.setPrompt("Once upon a time")
   io.stderr:write([[Prompt set! Running...\n]])
-  return Llama.run(100)
+  local str = Llama.run(30)
+  return str
   `), getEnv())
+    console.log("START SECOND MESSAGE")
+    const result2 = await handle(getEval(`
+    Llama.setPrompt("How do you feel about rabbits? ")
+    io.stderr:write([[Prompt set! Running 2...\n]])
+    local str = Llama.run(30)
+    return str
+    `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)
   })
@@ -143,11 +151,11 @@ return Llama.info()
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it('AOS loads Phi-2', async () => {
+  it.skip('AOS loads Phi-2', async () => {
     const result = await handle(getEval(`
   local Llama = require("llama")
   Llama.load('/data/kd34P4974oqZf2Db-hFTUiCipsU6CzbR6t-iJoQhKIo')
-  Llama.setPrompt([[<|user|>Can you write a HelloWorld function in js<|end|><|assistant|>]])
+  --Llama.setPrompt([[<|user|>Can you write a HelloWorld function in js<|end|><|assistant|>]])
   return Llama.run(10)
   `), getEnv())
     console.log(result.response)

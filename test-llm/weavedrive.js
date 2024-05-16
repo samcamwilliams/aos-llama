@@ -164,6 +164,10 @@ module.exports = function weaveDrive(mod, FS) {
       // Rebuild the cache from the new cache chunks
       stream.node.cache = this.addChunksToCache(stream.node.cache, cache_chunks)
 
+      if(bytes_read > MB) {
+        console.log(`Downloaded ${bytes_read}\n`)
+      }
+
       // Update the last read position
       stream.lastReadPosition = stream.position
       return bytes_read

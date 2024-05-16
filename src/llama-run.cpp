@@ -41,8 +41,14 @@ int isCtxFull() {
     return tks_processed > llama_n_ctx(ctx);
 }
 
+void llama_free_context() {
+    llama_batch_free(batch);
+    llama_free(ctx);
+}
+
 extern "C" int llama_set_prompt(char* prompt);
 int llama_set_prompt(char* prompt) {
+    llama_free_context();
 
     params.prompt = prompt;
 
@@ -74,6 +80,8 @@ int llama_set_prompt(char* prompt) {
     // create a llama_batch with size 512
     // we use this object to submit token data for decoding
     batch = llama_batch_init(512, 0, 1);
+
+    fprintf(stderr, "Starting to ingest prompt...\n");
 
     // evaluate the initial prompt
     for (size_t i = 0; i < tokens_list.size(); i++) {
@@ -173,8 +181,6 @@ int llama_add(char* new_string) {
 
 extern "C" void llama_stop();
 void llama_stop() {
-    llama_batch_free(batch);
-    llama_free(ctx);
     llama_free_model(model);
     llama_backend_free();
 }
