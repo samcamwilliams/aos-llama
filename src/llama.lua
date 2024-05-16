@@ -25,6 +25,10 @@ function Llama.add(str)
     Llama.backend.add(str)
 end
 
+function Llama.applyTemplate(table)
+    Llama.backend.apply_template(table)
+end
+
 function Llama.stop()
     Llama.backend.stop()
 end

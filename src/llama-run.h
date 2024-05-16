@@ -11,6 +11,7 @@ char* llama_run(int len);
 char* llama_next();
 int llama_add(char* new_string);
 void llama_stop();
+int llama_apply_template(llama_chat_message* msgs, int nmsgs);
 
 #endif // LLAMA_RUN_H
 

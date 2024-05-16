@@ -4,6 +4,7 @@
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
+#include <string.h>
 #include "llama-run.h"
 #include "llama.h"
 
@@ -52,6 +53,54 @@ static int l_llama_stop(lua_State *L) {
   return 0;
 }
 
+static int l_llama_apply_template(lua_State *L) {
+  llama_chat_message* msgs;
+  int count = 0;
+
+  // Make sure the table is at the given index
+  if (!lua_istable(L, -1)) {
+      return 0;
+  }
+
+  // Get the size of the table
+  lua_pushnil(L);  // First key
+  while (lua_next(L, -1) != 0) {
+      count++;
+      lua_pop(L, 1);  // Remove the value, keep the key for next iteration
+  }
+
+  // Allocate memory for the llama_chat_message array
+  llama_chat_message* messages = (llama_chat_message*) malloc(count * sizeof(llama_chat_message));
+  if (!messages) {
+      return 0;
+  }
+
+  // Populate the array with key-value pairs from the Lua table
+  int i = 0;
+  lua_pushnil(L);  // First key
+  while (lua_next(L, -1) != 0) {
+      if (lua_type(L, -2) == LUA_TSTRING && lua_type(L, -1) == LUA_TSTRING) {
+          const char *role = lua_tostring(L, -2);
+          const char *content = lua_tostring(L, -1);
+
+          // Allocate memory for the strings and copy them
+          messages[i].role = strdup(role);
+          messages[i].content = strdup(content);
+
+          i++;
+      }
+      lua_pop(L, 1);  // Remove the value, keep the key for next iteration
+  }
+
+  fprintf(stderr, "C got lua table with %d elements, as follows:\n", count);
+
+  for(int i = 0; i < count; i++) {
+    fprintf(stderr, "%s: %s\n", messages[i].role, messages[i].content);
+  }
+
+  return 1;
+}
+
 // register function
 int luaopen_llama(lua_State *L) {
   static const luaL_Reg llama_funcs[] = {
@@ -60,6 +109,7 @@ int luaopen_llama(lua_State *L) {
       {"add", l_llama_add},
       {"run", l_llama_run},
       {"next", l_llama_next},
+      {"apply_template", l_llama_apply_template},
       {"stop", l_llama_stop},
       {NULL, NULL}  // Sentinel to indicate end of array
   };

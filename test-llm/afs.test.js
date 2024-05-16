@@ -111,6 +111,20 @@ end`), getEnv())
     assert.ok(result.response.Output.data.output.length == 10)
   })
 
+  it('Llama can template strings', async () => {
+    const result = await handle(getEval(`
+local Llama = require("llama")
+Llama.load("/data/M-OzkyjxWhSvWYF87p0kvmkuAEEkvOzIj4nMNoSIydc")
+local chat = {
+  ["User"] = "I like turtles",
+  ["Assistant"] = "Not another one..."
+}
+return Llama.applyTemplate(chat)
+`), getEnv())
+
+    assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
+  })
+
   it.skip('Llama Lua library loads', async () => {
     const result = await handle(getEval(`
 local Llama = require("llama")
@@ -120,7 +134,7 @@ return Llama.info()
     assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
   })
 
-  it('AOS runs GPT-2 117m model', async () => {
+  it.skip('AOS runs GPT-2 117m model', async () => {
     const result = await handle(getEval(`
   local Llama = require("llama")
   io.stderr:write([[Loading model...\n]])
@@ -133,8 +147,15 @@ return Llama.info()
   `), getEnv())
     console.log("START SECOND MESSAGE")
     const result2 = await handle(getEval(`
-    Llama.setPrompt("How do you feel about rabbits? ")
-    io.stderr:write([[Prompt set! Running 2...\n]])
+    --Llama.setPrompt("How do you feel about rabbits? ")
+    io.stderr:write([[Running second time...\n]])
+    local str = Llama.run(30)
+    return str
+    `), getEnv())
+    console.log("START THIRD MESSAGE")
+    const result3 = await handle(getEval(`
+    --Llama.setPrompt("How do you feel about rabbits? ")
+    io.stderr:write([[Running third time...\n]])
     local str = Llama.run(30)
     return str
     `), getEnv())

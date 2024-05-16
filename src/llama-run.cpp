@@ -7,6 +7,7 @@
 #include <vector>
 
 #define CTX_SIZE 2048
+#define MAX_TKN_SIZE 256
 
 gpt_params params;
 llama_model* model;
@@ -44,6 +45,19 @@ int isCtxFull() {
 void llama_free_context() {
     llama_batch_free(batch);
     llama_free(ctx);
+}
+
+extern "C" int llama_apply_template(llama_chat_message* msgs, int nmsgs);
+int llama_apply_template(llama_chat_message* msgs, int nmsgs) {
+    char* formatted_str = (char*) malloc(CTX_SIZE * MAX_TKN_SIZE);
+    int res = llama_chat_apply_template(
+        model,
+        0,
+        msgs,
+        nmsgs,
+        true, formatted_str, CTX_SIZE * MAX_TKN_SIZE);
+
+    return res;
 }
 
 extern "C" int llama_set_prompt(char* prompt);
@@ -104,7 +118,7 @@ extern "C" char* llama_next();
 char* llama_next() {
     auto   n_vocab = llama_n_vocab(model);
     auto * logits  = llama_get_logits_ith(ctx, batch.n_tokens - 1);
-    char* token = (char*)malloc(256);
+    char* token = (char*)malloc(MAX_TKN_SIZE);
 
     std::vector<llama_token_data> candidates;
     candidates.reserve(n_vocab);
@@ -144,6 +158,7 @@ char* llama_next() {
 extern "C" char* llama_run(int len);
 char* llama_run(int len) {
     char* response = (char*)malloc(len * 256);
+    *response = '\0';
 
     for (int i = 0; i < len; i++) {
         // sample the next token
