@@ -26,7 +26,7 @@ int llama_load(char* model_path) {
 
     // initialize the model
     llama_model_params model_params = llama_model_default_params();
-    model_params.use_mmap = false;
+    model_params.use_mmap = true;
     model = llama_load_model_from_file(params.model.c_str(), model_params);
 
     if (model == NULL) {
@@ -41,18 +41,14 @@ int isCtxFull() {
     return tks_processed > llama_n_ctx(ctx);
 }
 
-void llama_free_context() {
+void llama_reset_context() {
+    tks_processed = 0;
     llama_batch_free(batch);
     llama_free(ctx);
-}
 
-extern "C" int llama_set_prompt(char* prompt);
-int llama_set_prompt(char* prompt) {
-    llama_free_context();
+    batch = llama_batch_init(512, 0, 1);
 
-    params.prompt = prompt;
-
-    // initialize the context
+    // (Re-)initialize the context
     llama_context_params ctx_params = llama_context_default_params();
 
     ctx_params.seed  = 1234;
@@ -64,8 +60,13 @@ int llama_set_prompt(char* prompt) {
 
     if (ctx == NULL) {
         l_llama_on_log(GGML_LOG_LEVEL_ERROR, "error: failed to create the llama_context\n", NULL);
-        return 1;
     }
+}
+
+extern "C" int llama_set_prompt(char* prompt);
+int llama_set_prompt(char* prompt) {
+    llama_reset_context();
+    params.prompt = prompt;
 
     // tokenize the prompt
     std::vector<llama_token> tokens_list;
@@ -181,6 +182,8 @@ int llama_add(char* new_string) {
 
 extern "C" void llama_stop();
 void llama_stop() {
+    llama_free(ctx);
+    llama_batch_free(batch);
     llama_free_model(model);
     llama_backend_free();
 }
