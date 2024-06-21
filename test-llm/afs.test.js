@@ -120,7 +120,7 @@ return Llama.info()
     assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
   })
 
-  it('AOS runs GPT-2 117m model', async () => {
+  it('AOS runs GPT-2-XL model', async () => {
     const result = await handle(getEval(`
   local Llama = require("llama")
   io.stderr:write([[Loading model...\n]])
@@ -139,6 +139,7 @@ return Llama.info()
     return str
     `), getEnv())
     console.log(result.response)
+    console.log(result)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
