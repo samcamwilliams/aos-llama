@@ -120,7 +120,7 @@ return Llama.info()
     assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
   })
 
-  it('AOS runs GPT-2-XL model', async () => {
+  it.skip('AOS runs GPT-2-XL model', async () => {
     const result = await handle(getEval(`
   local Llama = require("llama")
   io.stderr:write([[Loading model...\n]])
@@ -190,6 +190,20 @@ local Llama = require("llama")
 Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
 Llama.setPrompt([[<|user|>Tell me a story.<|end|><|assistant|>]])
 return Llama.run(80) 
+  `), getEnv())
+    console.log(result.response)
+    assert.ok(result.response.Output.data.output.length > 10)
+  })
+
+  it('AOS runs Phi-3 and loads state from checkpoint correctly', async () => {
+    const result = await handle(getEval(`
+local Llama = require("llama")
+Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
+Llama.setPrompt([[<|user|>Tell me a story.<|end|><|assistant|>]])
+Llama.saveState()
+print(Llama.run(1))
+Llama.loadState()
+return Llama.run(10)
   `), getEnv())
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)

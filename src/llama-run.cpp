@@ -18,6 +18,7 @@ int tks_processed = 0;
 bool save_state = false;
 uint8_t * save_state_ctx_data;
 int save_state_tks_processed = 0;
+int32_t save_state_n_tokens = 0;
 
 extern "C" bool l_llama_on_progress(float progress, void * user_data);
 extern "C" void l_llama_on_log(enum ggml_log_level level, const char * text, void * user_data);
@@ -109,7 +110,9 @@ int llama_set_prompt(char* prompt) {
 extern "C" char* llama_next();
 char* llama_next() {
     auto   n_vocab = llama_n_vocab(model);
+    printf("batch.n_tokens: %d\n", 0);
     auto * logits  = llama_get_logits_ith(ctx, batch.n_tokens - 1);
+    printf("logits: %p\n", logits);
     char* token = (char*)malloc(256);
 
     std::vector<llama_token_data> candidates;
@@ -121,9 +124,12 @@ char* llama_next() {
 
     llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
 
+    printf("candidates_p: %p\n", candidates_p);
     // sample the most likely token
     const llama_token new_token_id = llama_sample_token_greedy(ctx, &candidates_p);
+    printf("new_token_id: %lu\n", new_token_id);
     std::string token_str = llama_token_to_piece(ctx, new_token_id);
+    printf("token_str: %s\n", token_str.c_str());
     strcpy(token, token_str.c_str());
     tks_processed += 1;
 
@@ -194,12 +200,15 @@ void llama_save_state() {
 
     // Allocate & copy memory from active context
     size_t active_context_size = llama_state_get_size(ctx);
+    printf("Saving state with size: %lu\n", active_context_size * sizeof(uint8_t));
     save_state_ctx_data = (uint8_t *)malloc(active_context_size * sizeof(uint8_t));
     llama_state_get_data(ctx, save_state_ctx_data);
 
     // Set misc variables
     save_state_tks_processed = tks_processed;
     save_state = true;
+    save_state_n_tokens = batch.n_tokens;
+    printf("Saved state\n");
 }
 
 // Returns whether the state was loaded
@@ -209,8 +218,15 @@ bool llama_load_state() {
         return false;
     }
 
+    printf("Loading state\n");
     llama_state_set_data(ctx, save_state_ctx_data);
+    printf("Loaded state\n");
     tks_processed = save_state_tks_processed;
+
+    llama_batch_free(batch);
+    batch = llama_batch_init(512, 0, 1);
+    save_state_n_tokens = batch.n_tokens;
+
     return true;
 }
 
