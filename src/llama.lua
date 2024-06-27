@@ -25,6 +25,18 @@ function Llama.add(str)
     Llama.backend.add(str)
 end
 
+function Llama.saveState()
+    Llama.backend.save_state()
+end
+
+function Llama.loadState()
+    return Llama.backend.load_state()
+end
+
+function Llama.clearState()
+    return Llama.backend.clear_state()
+end
+
 function Llama.stop()
     Llama.backend.stop()
 end

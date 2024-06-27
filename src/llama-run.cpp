@@ -11,8 +11,13 @@
 gpt_params params;
 llama_model* model;
 llama_batch batch;
+
 llama_context * ctx;
 int tks_processed = 0;
+
+bool save_state = false;
+uint8_t * save_state_ctx_data;
+int save_state_tks_processed = 0;
 
 extern "C" bool l_llama_on_progress(float progress, void * user_data);
 extern "C" void l_llama_on_log(enum ggml_log_level level, const char * text, void * user_data);
@@ -178,6 +183,47 @@ int llama_add(char* new_string) {
     }
 
     return 0;
+}
+
+extern "C" void llama_save_state();
+void llama_save_state() {
+    // Free the previous save state, if it exists
+    if (save_state) {
+        free(save_state_ctx_data);
+    }
+
+    // Allocate & copy memory from active context
+    size_t active_context_size = llama_state_get_size(ctx);
+    save_state_ctx_data = (uint8_t *)malloc(active_context_size * sizeof(uint8_t));
+    llama_state_get_data(ctx, save_state_ctx_data);
+
+    // Set misc variables
+    save_state_tks_processed = tks_processed;
+    save_state = true;
+}
+
+// Returns whether the state was loaded
+extern "C" bool llama_load_state();
+bool llama_load_state() {
+    if (!save_state) {
+        return false;
+    }
+
+    llama_state_set_data(ctx, save_state_ctx_data);
+    tks_processed = save_state_tks_processed;
+    return true;
+}
+
+// Returns whether the state was cleared
+extern "C" bool llama_clear_state();
+bool llama_clear_state() {
+    if (save_state) {
+        free(save_state_ctx_data);
+        save_state_tks_processed = 0;
+        save_state = false;
+        return true;
+    }
+    return false;
 }
 
 extern "C" void llama_stop();
