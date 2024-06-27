@@ -26,15 +26,15 @@ function Llama.add(str)
 end
 
 function Llama.saveState()
-    return Llama.backend.save_state()
+    Llama.backend.save_state()
 end
 
 function Llama.loadState()
-    Llama.backend.load_state()
+    return Llama.backend.load_state()
 end
 
 function Llama.clearState()
-    Llama.backend.clear_state()
+    return Llama.backend.clear_state()
 end
 
 function Llama.stop()
