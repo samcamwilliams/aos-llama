@@ -47,6 +47,23 @@ static int l_llama_next(lua_State *L) {
   return 1;
 }
 
+static int l_llama_save_state(lua_State *L) {
+  llama_save_state();
+  return 0;
+}
+
+static int l_llama_load_state(lua_State *L) {
+  bool result = llama_load_state();
+  lua_pushboolean(L, result);
+  return 1;
+}
+
+static int l_llama_clear_state(lua_State *L) {
+  bool result = llama_clear_state();
+  lua_pushboolean(L, result);
+  return 1;
+}
+
 static int l_llama_stop(lua_State *L) {
   llama_stop();
   return 0;
@@ -60,6 +77,9 @@ int luaopen_llama(lua_State *L) {
       {"add", l_llama_add},
       {"run", l_llama_run},
       {"next", l_llama_next},
+      {"save_state", l_llama_save_state},
+      {"load_state", l_llama_load_state},
+      {"clear_state", l_llama_clear_state},
       {"stop", l_llama_stop},
       {NULL, NULL}  // Sentinel to indicate end of array
   };
