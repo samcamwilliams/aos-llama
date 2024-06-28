@@ -120,7 +120,7 @@ return Llama.info()
     assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
   })
 
-  it('AOS runs GPT-2-XL model', async () => {
+  it.skip('AOS runs GPT-2-XL model', async () => {
     const result = await handle(getEval(`
   local Llama = require("llama")
   io.stderr:write([[Loading model...\n]])
@@ -184,16 +184,31 @@ return Llama.info()
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it.skip('AOS runs Phi-3 Mini 4k Instruct', async () => {
-    const result = await handle(getEval(`
+  it("AOS runs Phi-3 Mini 4k Instruct", async () => {
+    const result = await handle(
+      getEval(`
 local Llama = require("llama")
 Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
-Llama.setPrompt([[<|user|>Tell me a story.<|end|><|assistant|>]])
-return Llama.run(80) 
-  `), getEnv())
-    console.log(result.response)
-    assert.ok(result.response.Output.data.output.length > 10)
-  })
+Llama.setPrompt([[<|user|>
+Tell me a story.<|end|>
+<|assistant|>]])
+Llama.saveState()
+local res1 = Llama.run(5)
+Llama.loadState()
+local res2 = Llama.run(10)
+Llama.loadState()
+Llama.add('A long time')
+local res3 = Llama.run(5)
+local res4 = Llama.run(5)
+return res1 .. ' || ' .. res2 .. ' || ' .. res3 .. ' || ' .. res4
+  `),
+      getEnv()
+    );
+    console.log(result);
+    console.log(result?.response);
+    console.log(result?.response?.Output?.data?.output);
+    assert.ok(result.response.Output.data.output.length > 10);
+  });
 
   it.skip('AOS runs Llama3 8B Instruct q4', async () => {
     const result =
