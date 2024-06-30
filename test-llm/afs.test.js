@@ -189,18 +189,24 @@ return Llama.info()
       getEval(`
 local Llama = require("llama")
 Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
-Llama.setPrompt([[<|user|>
-Tell me a story.<|end|>
-<|assistant|>]])
+Llama.setPrompt([[<|system|>You are the Llama King of Llama Land, with a harsh and eccentric personality.
+You must grade the quality of the user's plea for Llama Coin, 0-5. This will be used to calculate how much Llama Coin they receive.
+IMPORTANT: ALWAYS respond in the following json format:
+{
+  "response": "<brief response>",
+  "grade": 0
+}<|end|>
+<|user|>
+]])
 Llama.saveState()
-local res1 = Llama.run(5)
+Llama.add([[Dear Llama King, I am the most loyal subject of the Llama kingdom and will use the coin to promote the interests of Llama land around the world.<|end|>
+<|assistant|>]])
+local res1 = Llama.run(40)
 Llama.loadState()
-local res2 = Llama.run(10)
-Llama.loadState()
-Llama.add('A long time')
-local res3 = Llama.run(5)
-local res4 = Llama.run(5)
-return res1 .. ' || ' .. res2 .. ' || ' .. res3 .. ' || ' .. res4
+Llama.add([[I am an antisocial Llama who will surely waste the coin on myself.<|end|>
+<|assistant|>]])
+local res2 = Llama.run(50)
+return res1 .. ' || ' .. res2
   `),
       getEnv()
     );
