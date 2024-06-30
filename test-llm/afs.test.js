@@ -184,7 +184,18 @@ return Llama.info()
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it("AOS runs Phi-3 Mini 4k Instruct", async () => {
+  it.skip('AOS runs Phi-3 Mini 4k Instruct', async () => {
+    const result = await handle(getEval(`
+local Llama = require("llama")
+Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
+Llama.setPrompt([[<|user|>Tell me a story.<|end|><|assistant|>]])
+return Llama.run(80) 
+  `), getEnv())
+    console.log(result.response)
+    assert.ok(result.response.Output.data.output.length > 10)
+  })
+
+  it("AOS runs Phi-3 Mini 4k Instruct with saveState/Loadstate", async () => {
     const result = await handle(
       getEval(`
 local Llama = require("llama")
