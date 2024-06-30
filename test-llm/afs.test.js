@@ -195,7 +195,7 @@ return Llama.run(80)
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it("AOS runs Phi-3 Mini 4k Instruct with saveState/Loadstate", async () => {
+  it("AOS runs Phi-3 Mini 4k Instruct with saveState/loadState", async () => {
     const result = await handle(
       getEval(`
 local Llama = require("llama")
