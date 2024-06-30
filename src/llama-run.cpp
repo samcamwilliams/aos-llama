@@ -133,6 +133,8 @@ extern "C" char* llama_run(int len);
 char* llama_run(int len) {
     char* response = (char*)malloc(len * 256);
 
+    response[0] = '\0';
+
     for (int i = 0; i < len; i++) {
         // sample the next token
         char* next_token = llama_next();
