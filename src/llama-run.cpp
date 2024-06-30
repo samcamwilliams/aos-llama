@@ -87,10 +87,9 @@ int llama_add(char* new_string) {
 
 extern "C" int llama_set_prompt(char* prompt);
 int llama_set_prompt(char* prompt) {
-    params.prompt = prompt;
-    llama_reset_context();
     // Not needed ?
     // params.prompt = prompt;
+    llama_reset_context();
 
     return llama_add(prompt);
 }
