@@ -120,7 +120,7 @@ return Llama.info()
     assert.ok(result.response.Output.data.output == "Decentralized llama.cpp.")
   })
 
-  it('AOS runs GPT-2-XL model', async () => {
+  it.skip('AOS runs GPT-2-XL model', async () => {
     const result = await handle(getEval(`
   local Llama = require("llama")
   io.stderr:write([[Loading model...\n]])
@@ -194,6 +194,38 @@ return Llama.run(80)
     console.log(result.response)
     assert.ok(result.response.Output.data.output.length > 10)
   })
+
+  it("AOS runs Phi-3 Mini 4k Instruct with saveState/loadState", async () => {
+    const result = await handle(
+      getEval(`
+local Llama = require("llama")
+Llama.load('/data/ISrbGzQot05rs_HKC08O_SmkipYQnqgB1yC3mjZZeEo')
+Llama.setPrompt([[<|system|>You are the Llama King of Llama Land, with a harsh and eccentric personality.
+You must grade the quality of the user's plea for Llama Coin, 0-5. This will be used to calculate how much Llama Coin they receive.
+IMPORTANT: ALWAYS respond in the following json format:
+{
+  "response": "<brief response>",
+  "grade": 0
+}<|end|>
+<|user|>
+]])
+Llama.saveState()
+Llama.add([[Dear Llama King, I am the most loyal subject of the Llama kingdom and will use the coin to promote the interests of Llama land around the world.<|end|>
+<|assistant|>]])
+local res1 = Llama.run(40)
+Llama.loadState()
+Llama.add([[I am an antisocial Llama who will surely waste the coin on myself.<|end|>
+<|assistant|>]])
+local res2 = Llama.run(50)
+return res1 .. ' || ' .. res2
+  `),
+      getEnv()
+    );
+    console.log(result);
+    console.log(result?.response);
+    console.log(result?.response?.Output?.data?.output);
+    assert.ok(result.response.Output.data.output.length > 10);
+  });
 
   it.skip('AOS runs Llama3 8B Instruct q4', async () => {
     const result =

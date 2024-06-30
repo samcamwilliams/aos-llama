@@ -10,9 +10,13 @@
 
 gpt_params params;
 llama_model* model;
-llama_batch batch;
+
 llama_context * ctx;
 int tks_processed = 0;
+
+bool save_state = false;
+uint8_t * save_state_ctx_data;
+int save_state_tks_processed = 0;
 
 extern "C" bool l_llama_on_progress(float progress, void * user_data);
 extern "C" void l_llama_on_log(enum ggml_log_level level, const char * text, void * user_data);
@@ -42,11 +46,8 @@ int isCtxFull() {
 }
 
 void llama_reset_context() {
-    tks_processed = 0;
-    llama_batch_free(batch);
     llama_free(ctx);
-
-    batch = llama_batch_init(512, 0, 1);
+    tks_processed = 0;
 
     // (Re-)initialize the context
     llama_context_params ctx_params = llama_context_default_params();
@@ -63,49 +64,41 @@ void llama_reset_context() {
     }
 }
 
-extern "C" int llama_set_prompt(char* prompt);
-int llama_set_prompt(char* prompt) {
-    llama_reset_context();
-    params.prompt = prompt;
+extern "C" int llama_add(char* new_string);
+int llama_add(char* new_string) {
+    std::vector<llama_token> new_tokens_list = ::llama_tokenize(ctx, new_string, true);
 
-    // tokenize the prompt
-    std::vector<llama_token> tokens_list;
-    tokens_list = ::llama_tokenize(ctx, params.prompt, true);
-
-    // make sure the KV cache is big enough to hold all the prompt and generated tokens
     if (isCtxFull()) {
-        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "error: n_kv_req > n_ctx, the required KV cache size is not big enough\n", NULL);
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Context full, cannot add more tokens\n", NULL);
         return 1;
     }
 
-    // create a llama_batch with size 512
-    // we use this object to submit token data for decoding
-    batch = llama_batch_init(512, 0, 1);
+    fprintf(stderr, "Adding to prompt...\n");
 
-    fprintf(stderr, "Starting to ingest prompt...\n");
-
-    // evaluate the initial prompt
-    for (size_t i = 0; i < tokens_list.size(); i++) {
-        llama_batch_add(batch, tokens_list[i], i, { 0 }, false);
-        tks_processed += 1;
-    }
-
-    // llama_decode will output logits only for the last token of the prompt
-    batch.logits[batch.n_tokens - 1] = true;
-
+    auto batch = llama_batch_get_one(new_tokens_list.data(), new_tokens_list.size(), tks_processed, 0);
     if (llama_decode(ctx, batch) != 0) {
         l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Failed to eval, return code %d\n", NULL);
         return 1;
     }
 
+    tks_processed += new_tokens_list.size();
     return 0;
+}
+
+extern "C" int llama_set_prompt(char* prompt);
+int llama_set_prompt(char* prompt) {
+    // Not needed ?
+    // params.prompt = prompt;
+    llama_reset_context();
+
+    return llama_add(prompt);
 }
 
 extern "C" char* llama_next();
 char* llama_next() {
     auto   n_vocab = llama_n_vocab(model);
-    auto * logits  = llama_get_logits_ith(ctx, batch.n_tokens - 1);
-    char* token = (char*)malloc(256);
+    auto * logits  = llama_get_logits(ctx);
+    char * token = (char*)malloc(256);
 
     std::vector<llama_token_data> candidates;
     candidates.reserve(n_vocab);
@@ -117,34 +110,30 @@ char* llama_next() {
     llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
 
     // sample the most likely token
-    const llama_token new_token_id = llama_sample_token_greedy(ctx, &candidates_p);
+    llama_token new_token_id = llama_sample_token_greedy(ctx, &candidates_p);
     std::string token_str = llama_token_to_piece(ctx, new_token_id);
     strcpy(token, token_str.c_str());
-    tks_processed += 1;
 
     // is it an end of generation?
     if (llama_token_is_eog(model, new_token_id)) {
         return 0;
     }
 
-    // prepare the next batch
-    llama_batch_clear(batch);
-
-    // push this new token for next evaluation
-    llama_batch_add(batch, new_token_id, tks_processed, { 0 }, true);
-
-    // evaluate the current batch with the transformer model
-    if (llama_decode(ctx, batch)) {
+    auto batch = llama_batch_get_one(&new_token_id, 1, tks_processed, 0);
+    if (llama_decode(ctx, batch) != 0) {
         l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Failed to eval, return code %d\n", NULL);
         return 0;
     }
 
+    tks_processed += 1;
     return token;
 }
 
 extern "C" char* llama_run(int len);
 char* llama_run(int len) {
     char* response = (char*)malloc(len * 256);
+
+    response[0] = '\0';
 
     for (int i = 0; i < len; i++) {
         // sample the next token
@@ -156,34 +145,58 @@ char* llama_run(int len) {
     return response;
 }
 
-extern "C" int llama_add(char* new_string);
-int llama_add(char* new_string) {
-    std::vector<llama_token> new_tokens_list = ::llama_tokenize(ctx, new_string, true);
-
-    if (isCtxFull()) {
-        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Context full, cannot add more tokens\n", NULL);
-        return 1;
+extern "C" void llama_save_state();
+void llama_save_state() {
+    // Free the previous save state, if it exists
+    if (save_state) {
+        free(save_state_ctx_data);
     }
 
-    // Add new tokens to the batch
-    for (size_t i = 0; i < new_tokens_list.size(); i++) {
-        llama_batch_add(batch, new_tokens_list[i], tks_processed + i, {0}, false);
-        tks_processed++;
+    // Allocate & copy memory from active context
+    size_t active_context_size = llama_state_get_size(ctx);
+    save_state_ctx_data = (uint8_t *)malloc(active_context_size * sizeof(uint8_t));
+    llama_state_get_data(ctx, save_state_ctx_data);
+
+    // Set misc variables
+    save_state_tks_processed = tks_processed;
+
+    fprintf(stderr, "Saved state of size %zu at position %d\n", active_context_size, save_state_tks_processed);
+
+    save_state = true;
+}
+
+// Returns whether the state was loaded
+extern "C" bool llama_load_state();
+bool llama_load_state() {
+    if (!save_state) {
+        return false;
     }
 
-    batch.logits[batch.n_tokens - 1] = true;
-    if (llama_decode(ctx, batch) != 0) {
-        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "llama_decode() failed with new tokens\n", NULL);
-        return 1;
-    }
+    llama_reset_context();
+    
+    llama_state_set_data(ctx, save_state_ctx_data);
+    tks_processed = save_state_tks_processed;
 
-    return 0;
+    fprintf(stderr, "Loaded state of size %zu at position %d\n", llama_state_get_size(ctx), tks_processed);
+
+    return true;
+}
+
+// Returns whether the state was cleared
+extern "C" bool llama_clear_state();
+bool llama_clear_state() {
+    if (save_state) {
+        free(save_state_ctx_data);
+        save_state_tks_processed = 0;
+        save_state = false;
+        return true;
+    }
+    return false;
 }
 
 extern "C" void llama_stop();
 void llama_stop() {
     llama_free(ctx);
-    llama_batch_free(batch);
     llama_free_model(model);
     llama_backend_free();
 }
