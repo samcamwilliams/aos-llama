@@ -87,6 +87,7 @@ int llama_add(char* new_string) {
 
 extern "C" int llama_set_prompt(char* prompt);
 int llama_set_prompt(char* prompt) {
+    params.prompt = prompt;
     llama_reset_context();
     // Not needed ?
     // params.prompt = prompt;
@@ -160,7 +161,7 @@ void llama_save_state() {
     // Set misc variables
     save_state_tks_processed = tks_processed;
 
-    // fprintf(stderr, "Saved state of size %zu at position %d\n", active_context_size, save_state_tks_processed);
+    fprintf(stderr, "Saved state of size %zu at position %d\n", active_context_size, save_state_tks_processed);
 
     save_state = true;
 }
@@ -177,7 +178,7 @@ bool llama_load_state() {
     llama_state_set_data(ctx, save_state_ctx_data);
     tks_processed = save_state_tks_processed;
 
-    // fprintf(stderr, "Loaded state of size %zu at position %d\n", llama_state_get_size(ctx), tks_processed);
+    fprintf(stderr, "Loaded state of size %zu at position %d\n", llama_state_get_size(ctx), tks_processed);
 
     return true;
 }
