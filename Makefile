@@ -61,7 +61,7 @@ build/aos/process/AOS.wasm: libllama.a build/llama.cpp/llama-run.o build/aos/pac
 
 build/llama.cpp: build
 	if [ ! -d "build/llama.cpp" ]; then \
-		cd build; git clone https://github.com/ggerganov/llama.cpp.git; \
+		cd build; git clone -b b3233 --single-branch https://github.com/ggerganov/llama.cpp.git; \
 	fi
 
 libllama.a: build/llama.cpp container
